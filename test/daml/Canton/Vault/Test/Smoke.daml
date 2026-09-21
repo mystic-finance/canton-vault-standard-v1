@@ -1,0 +1,11 @@
+-- Toolchain smoke test; the conformance suite replaces this.
+module Canton.Vault.Test.Smoke where
+
+import Daml.Script
+import Canton.Vault.V1 ()
+import Canton.Vault.Reference.V1 ()
+
+smoke : Script ()
+smoke = script do
+  _ <- allocateParty "registrar"
+  pure ()

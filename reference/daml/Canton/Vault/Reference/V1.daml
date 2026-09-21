@@ -1,0 +1,4 @@
+-- Reference vault implementing the standard's interfaces. Not yet implemented.
+module Canton.Vault.Reference.V1 where
+
+import Canton.Vault.V1 ()

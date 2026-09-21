@@ -1,0 +1,19 @@
+sdk-version: 3.5.2
+name: canton-vault-reference-v1
+version: 0.1.0
+source: daml
+dependencies:
+  - daml-prim
+  - daml-stdlib
+data-dependencies:
+  - ../api/.daml/dist/canton-vault-standard-v1-0.1.0.dar
+  - ../dependencies/splice-api-token-metadata-v1-1.0.0.dar
+  - ../dependencies/splice-api-token-holding-v2-1.0.0.dar
+  - ../dependencies/splice-api-token-transfer-instruction-v2-1.0.0.dar
+  - ../dependencies/splice-api-token-allocation-v2-1.0.0.dar
+  - ../dependencies/splice-api-token-allocation-instruction-v2-1.0.0.dar
+  - ../dependencies/splice-api-token-transfer-events-v2-1.0.0.dar
+  - ../dependencies/splice-token-standard-utils-2.0.0.dar
+build-options:
+  - --explicit-serializable=yes
+  - --target=2.1

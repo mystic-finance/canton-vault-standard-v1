@@ -1,0 +1,32 @@
+# Daml build output
+.daml/
+dist/
+*/.daml/
+target/
+.daml-delegation
+
+# Logs
+*.log
+log/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors / agents
+.vscode/
+.idea/
+.claude/
+CLAUDE.md
+memory/
+MEMORY.md
+
+# Node (token-standard CLI / scripts)
+node_modules/
+
+# Local env
+.env
+.env.*
+
+# Internal working notes
+docs/plan.md

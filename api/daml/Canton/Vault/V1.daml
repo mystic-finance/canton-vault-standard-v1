@@ -1,0 +1,51 @@
+-- Canton vault standard: shared types.
+-- Interfaces (Vault, VaultAsyncDeposit, VaultAsyncRedeem, VaultEventLog) and
+-- VaultDelegateAuth follow; see docs/design.md.
+module Canton.Vault.V1 where
+
+import DA.Time (RelTime)
+import Splice.Api.Token.HoldingV2 (InstrumentId)
+
+-- Per-second yield model used to accrue totalAssets from `asOf` to now.
+data Accrual
+  = Simple with ratePerSecond : Decimal      -- linear (APR)
+  | Compounding with ratePerSecond : Decimal -- continuous (APY)
+  deriving (Eq, Show)
+
+-- Share price derived on-ledger from the pool's totals.
+data ComputedRate = ComputedRate with
+    totalAssets : Decimal
+    asOf : Time
+    accrual : Optional Accrual
+    depositFeeBps : Int
+    redeemFeeBps : Int
+  deriving (Eq, Show)
+
+-- Share price set by an external authority.
+data AttestedRate = AttestedRate with
+    pricePerShare : Decimal
+    authority : Party
+    effectiveAt : Time
+    priceId : Text
+    depositFeeBps : Int
+    redeemFeeBps : Int
+  deriving (Eq, Show)
+
+data Rate
+  = Computed ComputedRate
+  | Attested AttestedRate
+  deriving (Eq, Show)
+
+-- Everything a wallet needs to quote and act on a vault, served via disclosure.
+data VaultView = VaultView with
+    vaultId : Text
+    vaultRegistrar : Party
+    custodian : Party
+    underlyingInstrument : InstrumentId
+    shareInstrument : InstrumentId
+    totalShares : Decimal
+    totalAssets : Decimal
+    rate : Rate
+    settlementDeadlineWindow : Optional RelTime
+    executors : [Party]
+  deriving (Eq, Show)
