@@ -1,10 +1,6 @@
 # Design: Canton Vault standard
 
-| Author(s) | Status | Reviewers |
-| --- | --- | --- |
-| João Moreira, Luke Farrell | 8 Sep 2026: WIP | |
 
-Source of record: [Google Doc](https://docs.google.com/document/d/1xQG-5p7m9Rh59QYs8UwL_LyaEWbQDCQBuSajRHXBRFw/edit). This copy is a snapshot taken 17 Sep 2026 so the spec is diffable next to the code; when they differ, the Google Doc wins until this file is updated.
 
 ## Technical Summary
 
