@@ -1,7 +1,7 @@
-# Canton vault standard
+# Canton vault
 
-A vault standard for Canton and a reference implementation of it, built on the
-Splice token standard (CIP-56 / CIP-112).
+A vault implementation for Canton, built on the Splice token standard
+(CIP-56 / CIP-112).
 
 A vault accepts deposits of a single underlying instrument and issues share
 holdings against them, which can later be redeemed for the underlying. Shares
