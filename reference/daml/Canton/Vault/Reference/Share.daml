@@ -1,0 +1,45 @@
+-- | Vault shares as token standard holdings, issued by the vault registrar.
+module Canton.Vault.Reference.Share where
+
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.HoldingV2 qualified as V2
+import Splice.TokenStandard.Utils
+
+template ShareHolding
+  with
+    holding : V2.HoldingView
+  where
+    -- Jointly signed, so shares cannot be issued or burned without the account
+    -- parties' authority.
+    signatory accountParties holding.instrumentId.admin holding.account, holding.instrumentId.admin
+
+    ensure holding.amount > 0.0 && isRegularAccount holding.account
+
+    interface instance V2.Holding for ShareHolding where
+      view = holding
+
+-- | Requires the admin's authority.
+mintShares : V2.InstrumentId -> V2.Account -> Decimal -> Update (ContractId ShareHolding)
+mintShares instrumentId account amount = do
+  require "mint amount is positive" (amount > 0.0)
+  create ShareHolding with
+    holding = V2.HoldingView with
+      instrumentId
+      account
+      amount
+      lock = None
+      meta = emptyMetadata
+
+-- | Burns `amount` from a holding, returning any change to the owner.
+burnShares : V2.InstrumentId -> V2.Account -> Decimal -> ContractId ShareHolding -> Update (Optional (ContractId ShareHolding))
+burnShares instrumentId account amount holdingCid = do
+  holding <- fetch holdingCid
+  require' ("holding.instrumentId", holding.holding.instrumentId) isEqualR ("expected", instrumentId)
+  require' ("holding.account", holding.holding.account) isEqualR ("expected", account)
+  require "holding is unlocked" (holding.holding.lock == None)
+  require' ("holding.amount", holding.holding.amount) isGreaterOrEqualR ("burn amount", amount)
+  archive holdingCid
+  let change = holding.holding.amount - amount
+  if change > 0.0
+    then Some <$> mintShares instrumentId account change
+    else pure None

@@ -1,0 +1,268 @@
+-- | Deposit and redeem against the reference vault.
+module Canton.Vault.Test.Deposit where
+
+import DA.Assert ((===))
+import DA.Time (addRelTime, hours)
+import DA.TextMap qualified as TextMap
+import Daml.Script
+
+import Canton.Vault.V1
+import Canton.Vault.Reference.V1
+import Canton.Vault.Reference.Share
+import Canton.Vault.Test.MockToken
+
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.HoldingV2 qualified as V2
+import Splice.Api.Token.TransferInstructionV2 qualified as V2
+import Splice.TokenStandard.Utils
+
+data Fixture = Fixture with
+  registrar : Party
+  custodian : Party
+  underlyingAdmin : Party
+  alice : Party
+  vaultCid : ContractId Vault
+  vaultTemplateCid : ContractId ReferenceVault
+  registryCid : ContractId V2.TransferFactory
+  registryTemplateCid : ContractId MockRegistry
+  underlying : V2.InstrumentId
+  shares : V2.InstrumentId
+
+setupVault : Script Fixture
+setupVault = do
+  registrar <- allocateParty "registrar"
+  custodian <- allocateParty "custodian"
+  underlyingAdmin <- allocateParty "underlyingAdmin"
+  alice <- allocateParty "alice"
+
+  let underlying = V2.InstrumentId with admin = underlyingAdmin; id = "USD"
+      shares = V2.InstrumentId with admin = registrar; id = "vUSD"
+
+  registryTemplateCid <- submit underlyingAdmin do
+    createCmd MockRegistry with admin = underlyingAdmin
+
+  now <- getTime
+  vaultTemplateCid <- submitMulti [registrar, custodian] [] do
+    createCmd ReferenceVault with
+      vaultId = "reference-1"
+      vaultRegistrar = registrar
+      custodian
+      underlyingInstrument = underlying
+      shareInstrument = shares
+      totalShares = 0.0
+      totalAssets = 0.0
+      accrual = None
+      depositFeeBps = 0
+      redeemFeeBps = 0
+      rateValidFrom = now
+      rateValidUntil = addRelTime now (hours 1)
+      depositCap = None
+
+  pure Fixture with
+    registrar; custodian; underlyingAdmin; alice
+    vaultCid = toInterfaceContractId vaultTemplateCid
+    vaultTemplateCid
+    registryCid = toInterfaceContractId registryTemplateCid
+    registryTemplateCid
+    underlying; shares
+
+-- | Neither the vault nor the registry is visible to a depositor, so both are
+-- disclosed on every submission.
+vaultDisclosure : Fixture -> Script [Disclosure]
+vaultDisclosure f = do
+  vault <- queryDisclosure f.registrar f.vaultTemplateCid
+  registry <- queryDisclosure f.underlyingAdmin f.registryTemplateCid
+  case (vault, registry) of
+    (Some v, Some r) -> pure [v, r]
+    _ -> abort "disclosures not available"
+
+fund : Fixture -> Party -> Decimal -> Script (ContractId V2.Holding)
+fund f party amount = do
+  cid <- submit f.underlyingAdmin do
+    createCmd MockHolding with
+      holding = V2.HoldingView with
+        account = basicAccount party
+        instrumentId = f.underlying
+        amount
+        lock = None
+        meta = emptyMetadata
+  pure (toInterfaceContractId cid)
+
+depositArgs : Fixture -> [ContractId V2.Holding] -> ExtraArgs
+depositArgs f holdingCids = ExtraArgs with
+  context = ChoiceContext with
+    values = TextMap.fromList
+      [ (underlyingTransferFactoryKey, AV_ContractId (toAnyContractId f.registryCid))
+      , (underlyingHoldingsKey, AV_List (map (AV_ContractId . toAnyContractId) holdingCids))
+      ]
+  meta = emptyMetadata
+
+redeemArgs : Fixture -> [ContractId V2.Holding] -> [ContractId ShareHolding] -> ExtraArgs
+redeemArgs f underlyingCids shareCids = ExtraArgs with
+  context = ChoiceContext with
+    values = TextMap.fromList
+      [ (underlyingTransferFactoryKey, AV_ContractId (toAnyContractId f.registryCid))
+      , (underlyingHoldingsKey, AV_List (map (AV_ContractId . toAnyContractId) underlyingCids))
+      , (shareHoldingsKey, AV_List (map (AV_ContractId . toAnyContractId) shareCids))
+      ]
+  meta = emptyMetadata
+
+-- | The first deposit into an empty vault mints one share per unit.
+firstDepositMintsAtPar : Script ()
+firstDepositMintsAtPar = script do
+  f <- setupVault
+  holdingCid <- fund f f.alice 100.0
+
+  disclosures <- vaultDisclosure f
+  result <- submitWithDisclosures f.alice disclosures do
+    exerciseCmd f.vaultCid Vault_Deposit with
+      assets = 100.0
+      receiver = f.alice
+      minSharesOut = Some 100.0
+      actors = [f.alice]
+      extraArgs = depositArgs f [holdingCid]
+
+  result.assets === 100.0
+  result.shares === 100.0
+  -- Nonconsuming: a deposit does not rewrite the vault.
+  result.vaultCid === None
+  pure ()
+
+-- | A deposit minting fewer shares than asked for is rejected.
+slippageLimitIsEnforced : Script ()
+slippageLimitIsEnforced = script do
+  f <- setupVault
+  holdingCid <- fund f f.alice 100.0
+
+  disclosures <- vaultDisclosure f
+  submitWithDisclosuresMustFail f.alice disclosures do
+    exerciseCmd f.vaultCid Vault_Deposit with
+      assets = 100.0
+      receiver = f.alice
+      minSharesOut = Some 101.0
+      actors = [f.alice]
+      extraArgs = depositArgs f [holdingCid]
+
+-- | Shares redeem back into the underlying.
+redeemReturnsUnderlying : Script ()
+redeemReturnsUnderlying = script do
+  f <- setupVault
+  holdingCid <- fund f f.alice 100.0
+
+  disclosures <- vaultDisclosure f
+  depositResult <- submitWithDisclosures f.alice disclosures do
+    exerciseCmd f.vaultCid Vault_Deposit with
+      assets = 100.0
+      receiver = f.alice
+      minSharesOut = None
+      actors = [f.alice]
+      extraArgs = depositArgs f [holdingCid]
+
+  custodianHoldings <- query @MockHolding f.custodian
+  let custodianCids = map (toInterfaceContractId . fst) custodianHoldings
+      shareCids = map fromInterfaceContractId depositResult.holdingCids
+  -- The pool belongs to the custodian, who discloses it for the payout leg.
+  poolDisclosures <- forA custodianHoldings $ \(cid, _) -> do
+    d <- queryDisclosure f.custodian cid
+    case d of
+      Some d' -> pure d'
+      None -> abort "pool holding disclosure not available"
+
+  redeemResult <- submitWithDisclosures f.alice (disclosures <> poolDisclosures) do
+    exerciseCmd f.vaultCid Vault_Redeem with
+      shares = 100.0
+      owner = f.alice
+      receiver = f.alice
+      minAssetsOut = Some 100.0
+      actors = [f.alice]
+      extraArgs = redeemArgs f custodianCids shareCids
+
+  redeemResult.shares === 100.0
+  redeemResult.assets === 100.0
+  pure ()
+
+-- | A party cannot redeem shares they do not own, even holding the cids.
+redeemRequiresTheOwner : Script ()
+redeemRequiresTheOwner = script do
+  f <- setupVault
+  mallory <- allocateParty "mallory"
+  holdingCid <- fund f f.alice 100.0
+  disclosures <- vaultDisclosure f
+
+  depositResult <- submitWithDisclosures f.alice disclosures do
+    exerciseCmd f.vaultCid Vault_Deposit with
+      assets = 100.0
+      receiver = f.alice
+      minSharesOut = None
+      actors = [f.alice]
+      extraArgs = depositArgs f [holdingCid]
+
+  custodianHoldings <- query @MockHolding f.custodian
+  poolDisclosures <- forA custodianHoldings $ \(cid, _) -> do
+    d <- queryDisclosure f.custodian cid
+    case d of
+      Some d' -> pure d'
+      None -> abort "pool holding disclosure not available"
+  shareDisclosures <- forA depositResult.holdingCids $ \cid -> do
+    d <- queryDisclosure f.registrar (fromInterfaceContractId cid : ContractId ShareHolding)
+    case d of
+      Some d' -> pure d'
+      None -> abort "share holding disclosure not available"
+
+  submitWithDisclosuresMustFail mallory (disclosures <> poolDisclosures <> shareDisclosures) do
+    exerciseCmd f.vaultCid Vault_Redeem with
+      shares = 100.0
+      owner = f.alice
+      receiver = mallory
+      minAssetsOut = None
+      actors = [mallory]
+      extraArgs = redeemArgs f
+        (map (toInterfaceContractId . fst) custodianHoldings)
+        (map fromInterfaceContractId depositResult.holdingCids)
+
+-- | Two deposits in one period price identically, and the roll folds both in
+-- along with the period's yield.
+periodRollCarriesTotals : Script ()
+periodRollCarriesTotals = script do
+  f <- setupVault
+  disclosures <- vaultDisclosure f
+  bob <- allocateParty "bob"
+
+  aliceFunds <- fund f f.alice 100.0
+  bobFunds <- fund f bob 100.0
+
+  aliceResult <- submitWithDisclosures f.alice disclosures do
+    exerciseCmd f.vaultCid Vault_Deposit with
+      assets = 100.0
+      receiver = f.alice
+      minSharesOut = None
+      actors = [f.alice]
+      extraArgs = depositArgs f [aliceFunds]
+
+  bobResult <- submitWithDisclosures bob disclosures do
+    exerciseCmd f.vaultCid Vault_Deposit with
+      assets = 100.0
+      receiver = bob
+      minSharesOut = None
+      actors = [bob]
+      extraArgs = depositArgs f [bobFunds]
+
+  -- The rate is fixed for the period, so the second deposit prices like the first.
+  aliceResult.shares === bobResult.shares
+
+  flows <- query @PeriodFlow f.registrar
+  length flows === 2
+
+  now <- getTime
+  rolledCid <- submit f.registrar do
+    exerciseCmd f.vaultTemplateCid ReferenceVault_OpenPeriod with
+      flowCids = map fst flows
+      yield = 10.0
+      validUntil = addRelTime now (hours 2)
+
+  Some rolled <- queryContractId f.registrar rolledCid
+  rolled.totalShares === aliceResult.shares + bobResult.shares
+  rolled.totalAssets === 210.0
+
+  remaining <- query @PeriodFlow f.registrar
+  length remaining === 0

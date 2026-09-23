@@ -1,0 +1,72 @@
+-- | Share accounting. Every quantity rounds in the vault's favour.
+module Canton.Vault.Reference.Math where
+
+import DA.Math (exp)
+import DA.Time (convertRelTimeToMicroseconds, subTime)
+
+import Canton.Vault.V1
+
+ulp : Decimal
+ulp = 0.0000000001
+
+-- Daml rounds half-even, so these correct the result back afterwards.
+mulDivDown : Decimal -> Decimal -> Decimal -> Decimal
+mulDivDown a b c =
+  let p = a * b
+      r = p / c
+  in if r * c > p then r - ulp else r
+
+mulDivUp : Decimal -> Decimal -> Decimal -> Decimal
+mulDivUp a b c =
+  let p = a * b
+      r = p / c
+  in if r * c < p then r + ulp else r
+
+elapsedSeconds : Time -> Time -> Decimal
+elapsedSeconds from to =
+  intToDecimal (convertRelTimeToMicroseconds (subTime to from)) / 1000000.0
+
+-- | Simple accrual is linear in elapsed time, compounding is continuous.
+accrue : Optional Accrual -> Decimal -> Time -> Time -> Decimal
+accrue accrual assets asOf now =
+  let dt = elapsedSeconds asOf now
+  in if dt <= 0.0
+    then assets
+    else case accrual of
+      None -> assets
+      Some (AccrualSimple with ratePerSecond) -> assets * (1.0 + ratePerSecond * dt)
+      Some (AccrualCompounding with ratePerSecond) -> assets * exp (ratePerSecond * dt)
+
+-- | A unit on each side of the rate, so the first deposit cannot set an
+-- arbitrary price. Included in the totals the vault publishes.
+virtualOffset : Decimal
+virtualOffset = 1.0
+
+assetsToShares : Decimal -> Decimal -> Decimal -> Decimal
+assetsToShares totalShares totalAssets assets =
+  mulDivDown assets (totalShares + virtualOffset) (totalAssets + virtualOffset)
+
+sharesToAssets : Decimal -> Decimal -> Decimal -> Decimal
+sharesToAssets totalShares totalAssets shares =
+  mulDivDown shares (totalAssets + virtualOffset) (totalShares + virtualOffset)
+
+sharesToAssetsUp : Decimal -> Decimal -> Decimal -> Decimal
+sharesToAssetsUp totalShares totalAssets shares =
+  mulDivUp shares (totalAssets + virtualOffset) (totalShares + virtualOffset)
+
+assetsToSharesUp : Decimal -> Decimal -> Decimal -> Decimal
+assetsToSharesUp totalShares totalAssets assets =
+  mulDivUp assets (totalShares + virtualOffset) (totalAssets + virtualOffset)
+
+-- The fee rounds up, so the vault keeps the remainder.
+deductFeeBps : Int -> Decimal -> Decimal
+deductFeeBps feeBps amount =
+  amount - mulDivUp amount (intToDecimal feeBps) 10000.0
+
+addFeeBps : Int -> Decimal -> Decimal
+addFeeBps feeBps amount =
+  amount + mulDivUp amount (intToDecimal feeBps) 10000.0
+
+-- | Stands in for "no limit"; `Decimal` tops out just under 10^28.
+uncapped : Decimal
+uncapped = 1.0e27

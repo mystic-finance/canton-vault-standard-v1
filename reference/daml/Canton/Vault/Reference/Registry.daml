@@ -1,0 +1,58 @@
+-- | The share instrument's registry: transfers of vault shares between parties.
+module Canton.Vault.Reference.Registry where
+
+import Canton.Vault.Reference.Share
+
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.HoldingV2 qualified as V2
+import Splice.Api.Token.TransferInstructionV2 qualified as V2
+import Splice.TokenStandard.Utils
+
+template ShareRegistry
+  with
+    admin : Party
+      -- ^ The vault registrar, which administers the share instrument.
+  where
+    signatory admin
+
+    interface instance V2.TransferFactory for ShareRegistry where
+      view = V2.TransferFactoryView with
+        admin
+        meta = emptyMetadata
+
+      transferFactory_publicFetchImpl = publicFetchDefaultImpl this
+      transferFactory_transferExtraObservers _arg = []
+
+      transferFactory_transferImpl _self arg = do
+        let transfer = arg.transfer
+        require' ("transfer.instrumentId.admin", transfer.instrumentId.admin)
+          isEqualR ("registry admin", admin)
+        require "transfer names its input holdings" (transfer.inputHoldingCids /= [])
+        checkActors arg.actors [regularAccountParties transfer.sender]
+        now <- getTime
+        require "transfer is still executable" (now < transfer.executeBefore)
+
+        available <- sum <$> forA transfer.inputHoldingCids (\cid -> do
+          let shareCid : ContractId ShareHolding = fromInterfaceContractId cid
+          holding <- fetch shareCid
+          require' ("input.instrumentId", holding.holding.instrumentId)
+            isEqualR ("transfer.instrumentId", transfer.instrumentId)
+          require' ("input.account", holding.holding.account)
+            isEqualR ("transfer.sender", transfer.sender)
+          require "input is unlocked" (holding.holding.lock == None)
+          archive shareCid
+          pure holding.holding.amount)
+        require' ("available", available) isGreaterOrEqualR ("transfer.amount", transfer.amount)
+
+        receiverCid <- mintShares transfer.instrumentId transfer.receiver transfer.amount
+        changeCids <- if available > transfer.amount
+          then do
+            changeCid <- mintShares transfer.instrumentId transfer.sender (available - transfer.amount)
+            pure [toInterfaceContractId changeCid]
+          else pure []
+
+        pure V2.TransferInstructionResult with
+          output = V2.TransferInstructionResult_Completed with
+            receiverHoldingCids = [toInterfaceContractId receiverCid]
+          senderChangeCids = changeCids
+          meta = emptyMetadata

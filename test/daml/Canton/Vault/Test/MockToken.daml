@@ -1,0 +1,72 @@
+-- | A minimal token registry standing in for the vault's underlying.
+-- Transfers settle immediately. Not a model for a real registry.
+module Canton.Vault.Test.MockToken where
+
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.HoldingV2 qualified as V2
+import Splice.Api.Token.TransferInstructionV2 qualified as V2
+import Splice.TokenStandard.Utils
+
+template MockHolding
+  with
+    holding : V2.HoldingView
+  where
+    signatory holding.instrumentId.admin
+    observer regularAccountParties holding.account
+
+    ensure holding.amount > 0.0
+
+    interface instance V2.Holding for MockHolding where
+      view = holding
+
+template MockRegistry
+  with
+    admin : Party
+  where
+    signatory admin
+
+    interface instance V2.TransferFactory for MockRegistry where
+      view = V2.TransferFactoryView with
+        admin
+        meta = emptyMetadata
+
+      transferFactory_publicFetchImpl = publicFetchDefaultImpl this
+      transferFactory_transferExtraObservers _arg = []
+
+      transferFactory_transferImpl _self arg = do
+        let transfer = arg.transfer
+        require "transfer names its input holdings" (transfer.inputHoldingCids /= [])
+        funded <- forA transfer.inputHoldingCids $ \cid -> do
+          let mockCid : ContractId MockHolding = fromInterfaceContractId cid
+          holding <- fetch mockCid
+          require' ("input.instrumentId", holding.holding.instrumentId)
+            isEqualR ("transfer.instrumentId", transfer.instrumentId)
+          require' ("input.account", holding.holding.account)
+            isEqualR ("transfer.sender", transfer.sender)
+          archive mockCid
+          pure holding.holding.amount
+        let available = sum funded
+        require' ("available", available) isGreaterOrEqualR ("transfer.amount", transfer.amount)
+        receiverCid <- create MockHolding with
+          holding = V2.HoldingView with
+            account = transfer.receiver
+            instrumentId = transfer.instrumentId
+            amount = transfer.amount
+            lock = None
+            meta = emptyMetadata
+        changeCids <- if available > transfer.amount
+          then do
+            changeCid <- create MockHolding with
+              holding = V2.HoldingView with
+                account = transfer.sender
+                instrumentId = transfer.instrumentId
+                amount = available - transfer.amount
+                lock = None
+                meta = emptyMetadata
+            pure [toInterfaceContractId changeCid]
+          else pure []
+        pure V2.TransferInstructionResult with
+          output = V2.TransferInstructionResult_Completed with
+            receiverHoldingCids = [toInterfaceContractId receiverCid]
+          senderChangeCids = changeCids
+          meta = emptyMetadata
