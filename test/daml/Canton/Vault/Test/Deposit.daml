@@ -29,7 +29,19 @@ data Fixture = Fixture with
   shares : V2.InstrumentId
 
 setupVault : Script Fixture
-setupVault = do
+setupVault = setupVaultWith 0 None
+
+setupFeeVault : Int -> Script Fixture
+setupFeeVault feeBps = setupVaultWith feeBps None
+
+setupCappedVault : Decimal -> Script Fixture
+setupCappedVault cap = setupVaultFull 0 None (Some cap)
+
+setupVaultWith : Int -> Optional Accrual -> Script Fixture
+setupVaultWith feeBps vaultAccrual = setupVaultFull feeBps vaultAccrual None
+
+setupVaultFull : Int -> Optional Accrual -> Optional Decimal -> Script Fixture
+setupVaultFull feeBps vaultAccrual cap = do
   registrar <- allocateParty "registrar"
   custodian <- allocateParty "custodian"
   underlyingAdmin <- allocateParty "underlyingAdmin"
@@ -51,12 +63,12 @@ setupVault = do
       shareInstrument = shares
       totalShares = 0.0
       totalAssets = 0.0
-      accrual = None
-      depositFeeBps = 0
-      redeemFeeBps = 0
+      accrual = vaultAccrual
+      depositFeeBps = feeBps
+      redeemFeeBps = feeBps
       rateValidFrom = now
       rateValidUntil = addRelTime now (hours 1)
-      depositCap = None
+      depositCap = cap
 
   pure Fixture with
     registrar; custodian; underlyingAdmin; alice
@@ -77,22 +89,31 @@ vaultDisclosure f = do
     _ -> abort "disclosures not available"
 
 fund : Fixture -> Party -> Decimal -> Script (ContractId V2.Holding)
-fund f party amount = do
+fund f party = fundInstrument f party f.underlying
+
+fundInstrument : Fixture -> Party -> V2.InstrumentId -> Decimal -> Script (ContractId V2.Holding)
+fundInstrument f party = fundAccount f (basicAccount party)
+
+fundAccount : Fixture -> V2.Account -> V2.InstrumentId -> Decimal -> Script (ContractId V2.Holding)
+fundAccount f account instrumentId amount = do
   cid <- submit f.underlyingAdmin do
     createCmd MockHolding with
       holding = V2.HoldingView with
-        account = basicAccount party
-        instrumentId = f.underlying
+        account
+        instrumentId
         amount
         lock = None
         meta = emptyMetadata
   pure (toInterfaceContractId cid)
 
 depositArgs : Fixture -> [ContractId V2.Holding] -> ExtraArgs
-depositArgs f holdingCids = ExtraArgs with
+depositArgs f = depositArgsFor f f.registryCid
+
+depositArgsFor : Fixture -> ContractId V2.TransferFactory -> [ContractId V2.Holding] -> ExtraArgs
+depositArgsFor _f factoryCid holdingCids = ExtraArgs with
   context = ChoiceContext with
     values = TextMap.fromList
-      [ (underlyingTransferFactoryKey, AV_ContractId (toAnyContractId f.registryCid))
+      [ (underlyingTransferFactoryKey, AV_ContractId (toAnyContractId factoryCid))
       , (underlyingHoldingsKey, AV_List (map (AV_ContractId . toAnyContractId) holdingCids))
       ]
   meta = emptyMetadata
@@ -253,11 +274,21 @@ periodRollCarriesTotals = script do
   flows <- query @PeriodFlow f.registrar
   length flows === 2
 
+  -- Yield arrives in the pool. The roll has to find it there; the registrar
+  -- cannot simply state it.
+  _ <- fund f f.custodian 10.0
+  custodianHoldings <- query @MockHolding f.custodian
+  poolDisclosures <- forA custodianHoldings $ \(cid, _) -> do
+    d <- queryDisclosure f.custodian cid
+    case d of
+      Some d' -> pure d'
+      None -> abort "pool holding disclosure not available"
+
   now <- getTime
-  rolledCid <- submit f.registrar do
+  rolledCid <- submitWithDisclosures f.registrar poolDisclosures do
     exerciseCmd f.vaultTemplateCid ReferenceVault_OpenPeriod with
       flowCids = map fst flows
-      yield = 10.0
+      poolHoldingCids = map (toInterfaceContractId . fst) custodianHoldings
       validUntil = addRelTime now (hours 2)
 
   Some rolled <- queryContractId f.registrar rolledCid
@@ -266,3 +297,151 @@ periodRollCarriesTotals = script do
 
   remaining <- query @PeriodFlow f.registrar
   length remaining === 0
+
+-- | The pool cannot be inflated with holdings of another instrument, even
+-- though the custodian owns them.
+rollRejectsWrongInstrument : Script ()
+rollRejectsWrongInstrument = script do
+  f <- setupVault
+  disclosures <- vaultDisclosure f
+  holdingCid <- fund f f.alice 100.0
+
+  _ <- submitWithDisclosures f.alice disclosures do
+    exerciseCmd f.vaultCid Vault_Deposit with
+      assets = 100.0
+      receiver = f.alice
+      minSharesOut = None
+      actors = [f.alice]
+      extraArgs = depositArgs f [holdingCid]
+
+  -- The custodian also holds a different instrument. It is not the pool.
+  let other = V2.InstrumentId with admin = f.underlyingAdmin; id = "EUR"
+  _ <- fundInstrument f f.custodian other 500.0
+
+  custodianHoldings <- query @MockHolding f.custodian
+  poolDisclosures <- forA custodianHoldings $ \(cid, _) -> do
+    d <- queryDisclosure f.custodian cid
+    case d of
+      Some d' -> pure d'
+      None -> abort "pool holding disclosure not available"
+
+  flows <- query @PeriodFlow f.registrar
+  now <- getTime
+  submitWithDisclosuresMustFail f.registrar poolDisclosures do
+    exerciseCmd f.vaultTemplateCid ReferenceVault_OpenPeriod with
+      flowCids = map fst flows
+      poolHoldingCids = map (toInterfaceContractId . fst) custodianHoldings
+      validUntil = addRelTime now (hours 2)
+
+-- | An account's provider can fund a deposit alongside its owner.
+providerCanDepositForOwner : Script ()
+providerCanDepositForOwner = script do
+  f <- setupVault
+  provider <- allocateParty "provider"
+  disclosures <- vaultDisclosure f
+
+  let account = V2.Account with
+        owner = Some f.alice
+        provider = Some provider
+        id = ""
+  holdingCid <- fundAccount f account f.underlying 100.0
+
+  let args = ExtraArgs with
+        context = (depositArgs f [holdingCid]).context
+        meta = accountToMeta "sender" account emptyMetadata
+
+  result <- submit (actAs [f.alice, provider] <> discloseMany disclosures) do
+    exerciseCmd f.vaultCid Vault_Deposit with
+      assets = 100.0
+      receiver = f.alice
+      minSharesOut = None
+      actors = [f.alice, provider]
+      extraArgs = args
+
+  result.shares === 100.0
+
+-- | The declared actors must be exactly the funding account's parties. Both
+-- parties authorize here, so only the vault's own check can reject this.
+actorsMustMatchTheFundingAccount : Script ()
+actorsMustMatchTheFundingAccount = script do
+  f <- setupVault
+  provider <- allocateParty "provider"
+  disclosures <- vaultDisclosure f
+
+  let account = V2.Account with
+        owner = Some f.alice
+        provider = Some provider
+        id = ""
+  holdingCid <- fundAccount f account f.underlying 100.0
+
+  let args = ExtraArgs with
+        context = (depositArgs f [holdingCid]).context
+        meta = accountToMeta "sender" account emptyMetadata
+
+  submitMustFail (actAs [f.alice, provider] <> discloseMany disclosures) do
+    exerciseCmd f.vaultCid Vault_Deposit with
+      assets = 100.0
+      receiver = f.alice
+      minSharesOut = None
+      actors = [f.alice]
+      extraArgs = args
+
+-- | The max methods answer for the party's own holdings, not the whole pool.
+maxRedeemCountsOnlyTheParty : Script ()
+maxRedeemCountsOnlyTheParty = script do
+  f <- setupVault
+  bob <- allocateParty "bob"
+  disclosures <- vaultDisclosure f
+
+  aliceFunds <- fund f f.alice 100.0
+  bobFunds <- fund f bob 900.0
+
+  aliceResult <- submitWithDisclosures f.alice disclosures do
+    exerciseCmd f.vaultCid Vault_Deposit with
+      assets = 100.0
+      receiver = f.alice
+      minSharesOut = None
+      actors = [f.alice]
+      extraArgs = depositArgs f [aliceFunds]
+
+  _ <- submitWithDisclosures bob disclosures do
+    exerciseCmd f.vaultCid Vault_Deposit with
+      assets = 900.0
+      receiver = bob
+      minSharesOut = None
+      actors = [bob]
+      extraArgs = depositArgs f [bobFunds]
+
+  -- Alice holds a tenth of the pool, so that is all she may redeem.
+  let aliceShares : [ContractId ShareHolding] =
+        map fromInterfaceContractId aliceResult.holdingCids
+  limit <- submit f.registrar do
+    createAndExerciseCmd (MaxRedeemProbe with caller = f.registrar) (Probe_Run with
+      vaultCid = f.vaultCid
+      party = f.alice
+      extraArgs = redeemArgs f [] aliceShares)
+
+  limit === aliceResult.shares
+
+-- | Naming no holdings reports nothing available, not the whole pool.
+maxRedeemWithoutEvidenceIsZero : Script ()
+maxRedeemWithoutEvidenceIsZero = script do
+  f <- setupVault
+  disclosures <- vaultDisclosure f
+  holdingCid <- fund f f.alice 100.0
+
+  _ <- submitWithDisclosures f.alice disclosures do
+    exerciseCmd f.vaultCid Vault_Deposit with
+      assets = 100.0
+      receiver = f.alice
+      minSharesOut = None
+      actors = [f.alice]
+      extraArgs = depositArgs f [holdingCid]
+
+  limit <- submit f.registrar do
+    createAndExerciseCmd (MaxRedeemProbe with caller = f.registrar) (Probe_Run with
+      vaultCid = f.vaultCid
+      party = f.alice
+      extraArgs = redeemArgs f [] [])
+
+  limit === 0.0

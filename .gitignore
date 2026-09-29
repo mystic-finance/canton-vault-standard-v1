@@ -30,4 +30,8 @@ node_modules/
 
 # Internal working notes
 docs/plan.md
+
+# Dev tooling, not part of the reference
+scripts/guard_coverage.py
 docs/design.md
+service/

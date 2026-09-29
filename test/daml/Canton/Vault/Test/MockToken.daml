@@ -7,6 +7,8 @@ import Splice.Api.Token.HoldingV2 qualified as V2
 import Splice.Api.Token.TransferInstructionV2 qualified as V2
 import Splice.TokenStandard.Utils
 
+import Canton.Vault.V1
+
 template MockHolding
   with
     holding : V2.HoldingView
@@ -70,3 +72,110 @@ template MockRegistry
             receiverHoldingCids = [toInterfaceContractId receiverCid]
           senderChangeCids = changeCids
           meta = emptyMetadata
+
+-- | Read methods only run on-ledger and only for a party that can fetch the
+-- vault, so a script reaches them through a choice exercised by the registrar.
+-- | A registry that never completes a transfer, answering with a pending
+-- instruction the way a registry with a compliance step would.
+template PendingRegistry
+  with
+    admin : Party
+  where
+    signatory admin
+
+    interface instance V2.TransferFactory for PendingRegistry where
+      view = V2.TransferFactoryView with
+        admin
+        meta = emptyMetadata
+
+      transferFactory_publicFetchImpl = publicFetchDefaultImpl this
+      transferFactory_transferExtraObservers _arg = []
+
+      transferFactory_transferImpl _self arg = do
+        instructionCid <- create PendingInstruction with
+          admin
+          transfer = arg.transfer
+        pure V2.TransferInstructionResult with
+          output = V2.TransferInstructionResult_Pending with
+            transferInstructionCid = toInterfaceContractId instructionCid
+          senderChangeCids = []
+          meta = emptyMetadata
+
+template PendingInstruction
+  with
+    admin : Party
+    transfer : V2.Transfer
+  where
+    signatory admin
+
+    interface instance V2.TransferInstruction for PendingInstruction where
+      view = V2.TransferInstructionView with
+        originalInstructionCid = None
+        transfer
+        expiresAt = None
+        availableActions = mempty
+        meta = emptyMetadata
+
+      transferInstruction_acceptImpl _self _arg = abort "not needed"
+      transferInstruction_rejectImpl _self _arg = abort "not needed"
+      transferInstruction_withdrawImpl _self _arg = abort "not needed"
+      transferInstruction_acceptExtraObservers _arg = []
+      transferInstruction_rejectExtraObservers _arg = []
+      transferInstruction_withdrawExtraObservers _arg = []
+
+-- | A factory that reports success without moving anything. Anyone can write
+-- one; the question is whether a vault will accept it.
+template FreeMintRegistry
+  with
+    admin : Party
+  where
+    signatory admin
+
+    interface instance V2.TransferFactory for FreeMintRegistry where
+      view = V2.TransferFactoryView with
+        admin
+        meta = emptyMetadata
+
+      transferFactory_publicFetchImpl = publicFetchDefaultImpl this
+      transferFactory_transferExtraObservers _arg = []
+
+      transferFactory_transferImpl _self _arg =
+        pure V2.TransferInstructionResult with
+          output = V2.TransferInstructionResult_Completed with receiverHoldingCids = []
+          senderChangeCids = []
+          meta = emptyMetadata
+
+template MaxRedeemProbe
+  with
+    caller : Party
+  where
+    signatory caller
+
+    choice Probe_MaxMint : Decimal
+      with
+        vaultCid : ContractId Vault
+        party : Party
+        extraArgs : ExtraArgs
+      controller caller
+      do
+        vault <- fetch vaultCid
+        maxMint vault party extraArgs
+
+    choice Probe_ConvertToAssets : Decimal
+      with
+        vaultCid : ContractId Vault
+        shares : Decimal
+      controller caller
+      do
+        vault <- fetch vaultCid
+        convertToAssets vault shares
+
+    choice Probe_Run : Decimal
+      with
+        vaultCid : ContractId Vault
+        party : Party
+        extraArgs : ExtraArgs
+      controller caller
+      do
+        vault <- fetch vaultCid
+        maxRedeem vault party extraArgs

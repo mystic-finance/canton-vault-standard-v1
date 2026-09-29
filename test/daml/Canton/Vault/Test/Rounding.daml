@@ -1,0 +1,78 @@
+-- | Share accounting rounds in the vault's favour, exactly.
+module Canton.Vault.Test.Rounding where
+
+import DA.Assert ((===), assertMsg)
+import DA.Foldable (forA_)
+import Daml.Script
+
+import Canton.Vault.Reference.Math
+
+-- Awkward ratios, where the product needs more than ten decimals. The small
+-- amounts matter: they are where an intermediate rounding flips the direction.
+cases : [(Decimal, Decimal, Decimal)]
+cases =
+  [ (shares, assets, amount)
+  | (shares, assets) <-
+      [ (3.0, 7.0), (1.0, 3.0), (999.9999999999, 1000.0000000001)
+      , (0.0000000001, 0.0000000003), (123456.789, 987654.321)
+      , (7919.0, 104729.0), (1.0, 1000000.0)
+      , (0.5, 0.0), (0.0, 0.5), (1.5, 0.0), (0.25, 0.0), (2.5, 0.0) ]
+  , amount <-
+      [ 1.0, 0.1234567891, 3.3333333333, 99999.9999999999
+      , 0.0000000001, 0.0000000003, 0.0000000007 ]
+  ]
+
+-- | The helpers land on the exact floor and ceiling. These cases all sit where
+-- an intermediate rounding used to hide the overshoot from the correction.
+mulDivMatchesExactRounding : Script ()
+mulDivMatchesExactRounding = script do
+  let exact =
+        [ (0.5, 0.5, 1.5, 0.1666666666, 0.1666666667)
+        , (0.5, 1.5, 0.1234567891, 6.0750000503, 6.0750000504)
+        , (0.5, 0.25, 0.1234567891, 1.0125000083, 1.0125000084)
+        , (0.5, 1.0, 0.1234567891, 4.0500000335, 4.0500000336)
+        ]
+  forA_ exact $ \(a, b, c, down, up) -> do
+    mulDivDown a b c === down
+    mulDivUp a b c === up
+
+-- | Converting to shares and back never returns more than went in.
+sharesRoundTripFavoursTheVault : Script ()
+sharesRoundTripFavoursTheVault = script do
+  forA_ cases $ \(totalShares, totalAssets, assets) -> do
+    let shares = assetsToShares totalShares totalAssets assets
+        back = sharesToAssets totalShares totalAssets shares
+    assertMsg
+      ("assets " <> show assets <> " -> shares " <> show shares <> " -> " <> show back)
+      (back <= assets)
+
+-- | Converting from shares and back never returns more than went in.
+assetsRoundTripFavoursTheVault : Script ()
+assetsRoundTripFavoursTheVault = script do
+  forA_ cases $ \(totalShares, totalAssets, shares) -> do
+    let assets = sharesToAssets totalShares totalAssets shares
+        back = assetsToShares totalShares totalAssets assets
+    assertMsg
+      ("shares " <> show shares <> " -> assets " <> show assets <> " -> " <> show back)
+      (back <= shares)
+
+-- | The up variants never quote less than the down variants.
+upIsNeverBelowDown : Script ()
+upIsNeverBelowDown = script do
+  forA_ cases $ \(totalShares, totalAssets, amount) -> do
+    assertMsg "shares up >= down"
+      (assetsToSharesUp totalShares totalAssets amount
+        >= assetsToShares totalShares totalAssets amount)
+    assertMsg "assets up >= down"
+      (sharesToAssetsUp totalShares totalAssets amount
+        >= sharesToAssets totalShares totalAssets amount)
+
+-- | A fee never leaves the depositor better off than paying none.
+feesFavourTheVault : Script ()
+feesFavourTheVault = script do
+  forA_ [0, 1, 25, 300, 10000] $ \bps ->
+    forA_ [1.0, 0.1234567891, 99999.9999999999] $ \amount -> do
+      assertMsg "deducting a fee never increases the amount"
+        (deductFeeBps bps amount <= amount)
+      assertMsg "adding a fee never decreases the amount"
+        (addFeeBps bps amount >= amount)

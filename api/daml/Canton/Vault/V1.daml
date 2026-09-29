@@ -124,16 +124,22 @@ interface Vault where
 
   -- | Most the party may deposit in one call, after limits, capacity and
   -- eligibility. Zero means they cannot deposit at all right now.
-  maxDeposit : Party -> Update Decimal
+  --
+  -- A vault cannot look up what a party holds, so the answers below depend on
+  -- the holdings named in `extraArgs`. A caller that names none gets the
+  -- vault's own limit rather than theirs.
+  maxDeposit : Party -> ExtraArgs -> Update Decimal
 
   -- | Most the party may mint in one call right now. Zero as for `maxDeposit`.
-  maxMint : Party -> Update Decimal
+  maxMint : Party -> ExtraArgs -> Update Decimal
 
-  -- | Most the party may withdraw in one call, limited by available liquidity.
-  maxWithdraw : Party -> Update Decimal
+  -- | What the party's named share holdings are worth. Reading the pool needs
+  -- the custodian's authority, which a read method does not carry, so available
+  -- liquidity is not reflected and a withdrawal may still fail for want of it.
+  maxWithdraw : Party -> ExtraArgs -> Update Decimal
 
-  -- | Most the party may redeem in one call right now. Zero as for `maxWithdraw`.
-  maxRedeem : Party -> Update Decimal
+  -- | The party's named share holdings. Liquidity as for `maxWithdraw`.
+  maxRedeem : Party -> ExtraArgs -> Update Decimal
 
   -- | Shares `assets` would mint, including fees. Rounds down.
   --

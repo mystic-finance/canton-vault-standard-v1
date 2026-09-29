@@ -1,0 +1,330 @@
+-- | Fees, accrual and pricing across rate periods.
+module Canton.Vault.Test.Periods where
+
+import DA.Assert ((===), assertMsg)
+import DA.Time (addRelTime, hours, minutes)
+import Daml.Script
+
+import Canton.Vault.V1
+import Canton.Vault.Reference.V1
+import Canton.Vault.Reference.Share
+import Canton.Vault.Test.Deposit
+import Canton.Vault.Test.MockToken
+
+import Splice.Api.Token.HoldingV2 qualified as V2
+import Splice.TokenStandard.Utils
+
+-- | Roll the period, measuring the pool from the custodian's holdings.
+rollPeriod : Fixture -> ContractId ReferenceVault -> Script (ContractId ReferenceVault)
+rollPeriod f vaultCid = do
+  flows <- query @PeriodFlow f.registrar
+  pool <- query @MockHolding f.custodian
+  poolDisclosures <- forA pool $ \(cid, _) -> do
+    d <- queryDisclosure f.custodian cid
+    case d of
+      Some d' -> pure d'
+      None -> abort "pool holding disclosure not available"
+  now <- getTime
+  submit (actAs f.registrar <> discloseMany poolDisclosures) do
+    exerciseCmd vaultCid ReferenceVault_OpenPeriod with
+      flowCids = map fst flows
+      poolHoldingCids = map (toInterfaceContractId . fst) pool
+      validUntil = addRelTime now (hours 2)
+
+-- | The custodian's pool holdings, disclosed.
+poolDisclosures : Fixture -> Script [Disclosure]
+poolDisclosures f = do
+  pool <- query @MockHolding f.custodian
+  forA pool $ \(cid, _) -> do
+    d <- queryDisclosure f.custodian cid
+    case d of
+      Some d' -> pure d'
+      None -> abort "pool holding disclosure not available"
+
+disclosuresFor : Fixture -> ContractId ReferenceVault -> Script [Disclosure]
+disclosuresFor f vaultCid = do
+  vault <- queryDisclosure f.registrar vaultCid
+  registry <- queryDisclosure f.underlyingAdmin f.registryTemplateCid
+  case (vault, registry) of
+    (Some v, Some r) -> pure [v, r]
+    _ -> abort "disclosures not available"
+
+deposit : Fixture -> ContractId ReferenceVault -> Party -> Decimal -> Script VaultActionResult
+deposit f vaultCid party amount = do
+  funds <- fund f party amount
+  ds <- disclosuresFor f vaultCid
+  submitWithDisclosures party ds do
+    exerciseCmd (toInterfaceContractId vaultCid : ContractId Vault) Vault_Deposit with
+      assets = amount
+      receiver = party
+      minSharesOut = None
+      actors = [party]
+      extraArgs = depositArgs f [funds]
+
+-- | Yield earned in one period raises the price for the next one's depositors.
+yieldRaisesThePriceNextPeriod : Script ()
+yieldRaisesThePriceNextPeriod = script do
+  f <- setupVault
+  bob <- allocateParty "bob"
+
+  first <- deposit f f.vaultTemplateCid f.alice 100.0
+  first.shares === 100.0
+
+  -- The strategy earns 10, paid into the pool.
+  _ <- fund f f.custodian 10.0
+  rolled <- rollPeriod f f.vaultTemplateCid
+
+  Some vault <- queryContractId f.registrar rolled
+  vault.totalAssets === 110.0
+  vault.totalShares === 100.0
+
+  -- The same deposit now buys fewer shares, because each is worth more.
+  second <- deposit f rolled bob 100.0
+  assertMsg
+    ("expected fewer than 100 shares, got " <> show second.shares)
+    (second.shares < 100.0 && second.shares > 90.0)
+
+-- | A deposit fee leaves the payer with fewer shares and the pool better off.
+depositFeeAccruesToHolders : Script ()
+depositFeeAccruesToHolders = script do
+  f <- setupFeeVault 100
+  bob <- allocateParty "bob"
+
+  -- 1% of 100 is taken before shares are priced.
+  first <- deposit f f.vaultTemplateCid f.alice 100.0
+  first.shares === 99.0
+  first.assets === 100.0
+
+  rolled <- rollPeriod f f.vaultTemplateCid
+  Some vault <- queryContractId f.registrar rolled
+  -- The whole 100 sits in the pool against 99 shares.
+  vault.totalAssets === 100.0
+  vault.totalShares === 99.0
+
+  second <- deposit f rolled bob 100.0
+  assertMsg
+    ("fee should leave the second depositor with fewer shares, got " <> show second.shares)
+    (second.shares < 99.0)
+
+-- | A linear accrual raises the price as time passes inside a period.
+linearAccrualRaisesThePrice : Script ()
+linearAccrualRaisesThePrice = script do
+  f <- setupVaultWith 0 (Some (AccrualSimple with ratePerSecond = 0.00001))
+
+  first <- deposit f f.vaultTemplateCid f.alice 100.0
+  rolled <- rollPeriod f f.vaultTemplateCid
+  Some vault <- queryContractId f.registrar rolled
+  vault.totalAssets === 100.0
+
+  atStart <- convertShares f rolled first.shares
+  passTime (hours 1)
+  anHourLater <- convertShares f rolled first.shares
+
+  -- 0.001% per second over an hour is 3.6% on top.
+  assertMsg ("expected growth, got " <> show atStart <> " then " <> show anHourLater)
+    (anHourLater > atStart)
+  assertMsg ("expected about 103.6, got " <> show anHourLater)
+    (anHourLater > 103.0 && anHourLater < 104.0)
+
+-- | Compounding accrual outpaces linear over the same period.
+compoundingOutpacesLinear : Script ()
+compoundingOutpacesLinear = script do
+  let rate = 0.00001
+  linear <- setupVaultWith 0 (Some (AccrualSimple with ratePerSecond = rate))
+  linearFirst <- deposit linear linear.vaultTemplateCid linear.alice 100.0
+  linearRolled <- rollPeriod linear linear.vaultTemplateCid
+
+  compounding <- setupVaultWith 0 (Some (AccrualCompounding with ratePerSecond = rate))
+  compoundingFirst <- deposit compounding compounding.vaultTemplateCid compounding.alice 100.0
+  compoundingRolled <- rollPeriod compounding compounding.vaultTemplateCid
+
+  passTime (hours 1)
+  linearWorth <- convertShares linear linearRolled linearFirst.shares
+  compoundingWorth <- convertShares compounding compoundingRolled compoundingFirst.shares
+
+  assertMsg
+    ("linear " <> show linearWorth <> " should trail compounding " <> show compoundingWorth)
+    (compoundingWorth > linearWorth)
+
+-- | What a holding of shares is worth right now.
+convertShares : Fixture -> ContractId ReferenceVault -> Decimal -> Script Decimal
+convertShares f vaultCid shares =
+  submit f.registrar do
+    createAndExerciseCmd (MaxRedeemProbe with caller = f.registrar) (Probe_ConvertToAssets with
+      vaultCid = toInterfaceContractId vaultCid
+      shares)
+
+-- | Several depositors in one period all price the same, and exits leave the
+-- rest untouched.
+manyDepositorsInOnePeriod : Script ()
+manyDepositorsInOnePeriod = script do
+  f <- setupVault
+  bob <- allocateParty "bob"
+  carol <- allocateParty "carol"
+
+  a <- deposit f f.vaultTemplateCid f.alice 100.0
+  b <- deposit f f.vaultTemplateCid bob 250.0
+  c <- deposit f f.vaultTemplateCid carol 50.0
+
+  -- The rate is fixed for the period, so shares are proportional to deposits.
+  a.shares === 100.0
+  b.shares === 250.0
+  c.shares === 50.0
+
+  rolled <- rollPeriod f f.vaultTemplateCid
+  Some vault <- queryContractId f.registrar rolled
+  vault.totalAssets === 400.0
+  vault.totalShares === 400.0
+
+  -- Bob exits. Alice and Carol are unaffected.
+  pool <- query @MockHolding f.custodian
+  poolDisclosures <- forA pool $ \(cid, _) -> do
+    d <- queryDisclosure f.custodian cid
+    case d of
+      Some d' -> pure d'
+      None -> abort "pool holding disclosure not available"
+  ds <- disclosuresFor f rolled
+  bobShares <- query @ShareHolding bob
+  redeemed <- submitWithDisclosures bob (ds <> poolDisclosures) do
+    exerciseCmd (toInterfaceContractId rolled : ContractId Vault) Vault_Redeem with
+      shares = 250.0
+      owner = bob
+      receiver = bob
+      minAssetsOut = Some 250.0
+      actors = [bob]
+      extraArgs = redeemArgs f
+        (map (toInterfaceContractId . fst) pool)
+        (map fst bobShares)
+  redeemed.assets === 250.0
+
+  aliceWorth <- convertShares f rolled a.shares
+  aliceWorth === 100.0
+
+-- | A deposit whose underlying leg comes back pending mints nothing.
+pendingLegMintsNothing : Script ()
+pendingLegMintsNothing = script do
+  f <- setupVault
+  pendingCid <- submit f.underlyingAdmin do
+    createCmd PendingRegistry with admin = f.underlyingAdmin
+  pendingDisclosure <- queryDisclosure f.underlyingAdmin pendingCid
+  vault <- queryDisclosure f.registrar f.vaultTemplateCid
+  ds <- case (vault, pendingDisclosure) of
+    (Some v, Some p) -> pure [v, p]
+    _ -> abort "disclosures not available"
+
+  funds <- fund f f.alice 100.0
+  let args = depositArgsFor f (toInterfaceContractId pendingCid) [funds]
+
+  submitWithDisclosuresMustFail f.alice ds do
+    exerciseCmd f.vaultCid Vault_Deposit with
+      assets = 100.0
+      receiver = f.alice
+      minSharesOut = None
+      actors = [f.alice]
+      extraArgs = args
+
+  -- Nothing was issued.
+  shares <- query @ShareHolding f.alice
+  length shares === 0
+
+-- | A redemption fee is taken from the payout and stays in the pool.
+redeemFeeStaysInThePool : Script ()
+redeemFeeStaysInThePool = script do
+  f <- setupFeeVault 100
+  bob <- allocateParty "bob"
+
+  -- Bob stays in, so there is someone left for the fee to accrue to.
+  alice <- deposit f f.vaultTemplateCid f.alice 100.0
+  _ <- deposit f f.vaultTemplateCid bob 100.0
+  rolled <- rollPeriod f f.vaultTemplateCid
+
+  Some vault <- queryContractId f.registrar rolled
+  vault.totalAssets === 200.0
+  vault.totalShares === 198.0
+
+  -- Without a fee these shares are worth this much.
+  gross <- convertShares f rolled alice.shares
+
+  pool <- query @MockHolding f.custodian
+  poolDisclosures <- forA pool $ \(cid, _) -> do
+    d <- queryDisclosure f.custodian cid
+    case d of
+      Some d' -> pure d'
+      None -> abort "pool holding disclosure not available"
+  ds <- disclosuresFor f rolled
+  aliceShares <- query @ShareHolding f.alice
+
+  redeemed <- submitWithDisclosures f.alice (ds <> poolDisclosures) do
+    exerciseCmd (toInterfaceContractId rolled : ContractId Vault) Vault_Redeem with
+      shares = alice.shares
+      owner = f.alice
+      receiver = f.alice
+      minAssetsOut = None
+      actors = [f.alice]
+      extraArgs = redeemArgs f
+        (map (toInterfaceContractId . fst) pool)
+        (map fst aliceShares)
+
+  -- She is paid a percent less than her shares are worth.
+  assertMsg
+    ("gross " <> show gross <> ", paid " <> show redeemed.assets)
+    (redeemed.assets < gross)
+  assertMsg
+    ("fee should be about 1%, gross " <> show gross <> " paid " <> show redeemed.assets)
+    (redeemed.assets > gross * 0.985 && redeemed.assets < gross * 0.995)
+
+  -- The fee stayed behind, so Bob's shares are worth more than before.
+  rolledAgain <- rollPeriod f rolled
+  bobWorth <- convertShares f rolledAgain 99.0
+  assertMsg ("bob paid 100.0, now worth " <> show bobWorth) (bobWorth > 100.0)
+
+-- | An uncapped vault reports its mint limit without overflowing. The limit is
+-- far outside `Numeric 20`, so it must not be run through the share maths.
+maxMintOnAnUncappedVault : Script ()
+maxMintOnAnUncappedVault = script do
+  f <- setupVault
+  _ <- deposit f f.vaultTemplateCid f.alice 100.0
+  rolled <- rollPeriod f f.vaultTemplateCid
+  limit <- submit f.registrar do
+    createAndExerciseCmd (MaxRedeemProbe with caller = f.registrar) (Probe_MaxMint with
+      vaultCid = toInterfaceContractId rolled
+      party = f.alice
+      extraArgs = redeemArgs f [] [])
+  assertMsg ("expected a large limit, got " <> show limit) (limit > 0.0)
+
+-- | Shares cannot be issued to a party that is not acting.
+depositCannotIssueToAnAbsentParty : Script ()
+depositCannotIssueToAnAbsentParty = script do
+  f <- setupVault
+  stranger <- allocateParty "stranger"
+  ds <- disclosuresFor f f.vaultTemplateCid
+  funds <- fund f f.alice 100.0
+  submitWithDisclosuresMustFail f.alice ds do
+    exerciseCmd (toInterfaceContractId f.vaultTemplateCid : ContractId Vault) Vault_Deposit with
+      assets = 100.0
+      receiver = stranger
+      minSharesOut = None
+      actors = [f.alice]
+      extraArgs = depositArgs f [funds]
+
+-- | A vault cannot be created with a fee outside nought to a hundred percent.
+feesOutsideRangeAreRejected : Script ()
+feesOutsideRangeAreRejected = script do
+  f <- setupVault
+  now <- getTime
+  let mk bps = createCmd ReferenceVault with
+        vaultId = "bad"
+        vaultRegistrar = f.registrar
+        custodian = f.custodian
+        underlyingInstrument = f.underlying
+        shareInstrument = f.shares
+        totalShares = 0.0
+        totalAssets = 0.0
+        accrual = None
+        depositFeeBps = bps
+        redeemFeeBps = 0
+        rateValidFrom = now
+        rateValidUntil = addRelTime now (hours 1)
+        depositCap = None
+  submitMultiMustFail [f.registrar, f.custodian] [] (mk (-100))
+  submitMultiMustFail [f.registrar, f.custodian] [] (mk 10001)

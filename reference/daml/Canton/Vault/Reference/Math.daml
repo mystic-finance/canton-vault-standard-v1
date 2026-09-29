@@ -2,6 +2,7 @@
 module Canton.Vault.Reference.Math where
 
 import DA.Math (exp)
+import DA.Numeric qualified as N
 import DA.Time (convertRelTimeToMicroseconds, subTime)
 
 import Canton.Vault.V1
@@ -9,18 +10,20 @@ import Canton.Vault.V1
 ulp : Decimal
 ulp = 0.0000000001
 
--- Daml rounds half-even, so these correct the result back afterwards.
+-- `a * b` needs up to twenty decimals, so the product is held at that scale and
+-- only the division rounds. Comparing against the exact product then corrects
+-- the direction. Amounts at or above 10^18 overflow `Numeric 20` and fail.
 mulDivDown : Decimal -> Decimal -> Decimal -> Decimal
 mulDivDown a b c =
-  let p = a * b
-      r = p / c
-  in if r * c > p then r - ulp else r
+  let p = N.mul @20 a b
+      r = N.div @10 p c
+  in if N.mul @20 r c > p then r - ulp else r
 
 mulDivUp : Decimal -> Decimal -> Decimal -> Decimal
 mulDivUp a b c =
-  let p = a * b
-      r = p / c
-  in if r * c < p then r + ulp else r
+  let p = N.mul @20 a b
+      r = N.div @10 p c
+  in if N.mul @20 r c < p then r + ulp else r
 
 elapsedSeconds : Time -> Time -> Decimal
 elapsedSeconds from to =
