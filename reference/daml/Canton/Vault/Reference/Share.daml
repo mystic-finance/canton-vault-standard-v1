@@ -1,28 +1,22 @@
--- | Vault shares as token standard holdings, issued by the vault registrar.
-module Canton.Vault.Reference.Share where
+-- | Vault shares: Splice's V2 test token, jointly signed by holder and registrar.
+module Canton.Vault.Reference.Share
+  ( ShareHolding
+  , mintShares
+  , burnShares
+  ) where
 
 import Splice.Api.Token.MetadataV1
 import Splice.Api.Token.HoldingV2 qualified as V2
 import Splice.TokenStandard.Utils
+import Splice.Testing.Tokens.TestTokenV2.Holding (Token(..))
 
-template ShareHolding
-  with
-    holding : V2.HoldingView
-  where
-    -- Jointly signed, so shares cannot be issued or burned without the account
-    -- parties' authority.
-    signatory accountParties holding.instrumentId.admin holding.account, holding.instrumentId.admin
-
-    ensure holding.amount > 0.0 && isRegularAccount holding.account
-
-    interface instance V2.Holding for ShareHolding where
-      view = holding
+type ShareHolding = Token
 
 -- | Requires the admin's authority.
 mintShares : V2.InstrumentId -> V2.Account -> Decimal -> Update (ContractId ShareHolding)
 mintShares instrumentId account amount = do
   require "mint amount is positive" (amount > 0.0)
-  create ShareHolding with
+  create Token with
     holding = V2.HoldingView with
       instrumentId
       account

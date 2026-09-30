@@ -1,0 +1,216 @@
+-- | The read methods against the actions, over random vault states from a fixed seed.
+module Canton.Vault.Test.Conformance where
+
+import DA.Assert ((===))
+import DA.Foldable (forA_)
+import Daml.Script
+
+import Canton.Vault.V1
+import Canton.Vault.Reference.Share
+import Canton.Vault.Reference.V1
+import Canton.Vault.Test.Deposit
+import Canton.Vault.Test.MockToken
+import Canton.Vault.Test.Periods
+
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.HoldingV2 qualified as V2
+import Splice.TokenStandard.Utils
+
+next : Int -> Int
+next s = (s * 1103515245 + 12345) % 2147483648
+
+-- | Between 0.001 and 100,000, to three places.
+amountFrom : Int -> Decimal
+amountFrom s = intToDecimal (1 + s % 100000000) / 1000.0
+
+ulp : Decimal
+ulp = 0.0000000001
+
+data State = State with
+  f : Fixture
+  vaultCid : ContractId ReferenceVault
+  seed : Int
+
+-- | A vault after a random history: a fee, another depositor, then yield or a loss.
+randomState : Int -> Optional Decimal -> Script State
+randomState seed cap = do
+  let s1 = next seed
+      s2 = next s1
+      s3 = next s2
+      s4 = next s3
+      fee = case s1 % 4 of { 0 -> 0; 1 -> 30; 2 -> 250; _ -> 999 }
+  f <- setupVaultFull fee None cap
+  bob <- allocateParty "bob"
+  _ <- deposit f f.vaultTemplateCid bob (maybe identity min cap (amountFrom s2))
+  case s3 % 3 of
+    0 -> pure ()
+    1 -> do
+      _ <- fund f f.custodian (amountFrom s4)
+      pure ()
+    _ -> shrinkPool f (intToDecimal (5 + s4 % 90) / 100.0)
+  rolled <- rollPeriod f f.vaultTemplateCid
+  pure State with f; vaultCid = rolled; seed = s4
+
+shrinkPool : Fixture -> Decimal -> Script ()
+shrinkPool f fraction = do
+  pool <- query @MockHolding f.custodian
+  let total = sum [h.holding.amount | (_, h) <- pool]
+  forA_ pool $ \(cid, _) -> submitMulti [f.underlyingAdmin, f.custodian] [] (archiveCmd cid)
+  _ <- fund f f.custodian (total * fraction)
+  pure ()
+
+sharesOf : State -> Party -> Script [ContractId ShareHolding]
+sharesOf st party =
+  map fst . filter (\(_, h) -> h.holding.instrumentId == st.f.shares) <$> query @ShareHolding party
+
+quote : State -> Party -> Decimal -> Decimal -> Script Quote
+quote st party assets shares = do
+  held <- sharesOf st party
+  submit st.f.registrar do
+    createAndExerciseCmd (QuoteProbe with caller = st.f.registrar) Probe_Quote with
+      vaultCid = toInterfaceContractId st.vaultCid
+      party
+      assets
+      shares
+      extraArgs = redeemArgs st.f [] held
+
+vaultOf : State -> ContractId Vault
+vaultOf st = toInterfaceContractId st.vaultCid
+
+act : State -> Party -> Commands VaultActionResult -> Script (Either SubmitError VaultActionResult)
+act st party cmd = do
+  ds <- disclosuresFor st.f st.vaultCid
+  pool <- poolDisclosures st.f
+  trySubmit (actAs party <> discloseMany (ds <> pool)) cmd
+
+depositAs : State -> Party -> Decimal -> Script (Either SubmitError VaultActionResult)
+depositAs st party assets = do
+  funds <- fund st.f party assets
+  act st party $ exerciseCmd (vaultOf st) Vault_Deposit with
+    assets
+    receiver = party
+    minSharesOut = None
+    actors = [party]
+    extraArgs = depositArgs st.f [funds]
+
+mintAs : State -> Party -> Decimal -> Decimal -> Script (Either SubmitError VaultActionResult)
+mintAs st party shares budget = do
+  funds <- fund st.f party budget
+  act st party $ exerciseCmd (vaultOf st) Vault_Mint with
+    shares
+    receiver = party
+    maxAssetsIn = None
+    actors = [party]
+    extraArgs = depositArgs st.f [funds]
+
+withdrawAs : State -> Party -> Decimal -> Script (Either SubmitError VaultActionResult)
+withdrawAs st party assets = do
+  pool <- query @MockHolding st.f.custodian
+  held <- sharesOf st party
+  act st party $ exerciseCmd (vaultOf st) Vault_Withdraw with
+    assets
+    owner = party
+    receiver = party
+    maxSharesIn = None
+    actors = [party]
+    extraArgs = redeemArgs st.f (map (toInterfaceContractId . fst) pool) held
+
+redeemAs : State -> Party -> Decimal -> Script (Either SubmitError VaultActionResult)
+redeemAs st party shares = do
+  pool <- query @MockHolding st.f.custodian
+  held <- sharesOf st party
+  act st party $ exerciseCmd (vaultOf st) Vault_Redeem with
+    shares
+    owner = party
+    receiver = party
+    minAssetsOut = None
+    actors = [party]
+    extraArgs = redeemArgs st.f (map (toInterfaceContractId . fst) pool) held
+
+succeeded : Text -> Either SubmitError VaultActionResult -> Script VaultActionResult
+succeeded what result = case result of
+  Right r -> pure r
+  Left e -> abort (what <> " failed: " <> show e)
+
+refused : Text -> Either SubmitError VaultActionResult -> Script ()
+refused what result = case result of
+  Left _ -> pure ()
+  Right r -> abort (what <> " should have been refused, but moved " <> show r.assets)
+
+seeds : Int -> [Int]
+seeds n = [7919 * i | i <- [1 .. n]]
+
+stream : Int -> Int -> [Int]
+stream n s = if n <= 0 then [] else s :: stream (n - 1) (next s)
+
+-- Properties
+--------------
+
+-- | Each preview is what its action then does.
+previewsMatchActions : Script ()
+previewsMatchActions = script do
+  forA_ (seeds 12) $ \seed -> do
+    st <- randomState seed None
+    alice <- allocateParty "alice"
+    let a = amountFrom (next st.seed)
+        s = amountFrom (next (next st.seed))
+    q <- quote st alice a s
+    d <- succeeded "deposit" =<< depositAs st alice a
+    d.shares === q.depositPreview
+    m <- succeeded "mint" =<< mintAs st alice s (q.mintPreview + 1.0)
+    m.assets === q.mintPreview
+    q2 <- quote st alice (a / 2.0) (s / 2.0)
+    w <- succeeded "withdraw" =<< withdrawAs st alice (a / 2.0)
+    w.shares === q2.withdrawPreview
+    r <- succeeded "redeem" =<< redeemAs st alice (s / 2.0)
+    r.assets === q2.redeemPreview
+
+-- | A preview is never better than the fee-free conversion.
+conversionsBoundPreviews : Script ()
+conversionsBoundPreviews = script do
+  forA_ (seeds 8) $ \seed -> do
+    st <- randomState seed None
+    alice <- allocateParty "alice"
+    forA_ (stream 10 st.seed) $ \s -> do
+      let a = amountFrom s
+          n = amountFrom (next s)
+      q <- quote st alice a n
+      assertMsg "previewDeposit <= convertToShares" (q.depositPreview <= q.toShares)
+      assertMsg "previewRedeem <= convertToAssets" (q.redeemPreview <= q.toAssets)
+      assertMsg "previewMint >= convertToAssets" (q.mintPreview >= q.toAssets)
+      assertMsg "previewWithdraw >= convertToShares" (q.withdrawPreview >= q.toShares)
+
+-- | No round trip returns more than it put in.
+roundTripsDoNotProfit : Script ()
+roundTripsDoNotProfit = script do
+  forA_ (seeds 10) $ \seed -> do
+    st <- randomState seed None
+    alice <- allocateParty "alice"
+    let a = amountFrom (next st.seed)
+        s = amountFrom (next (next st.seed))
+    d <- succeeded "deposit" =<< depositAs st alice a
+    r <- succeeded "redeem" =<< redeemAs st alice d.shares
+    assertMsg ("deposit then redeem returned " <> show r.assets <> " for " <> show a) (r.assets <= a)
+    q <- quote st alice 0.0 s
+    m <- succeeded "mint" =<< mintAs st alice s (q.mintPreview + 1.0)
+    r2 <- succeeded "redeem" =<< redeemAs st alice s
+    assertMsg ("mint then redeem returned " <> show r2.assets <> " for " <> show m.assets) (r2.assets <= m.assets)
+
+-- | Each max is achievable, and a unit past the deposit and redeem limits is refused.
+maxLimitsAreExact : Script ()
+maxLimitsAreExact = script do
+  forA_ (seeds 10) $ \seed -> do
+    let cap = amountFrom (next (next seed)) + 1.0
+    st <- randomState seed (Some cap)
+    alice <- allocateParty "alice"
+    q <- quote st alice 1.0 1.0
+    _ <- succeeded "deposit at maxDeposit" =<< depositAs st alice q.depositMax
+    refused "deposit past maxDeposit" =<< depositAs st alice (q.depositMax + ulp)
+    _ <- succeeded "mint at maxMint" =<< mintAs st alice q.mintMax (cap + 1.0)
+    q2 <- quote st alice 1.0 1.0
+    _ <- succeeded "withdraw at maxWithdraw" =<< withdrawAs st alice q2.withdrawMax
+    _ <- succeeded "deposit" =<< depositAs st alice q.depositMax
+    q3 <- quote st alice 1.0 1.0
+    refused "redeem past maxRedeem" =<< redeemAs st alice (q3.redeemMax + ulp)
+    _ <- succeeded "redeem at maxRedeem" =<< redeemAs st alice q3.redeemMax
+    pure ()

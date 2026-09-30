@@ -130,12 +130,14 @@ interface Vault where
   -- vault's own limit rather than theirs.
   maxDeposit : Party -> ExtraArgs -> Update Decimal
 
-  -- | Most the party may mint in one call right now. Zero as for `maxDeposit`.
+  -- | Most the party may mint in one call right now, with the fee included in
+  -- what counts against any limit. Zero as for `maxDeposit`.
   maxMint : Party -> ExtraArgs -> Update Decimal
 
-  -- | What the party's named share holdings are worth. Reading the pool needs
-  -- the custodian's authority, which a read method does not carry, so available
-  -- liquidity is not reflected and a withdrawal may still fail for want of it.
+  -- | Most of the underlying the party's named share holdings can withdraw,
+  -- after the fee. Reading the pool needs the custodian's authority, which a
+  -- read method does not carry, so available liquidity is not reflected and a
+  -- withdrawal may still fail for want of it.
   maxWithdraw : Party -> ExtraArgs -> Update Decimal
 
   -- | The party's named share holdings. Liquidity as for `maxWithdraw`.

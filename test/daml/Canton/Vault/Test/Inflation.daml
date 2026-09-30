@@ -13,9 +13,7 @@ import Canton.Vault.Test.MockToken
 import Splice.Api.Token.HoldingV2 qualified as V2
 import Splice.TokenStandard.Utils
 
--- | An attacker takes one unit of shares, then donates a large amount straight
--- to the custodian so the next period prices shares enormously. The victim's
--- deposit must still be worth what they paid.
+-- | A donation after the attacker's first share still leaves the victim's deposit whole.
 donationBeforeTheFirstDepositDoesNotRobTheNext : Script ()
 donationBeforeTheFirstDepositDoesNotRobTheNext = script do
   f <- setupVault
@@ -84,8 +82,7 @@ donationBeforeTheFirstDepositDoesNotRobTheNext = script do
     ("victim paid 100.0, shares are worth " <> show backing)
     (backing >= 99.9)
 
-  -- And the attacker cannot get the donation back: the shares they bought for
-  -- one unit are still worth about one unit.
+  -- The attacker cannot recover the donation.
   attackerBacking <- submit f.registrar do
     createAndExerciseCmd (MaxRedeemProbe with caller = f.registrar) (Probe_ConvertToAssets with
       vaultCid = toInterfaceContractId rolledCid
@@ -95,9 +92,7 @@ donationBeforeTheFirstDepositDoesNotRobTheNext = script do
     (attackerBacking < 1.0)
 
 
--- | A depositor supplying their own transfer factory is refused: the factory
--- must administer the instrument it is being asked to move. Without the check
--- this mints shares for nothing.
+-- | A factory the depositor supplies must administer the instrument, or it mints for nothing.
 suppliedFactoryMustAdministerTheInstrument : Script ()
 suppliedFactoryMustAdministerTheInstrument = script do
   f <- setupVault

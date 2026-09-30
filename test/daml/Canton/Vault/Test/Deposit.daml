@@ -48,7 +48,7 @@ setupVaultFull feeBps vaultAccrual cap = do
   alice <- allocateParty "alice"
 
   let underlying = V2.InstrumentId with admin = underlyingAdmin; id = "USD"
-      shares = V2.InstrumentId with admin = registrar; id = "vUSD"
+      shares = V2.InstrumentId with admin = registrar; id = "reference-1"
 
   registryTemplateCid <- submit underlyingAdmin do
     createCmd MockRegistry with admin = underlyingAdmin
@@ -78,8 +78,7 @@ setupVaultFull feeBps vaultAccrual cap = do
     registryTemplateCid
     underlying; shares
 
--- | Neither the vault nor the registry is visible to a depositor, so both are
--- disclosed on every submission.
+-- | The vault and registry, disclosed, since a depositor sees neither.
 vaultDisclosure : Fixture -> Script [Disclosure]
 vaultDisclosure f = do
   vault <- queryDisclosure f.registrar f.vaultTemplateCid
@@ -241,8 +240,7 @@ redeemRequiresTheOwner = script do
         (map (toInterfaceContractId . fst) custodianHoldings)
         (map fromInterfaceContractId depositResult.holdingCids)
 
--- | Two deposits in one period price identically, and the roll folds both in
--- along with the period's yield.
+-- | Deposits in one period price the same, and the roll folds them in with the yield.
 periodRollCarriesTotals : Script ()
 periodRollCarriesTotals = script do
   f <- setupVault
@@ -274,8 +272,7 @@ periodRollCarriesTotals = script do
   flows <- query @PeriodFlow f.registrar
   length flows === 2
 
-  -- Yield arrives in the pool. The roll has to find it there; the registrar
-  -- cannot simply state it.
+  -- Yield arrives in the pool, where the roll must find it.
   _ <- fund f f.custodian 10.0
   custodianHoldings <- query @MockHolding f.custodian
   poolDisclosures <- forA custodianHoldings $ \(cid, _) -> do
@@ -298,8 +295,7 @@ periodRollCarriesTotals = script do
   remaining <- query @PeriodFlow f.registrar
   length remaining === 0
 
--- | The pool cannot be inflated with holdings of another instrument, even
--- though the custodian owns them.
+-- | Holdings of another instrument cannot inflate the pool, even the custodian's.
 rollRejectsWrongInstrument : Script ()
 rollRejectsWrongInstrument = script do
   f <- setupVault
@@ -360,8 +356,7 @@ providerCanDepositForOwner = script do
 
   result.shares === 100.0
 
--- | The declared actors must be exactly the funding account's parties. Both
--- parties authorize here, so only the vault's own check can reject this.
+-- | The actors must be exactly the funding account's parties; only the vault's check refuses this.
 actorsMustMatchTheFundingAccount : Script ()
 actorsMustMatchTheFundingAccount = script do
   f <- setupVault

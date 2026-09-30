@@ -1,0 +1,156 @@
+-- | The vault at its edges: limits, an empty vault, a donation, several users.
+module Canton.Vault.Test.Edges where
+
+import DA.Assert ((===))
+import Daml.Script
+
+import Canton.Vault.Reference.V1
+import Canton.Vault.Test.Conformance
+import Canton.Vault.Test.Deposit
+import Canton.Vault.Test.MockToken
+import Canton.Vault.Test.Periods
+
+fixed : Fixture -> State
+fixed f = State with f; vaultCid = f.vaultTemplateCid; seed = 0
+
+rolled : State -> Script State
+rolled st = do
+  cid <- rollPeriod st.f st.vaultCid
+  pure st with vaultCid = cid
+
+totals : State -> Script (Decimal, Decimal)
+totals st = do
+  Some v <- queryContractId st.f.registrar st.vaultCid
+  pure (v.totalShares, v.totalAssets)
+
+held : State -> Party -> Script Decimal
+held st party = do
+  cids <- sharesOf st party
+  amounts <- forA cids $ \cid -> do
+    Some h <- queryContractId party cid
+    pure h.holding.amount
+  pure (sum amounts)
+
+-- Limits
+----------
+
+-- | More than maxMint is refused; one percent more, since a max may round a little under.
+mintAboveMaxMintIsRefused : Script ()
+mintAboveMaxMintIsRefused = script do
+  f <- setupVaultFull 250 None (Some 1000.0)
+  alice <- allocateParty "alice"
+  let st = fixed f
+  q <- quote st alice 1.0 1.0
+  refused "mint above maxMint" =<< mintAs st alice (q.mintMax * 1.01) 2000.0
+
+withdrawAboveMaxWithdrawIsRefused : Script ()
+withdrawAboveMaxWithdrawIsRefused = script do
+  f <- setupFeeVault 250
+  alice <- allocateParty "alice"
+  _ <- succeeded "deposit" =<< depositAs (fixed f) alice 1000.0
+  st <- rolled (fixed f)
+  q <- quote st alice 1.0 1.0
+  refused "withdraw above maxWithdraw" =<< withdrawAs st alice (q.withdrawMax * 1.01)
+
+-- Empty vault
+---------------
+
+emptyVaultStatus : Script ()
+emptyVaultStatus = script do
+  f <- setupVault
+  alice <- allocateParty "alice"
+  let st = fixed f
+  totals st >>= (=== (0.0, 0.0))
+  q <- quote st alice 1.0 1.0
+  (q.toShares, q.toAssets) === (1.0, 1.0)
+  (q.depositPreview, q.mintPreview, q.withdrawPreview, q.redeemPreview) === (1.0, 1.0, 1.0, 1.0)
+  (q.withdrawMax, q.redeemMax) === (0.0, 0.0)
+
+emptyVaultMint : Script ()
+emptyVaultMint = script do
+  f <- setupVault
+  alice <- allocateParty "alice"
+  m <- succeeded "mint" =<< mintAs (fixed f) alice 1.0 10.0
+  (m.shares, m.assets) === (1.0, 1.0)
+
+-- | With nothing deposited there is nothing to take out.
+emptyVaultWithdrawAndRedeemAreRefused : Script ()
+emptyVaultWithdrawAndRedeemAreRefused = script do
+  f <- setupVault
+  alice <- allocateParty "alice"
+  let st = fixed f
+  refused "withdraw from an empty vault" =<< withdrawAs st alice 1.0
+  refused "redeem from an empty vault" =<< redeemAs st alice 1.0
+
+-- Inflation attack
+--------------------
+
+-- | A donation before any deposit stays with the virtual share; later depositors lose nothing.
+inflationAttack : Script ()
+inflationAttack = script do
+  f <- setupVault
+  donor <- allocateParty "donor"
+  victim <- allocateParty "victim"
+  _ <- fund f f.custodian 999999.0
+  st <- rolled (fixed f)
+  totals st >>= (=== (0.0, 999999.0))
+
+  q <- quote st victim 1.0 1.0
+  (q.toShares, q.toAssets) === (0.000001, 1000000.0)
+  d <- quote st donor 1.0 1.0
+  (d.withdrawMax, d.redeemMax) === (0.0, 0.0)
+
+  dep <- succeeded "deposit" =<< depositAs st victim 100.0
+  dep.shares === 0.0001
+  mnt <- succeeded "mint" =<< mintAs st victim 0.0001 200.0
+  mnt.assets === 100.0
+  red <- succeeded "redeem" =<< redeemAs st victim 0.0002
+  red.assets === 200.0
+
+-- Several users
+-----------------
+
+-- | Interleaved mints, deposits, yield, redemptions and withdrawals, rolling after each step.
+multipleUsersInterleaved : Script ()
+multipleUsersInterleaved = script do
+  f <- setupVault
+  alice <- allocateParty "alice"
+  bruce <- allocateParty "bruce"
+  let step st action = action >>= \r -> rolled st >>= \st' -> pure (r, st')
+      yieldOf st amount = fund f f.custodian amount >> rolled st
+  let st0 = fixed f
+
+  (m1, st1) <- step st0 (succeeded "1 alice mints" =<< mintAs st0 alice 2000.0 3000.0)
+  m1.assets === 2000.0
+  (m2, st2) <- step st1 (succeeded "2 bruce mints" =<< mintAs st1 bruce 4000.0 5000.0)
+  m2.assets === 4000.0
+  totals st2 >>= (=== (6000.0, 6000.0))
+
+  st3 <- yieldOf st2 3000.0
+  totals st3 >>= (=== (6000.0, 9000.0))
+
+  (d4, st4) <- step st3 (succeeded "4 alice deposits" =<< depositAs st3 alice 2000.0)
+  d4.shares === 1333.4073991778
+  (m5, st5) <- step st4 (succeeded "5 bruce mints" =<< mintAs st4 bruce 2000.0 4000.0)
+  m5.assets === 2999.8333611066
+
+  st6 <- yieldOf st5 3000.0
+  (r7, st7) <- step st6 (succeeded "7 alice redeems" =<< redeemAs st6 alice 1333.0)
+  r7.assets === 2427.8039195451
+  (w8, st8) <- step st7 (succeeded "8 bruce withdraws" =<< withdrawAs st7 bruce 2929.0)
+  w8.shares === 1608.1846513913
+
+  q9 <- quote st8 alice 1.0 1.0
+  q9.withdrawMax === 3643.3585329415
+  (w9, st9) <- step st8 (succeeded "9 alice withdraws all" =<< withdrawAs st8 alice q9.withdrawMax)
+  w9.shares === 2000.4073991778
+
+  left <- held st9 bruce
+  left === 4391.8153486087
+  (r10, st10) <- step st9 (succeeded "10 bruce redeems all" =<< redeemAs st9 bruce left)
+  r10.assets === 7998.8496003532
+
+  held st10 alice >>= (=== 0.0)
+  held st10 bruce >>= (=== 0.0)
+  -- The rounding remainder stays in the vault.
+  totals st10 >>= (=== (0.0, 0.8213082668))

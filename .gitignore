@@ -35,3 +35,4 @@ docs/plan.md
 scripts/guard_coverage.py
 docs/design.md
 service/
+scripts/localnet/

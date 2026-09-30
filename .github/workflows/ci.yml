@@ -46,5 +46,5 @@ jobs:
         with:
           name: dars
           path: |
-            api/.daml/dist/*.dar
+            api/*/.daml/dist/*.dar
             reference/.daml/dist/*.dar

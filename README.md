@@ -32,7 +32,7 @@ when it opens the next rate period.
 
 | | |
 | --- | --- |
-| `api/` | `canton-vault-standard-v1` — the `Vault` interface and its types |
+| `api/canton-vault-v1/` | `canton-vault-v1` — the `Vault` interface and its types, which every vault implements |
 | `reference/` | `canton-vault-reference-v1` — a vault implementing it |
 | `test/` | `canton-vault-standard-test` — Daml Script tests and a mock underlying registry |
 | `dependencies/` | Vendored Splice DARs; see `dependencies/VERSIONS.md` |
@@ -49,4 +49,4 @@ cd test && dpm test
 
 ## License
 
-Apache 2.0 — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE).

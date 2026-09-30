@@ -1,0 +1,207 @@
+-- | Settling an async deposit across two instrument admins.
+module Canton.Vault.Test.CrossAdminSettlement where
+
+import DA.Assert ((===))
+import DA.TextMap qualified as TextMap
+import Daml.Script
+
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.HoldingV2 qualified as V2
+import Splice.Api.Token.AllocationV2 qualified as V2
+import Splice.Api.Token.AllocationInstructionV2 qualified as V2
+import Splice.TokenStandard.Utils
+import Splice.Testing.Tokens.TestTokenV2 (TokenRules(..))
+import Splice.Testing.Tokens.TestTokenV2.AccountConfig (accountConfigsContextKey)
+import Splice.Testing.Tokens.TestTokenV2.Holding (Token(..))
+import Splice.Testing.Tokens.TestTokenV2.Util (tokenRulesContextKey)
+
+-- | A test-token registry, and the disclosure non-stakeholders need to use it.
+data Registry = Registry with
+  admin : Party
+  rulesCid : ContractId TokenRules
+  disclosure : Disclosure
+
+setupTokenRegistry : Text -> Script Registry
+setupTokenRegistry name = do
+  admin <- allocateParty name
+  rulesCid <- submit admin do createCmd TokenRules with admin
+  d <- queryDisclosure admin rulesCid
+  case d of
+    Some disclosure -> pure Registry with admin; rulesCid; disclosure
+    None -> abort "token rules disclosure not available"
+
+-- | The context the test token expects; basic accounts need no account configs.
+tokenArgs : Registry -> ExtraArgs
+tokenArgs r = ExtraArgs with
+  context = ChoiceContext with
+    values = TextMap.fromList
+      [ (accountConfigsContextKey, AV_List [])
+      , (tokenRulesContextKey, AV_ContractId (toAnyContractId r.rulesCid))
+      ]
+  meta = emptyMetadata
+
+sideOf : V2.TransferSide -> V2.TransferLeg -> V2.TransferLegSide
+sideOf side leg = V2.TransferLegSide with
+  transferLegId = leg.transferLegId
+  side
+  otherside = if side == V2.SenderSide then leg.receiver else leg.sender
+  amount = leg.amount
+  instrumentId = leg.instrumentId
+  meta = emptyMetadata
+
+allocate : Registry -> V2.SettlementInfo -> [Party] -> V2.Account -> V2.TransferLegSide -> [ContractId V2.Holding] -> Script (ContractId V2.Allocation)
+allocate r settlement actors authorizer side inputs = do
+  now <- getTime
+  result <- submit (actAs actors <> discloseMany [r.disclosure]) do
+    exerciseCmd (toInterfaceContractId r.rulesCid : ContractId V2.AllocationFactory)
+      V2.AllocationFactory_Allocate with
+        settlement
+        allocation = V2.AllocationSpecification with
+          admin = r.admin
+          authorizer
+          transferLegSides = [side]
+          settlementDeadline = None
+          nextIterationFunding = None
+          committed = False
+          meta = emptyMetadata
+        requestedAt = now
+        inputHoldingCids = inputs
+        extraArgs = tokenArgs r
+        actors
+  case result.output of
+    V2.AllocationInstructionResult_Completed with allocationCid -> pure allocationCid
+    other -> abort ("expected a completed allocation, got " <> show other)
+
+-- | The tokens an allocation locked, disclosed so the executor can consume them.
+lockedTokens : Registry -> [ContractId V2.Allocation] -> Script [Disclosure]
+lockedTokens r allocations = do
+  views <- forA allocations $ \cid -> queryInterfaceContractId @V2.Allocation r.admin cid
+  let holdingCids = concat [v.holdingCids | Some v <- views]
+  forA holdingCids $ \cid -> do
+    d <- queryDisclosure r.admin (fromInterfaceContractId cid : ContractId Token)
+    case d of
+      Some d' -> pure d'
+      None -> abort "locked token disclosure not available"
+
+settleCmd : Registry -> Party -> V2.SettlementInfo -> V2.TransferLeg -> [ContractId V2.Allocation] -> Commands V2.SettlementFactory_SettleBatchResult
+settleCmd r venue settlement leg allocations =
+  exerciseCmd (toInterfaceContractId r.rulesCid : ContractId V2.SettlementFactory)
+    V2.SettlementFactory_SettleBatch with
+      settlement
+      transferLegs = [leg]
+      allocations =
+        [ V2.FinalizedAllocation with allocationCid; extraTransferLegSides = []; nextIterationFunding = None
+        | allocationCid <- allocations ]
+      actors = [venue]
+      extraArgs = tokenArgs r
+
+balanceOf : Registry -> Party -> Text -> Script Decimal
+balanceOf r party instrument = do
+  held <- query @Token party
+  pure (sum [h.holding.amount | (_, h) <- held, h.holding.instrumentId == V2.InstrumentId with admin = r.admin; id = instrument])
+
+data Deposit = Deposit with
+  underlying : Registry
+  shares : Registry
+  alice : Party
+  custodian : Party
+  venue : Party
+  settlement : V2.SettlementInfo
+  underlyingLeg : V2.TransferLeg
+  shareLeg : V2.TransferLeg
+  underlyingAllocations : [ContractId V2.Allocation]
+  aliceShareAllocation : ContractId V2.Allocation
+  mintAllocation : ContractId V2.Allocation
+
+-- | Alice deposits 100 USD for 100 new vUSD, each side approved by its own party.
+depositAllocations : Script Deposit
+depositAllocations = do
+  underlying <- setupTokenRegistry "usdAdmin"
+  shares <- setupTokenRegistry "vaultRegistrar"
+  alice <- allocateParty "alice"
+  custodian <- allocateParty "custodian"
+  venue <- allocateParty "venue"
+
+  usdCid <- submitMulti [alice, underlying.admin] [] do
+    createCmd Token with
+      holding = V2.HoldingView with
+        account = basicAccount alice
+        instrumentId = V2.InstrumentId with admin = underlying.admin; id = "USD"
+        amount = 100.0
+        lock = None
+        meta = emptyMetadata
+
+  let settlement = V2.SettlementInfo with
+        executors = [venue]
+        id = "deposit-1"
+        cid = None
+        meta = emptyMetadata
+      underlyingLeg = V2.TransferLeg with
+        transferLegId = "underlying"
+        sender = basicAccount alice
+        receiver = basicAccount custodian
+        amount = 100.0
+        instrumentId = "USD"
+        meta = emptyMetadata
+      shareLeg = V2.TransferLeg with
+        transferLegId = "shares"
+        sender = mintAccount
+        receiver = basicAccount alice
+        amount = 100.0
+        instrumentId = "vUSD"
+        meta = emptyMetadata
+
+  aliceUsd <- allocate underlying settlement [alice] (basicAccount alice) (sideOf V2.SenderSide underlyingLeg) [toInterfaceContractId usdCid]
+  custodianUsd <- allocate underlying settlement [custodian] (basicAccount custodian) (sideOf V2.ReceiverSide underlyingLeg) []
+  mintAllocation <- allocate shares settlement [shares.admin] mintAccount (sideOf V2.SenderSide shareLeg) []
+  aliceShareAllocation <- allocate shares settlement [alice] (basicAccount alice) (sideOf V2.ReceiverSide shareLeg) []
+
+  pure Deposit with
+    underlying; shares; alice; custodian; venue; settlement; underlyingLeg; shareLeg
+    underlyingAllocations = [aliceUsd, custodianUsd]
+    aliceShareAllocation; mintAllocation
+
+-- | One batch per admin in a single transaction, so neither settles alone.
+settleBoth : Deposit -> [ContractId V2.Allocation] -> [ContractId V2.Allocation] -> Script (Either SubmitError ())
+settleBoth d underlyingAllocations shareAllocations = do
+  locked <- lockedTokens d.underlying d.underlyingAllocations
+  let ds = [d.underlying.disclosure, d.shares.disclosure] <> locked
+  trySubmit (actAs d.venue <> discloseMany ds) $
+    settleCmd d.underlying d.venue d.settlement d.underlyingLeg underlyingAllocations
+      *> settleCmd d.shares d.venue d.settlement d.shareLeg shareAllocations
+      *> pure ()
+
+settlesADepositAcrossTwoAdmins : Script ()
+settlesADepositAcrossTwoAdmins = script do
+  d <- depositAllocations
+  result <- settleBoth d d.underlyingAllocations [d.mintAllocation, d.aliceShareAllocation]
+  case result of
+    Right () -> pure ()
+    Left err -> abort ("settlement failed: " <> show err)
+  balanceOf d.underlying d.custodian "USD" >>= (=== 100.0)
+  balanceOf d.underlying d.alice "USD" >>= (=== 0.0)
+  balanceOf d.shares d.alice "vUSD" >>= (=== 100.0)
+
+-- | Without Alice's approval, the share batch fails and the USD batch rolls back.
+failedShareLegLeavesTheUnderlyingUnmoved : Script ()
+failedShareLegLeavesTheUnderlyingUnmoved = script do
+  d <- depositAllocations
+  result <- settleBoth d d.underlyingAllocations [d.mintAllocation]
+  case result of
+    Left _ -> pure ()
+    Right () -> abort "expected the settlement to fail"
+  balanceOf d.underlying d.custodian "USD" >>= (=== 0.0)
+  balanceOf d.underlying d.alice "USD" >>= (=== 100.0)
+  balanceOf d.shares d.alice "vUSD" >>= (=== 0.0)
+
+-- | Without the custodian's approval, the USD batch fails and no shares are minted.
+failedUnderlyingLegMintsNoShares : Script ()
+failedUnderlyingLegMintsNoShares = script do
+  d <- depositAllocations
+  result <- settleBoth d (take 1 d.underlyingAllocations) [d.mintAllocation, d.aliceShareAllocation]
+  case result of
+    Left _ -> pure ()
+    Right () -> abort "expected the settlement to fail"
+  balanceOf d.shares d.alice "vUSD" >>= (=== 0.0)
+  balanceOf d.underlying d.custodian "USD" >>= (=== 0.0)
+  balanceOf d.underlying d.alice "USD" >>= (=== 100.0)

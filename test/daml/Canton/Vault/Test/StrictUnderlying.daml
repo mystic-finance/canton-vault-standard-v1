@@ -1,0 +1,113 @@
+-- | An underlying that completes a transfer only for a receiver who acts or has a preapproval.
+module Canton.Vault.Test.StrictUnderlying where
+
+import DA.Assert ((===))
+import DA.TextMap qualified as TextMap
+import Daml.Script
+
+import Canton.Vault.V1
+import Canton.Vault.Reference.Share
+import Canton.Vault.Test.Deposit
+import Canton.Vault.Test.MockToken
+import Canton.Vault.Test.Periods
+
+import Splice.Api.Token.MetadataV1
+import Splice.TokenStandard.Utils
+
+-- | The fixture with its underlying registry swapped for a strict one.
+setupStrict : Script (Fixture, [Disclosure])
+setupStrict = do
+  f <- setupVault
+  strictCid <- submit f.underlyingAdmin do
+    createCmd StrictRegistry with admin = f.underlyingAdmin
+  vaultD <- queryDisclosure f.registrar f.vaultTemplateCid
+  strictD <- queryDisclosure f.underlyingAdmin strictCid
+  case (vaultD, strictD) of
+    (Some v, Some s) -> pure ((f with registryCid = toInterfaceContractId strictCid), [v, s])
+    _ -> abort "disclosures not available"
+
+-- | The standing preapproval a vault's custodian holds from launch.
+custodianPreapproval : Fixture -> Script (ContractId MockPreapproval, Disclosure)
+custodianPreapproval f = do
+  cid <- submit f.custodian do
+    createCmd MockPreapproval with admin = f.underlyingAdmin; receiver = f.custodian
+  d <- queryDisclosure f.custodian cid
+  case d of
+    Some d' -> pure (cid, d')
+    None -> abort "preapproval disclosure not available"
+
+withPreapproval : ContractId MockPreapproval -> ExtraArgs -> ExtraArgs
+withPreapproval cid args = args with
+  context = args.context with
+    values = TextMap.insert preapprovalKey (AV_ContractId (toAnyContractId cid)) args.context.values
+
+-- | Alice deposits 100 into a vault whose custodian holds a preapproval.
+depositWithPreapproval : Fixture -> [Disclosure] -> Script VaultActionResult
+depositWithPreapproval f ds = do
+  (preCid, preD) <- custodianPreapproval f
+  funds <- fund f f.alice 100.0
+  submit (actAs f.alice <> discloseMany (ds <> [preD])) do
+    exerciseCmd f.vaultCid Vault_Deposit with
+      assets = 100.0
+      receiver = f.alice
+      minSharesOut = None
+      actors = [f.alice]
+      extraArgs = withPreapproval preCid (depositArgsFor f f.registryCid [funds])
+
+depositCompletesWithTheCustodiansPreapproval : Script ()
+depositCompletesWithTheCustodiansPreapproval = script do
+  (f, ds) <- setupStrict
+  result <- depositWithPreapproval f ds
+  result.shares === 100.0
+
+-- | Without the preapproval the transfer stays pending, so no shares are minted.
+depositWithoutAPreapprovalIsRefused : Script ()
+depositWithoutAPreapprovalIsRefused = script do
+  (f, ds) <- setupStrict
+  funds <- fund f f.alice 100.0
+  submitMustFail (actAs f.alice <> discloseMany ds) do
+    exerciseCmd f.vaultCid Vault_Deposit with
+      assets = 100.0
+      receiver = f.alice
+      minSharesOut = None
+      actors = [f.alice]
+      extraArgs = depositArgsFor f f.registryCid [funds]
+
+redeemCompletesWhenTheRegistryWantsTheReceiver : Script ()
+redeemCompletesWhenTheRegistryWantsTheReceiver = script do
+  (f, ds) <- setupStrict
+  first <- depositWithPreapproval f ds
+  rolled <- rollPeriod f f.vaultTemplateCid
+  rolledDs <- disclosuresFor f rolled
+  poolDs <- poolDisclosures f
+  pool <- query @MockHolding f.custodian
+  shares <- map fst <$> query @ShareHolding f.alice
+  result <- submit (actAs f.alice <> discloseMany (take 1 rolledDs <> drop 1 ds <> poolDs)) do
+    exerciseCmd (toInterfaceContractId rolled : ContractId Vault) Vault_Redeem with
+      shares = first.shares
+      owner = f.alice
+      receiver = f.alice
+      minAssetsOut = None
+      actors = [f.alice]
+      extraArgs = redeemArgs f (map (toInterfaceContractId . fst) pool) shares
+  result.assets === 100.0
+
+-- | Redeeming to a receiver who is not acting leaves the transfer pending, so nothing is burned.
+redeemToAnAbsentReceiverIsRefused : Script ()
+redeemToAnAbsentReceiverIsRefused = script do
+  (f, ds) <- setupStrict
+  bob <- allocateParty "bob"
+  first <- depositWithPreapproval f ds
+  rolled <- rollPeriod f f.vaultTemplateCid
+  rolledDs <- disclosuresFor f rolled
+  poolDs <- poolDisclosures f
+  pool <- query @MockHolding f.custodian
+  shares <- map fst <$> query @ShareHolding f.alice
+  submitMustFail (actAs f.alice <> discloseMany (take 1 rolledDs <> drop 1 ds <> poolDs)) do
+    exerciseCmd (toInterfaceContractId rolled : ContractId Vault) Vault_Redeem with
+      shares = first.shares
+      owner = f.alice
+      receiver = bob
+      minAssetsOut = None
+      actors = [f.alice]
+      extraArgs = redeemArgs f (map (toInterfaceContractId . fst) pool) shares

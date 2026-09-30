@@ -7,8 +7,7 @@ import Daml.Script
 
 import Canton.Vault.Reference.Math
 
--- Awkward ratios, where the product needs more than ten decimals. The small
--- amounts matter: they are where an intermediate rounding flips the direction.
+-- Ratios whose product needs more than ten decimals; small amounts flip an intermediate rounding.
 cases : [(Decimal, Decimal, Decimal)]
 cases =
   [ (shares, assets, amount)
@@ -22,8 +21,7 @@ cases =
       , 0.0000000001, 0.0000000003, 0.0000000007 ]
   ]
 
--- | The helpers land on the exact floor and ceiling. These cases all sit where
--- an intermediate rounding used to hide the overshoot from the correction.
+-- | The helpers land on the exact floor and ceiling.
 mulDivMatchesExactRounding : Script ()
 mulDivMatchesExactRounding = script do
   let exact =
