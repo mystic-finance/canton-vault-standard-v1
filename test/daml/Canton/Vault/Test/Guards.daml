@@ -9,6 +9,7 @@ import Daml.Script
 import Canton.Vault.V1
 import Canton.Vault.Reference.V1
 import Canton.Vault.Reference.Share
+import Splice.Testing.Tokens.TestTokenV2.Holding (Token(..))
 import Canton.Vault.Test.Deposit
 import Canton.Vault.Test.MockToken
 import Canton.Vault.Test.Periods
@@ -20,8 +21,7 @@ import Splice.TokenStandard.Utils
 -- Rolling the period
 ----------------------
 
--- | The same pool holding named twice would double-count the pool and halve
--- every holder's share price.
+-- | A pool holding named twice would double-count the pool.
 rollRejectsDuplicatePoolHoldings : Script ()
 rollRejectsDuplicatePoolHoldings = script do
   f <- setupVault
@@ -37,9 +37,7 @@ rollRejectsDuplicatePoolHoldings = script do
       poolHoldingCids = dup <> dup
       validUntil = addRelTime now (hours 2)
 
--- | Flows belong to one vault. Folding a sibling vault's flows in would move
--- the totals without any assets having moved. Both vaults share a registrar, so
--- the flows are readable and only the guard can refuse them.
+-- | A sibling vault's flows are readable under a shared registrar, so only the guard refuses them.
 rollRejectsFlowsFromAnotherVault : Script ()
 rollRejectsFlowsFromAnotherVault = script do
   f <- setupVault
@@ -50,7 +48,7 @@ rollRejectsFlowsFromAnotherVault = script do
       vaultRegistrar = f.registrar
       custodian = f.custodian
       underlyingInstrument = f.underlying
-      shareInstrument = f.shares
+      shareInstrument = f.shares with id = "reference-2"
       totalShares = 0.0
       totalAssets = 0.0
       accrual = None
@@ -72,8 +70,7 @@ rollRejectsFlowsFromAnotherVault = script do
       poolHoldingCids = map (toInterfaceContractId . fst) pool
       validUntil = addRelTime now (hours 2)
 
--- | Flows belong to the period they were written in. This roll leaves them
--- open, so they survive into the next period and can be replayed there.
+-- | Flows left open by a roll cannot be replayed in the next period.
 rollRejectsFlowsFromAnEarlierPeriod : Script ()
 rollRejectsFlowsFromAnEarlierPeriod = script do
   f <- setupVault
@@ -179,8 +176,7 @@ nonPositiveAmountsAreRejected = script do
       actors = [f.alice]
       extraArgs = depositArgs f [funds]
 
--- | A deposit too small to mint a whole unit of share is refused rather than
--- taking the money for nothing.
+-- | A deposit too small to mint a unit of share is refused.
 depositMintingZeroSharesIsRejected : Script ()
 depositMintingZeroSharesIsRejected = script do
   -- A pool worth far more per share than the deposit on offer.
@@ -267,7 +263,7 @@ lockedSharesCannotBeRedeemed = script do
   aliceShares <- query @ShareHolding f.alice
   forA_ aliceShares $ \(cid, _) -> submitMulti [f.alice, f.registrar] [] (archiveCmd cid)
   lockedCid <- submitMulti [f.alice, f.registrar] [] do
-    createCmd ShareHolding with
+    createCmd Token with
       holding = V2.HoldingView with
         account = basicAccount f.alice
         instrumentId = f.shares
@@ -348,7 +344,7 @@ burningTheWrongInstrumentIsRejected = script do
   -- Shares of a different instrument, in Alice's own account.
   let other = V2.InstrumentId with admin = f.registrar; id = "vEUR"
   otherCid <- submitMulti [f.alice, f.registrar] [] do
-    createCmd ShareHolding with
+    createCmd Token with
       holding = V2.HoldingView with
         account = basicAccount f.alice
         instrumentId = other
@@ -365,8 +361,7 @@ burningTheWrongInstrumentIsRejected = script do
       actors = [f.alice]
       extraArgs = redeemArgs f (map (toInterfaceContractId . fst) pool) [otherCid]
 
--- | A loss can price shares below one unit of the underlying. A redemption too
--- small to return anything is refused rather than burning the shares for free.
+-- | After a loss, a redemption too small to return anything is refused.
 redemptionReturningNothingIsRejected : Script ()
 redemptionReturningNothingIsRejected = script do
   f <- setupVault
@@ -403,8 +398,7 @@ redemptionReturningNothingIsRejected = script do
 
 -- What a party may redeem
 ---------------------------
--- The checks below sit in `heldShares`, which only the read methods reach: the
--- burn path has its own, in `Share.daml`.
+-- These checks sit in `heldShares`, which only the read methods reach.
 
 -- | The same holding named twice would double what the party appears to hold.
 maxRedeemRejectsDuplicateShareHoldings : Script ()
@@ -438,7 +432,7 @@ maxRedeemRejectsTheWrongInstrument = script do
   _ <- deposit f f.vaultTemplateCid f.alice 100.0
   let other = V2.InstrumentId with admin = f.registrar; id = "vEUR"
   otherCid <- submitMulti [f.alice, f.registrar] [] do
-    createCmd ShareHolding with
+    createCmd Token with
       holding = V2.HoldingView with
         account = basicAccount f.alice
         instrumentId = other
@@ -459,7 +453,7 @@ maxRedeemRejectsALockedShareHolding = script do
   aliceShares <- query @ShareHolding f.alice
   forA_ aliceShares $ \(cid, _) -> submitMulti [f.alice, f.registrar] [] (archiveCmd cid)
   lockedCid <- submitMulti [f.alice, f.registrar] [] do
-    createCmd ShareHolding with
+    createCmd Token with
       holding = V2.HoldingView with
         account = basicAccount f.alice
         instrumentId = f.shares
@@ -476,8 +470,7 @@ maxRedeemRejectsALockedShareHolding = script do
       party = f.alice
       extraArgs = redeemArgs f [] [lockedCid])
 
--- | A roll that counts a redemption without the deposit that funded it would
--- drive the share count below zero.
+-- | Counting a redemption without its funding deposit would make the share count negative.
 rollRejectsNegativeShares : Script ()
 rollRejectsNegativeShares = script do
   f <- setupVault
@@ -549,15 +542,12 @@ mintWithdrawAndRedeemFailAfterThePeriodEnds = script do
       actors = [f.alice]
       extraArgs = redeemArgs f poolCids aliceShares
 
--- | The pool is what the custodian holds in its basic account. A second account
--- of the custodian's own is still not the pool, and the vault can read it, so
--- only the guard can refuse it.
+-- | A second account of the custodian's is not the pool; only the guard can refuse it.
 rollRejectsPoolHoldingsOutsideTheCustodianAccount : Script ()
 rollRejectsPoolHoldingsOutsideTheCustodianAccount = script do
   f <- setupVault
   _ <- deposit f f.vaultTemplateCid f.alice 100.0
-  -- Measure the pool before funding the second account, since the custodian
-  -- observes both and a query would otherwise return them together.
+  -- Measured first, since the custodian observes both accounts.
   pool <- query @MockHolding f.custodian
   ds <- poolDisclosures f
 
@@ -575,15 +565,14 @@ rollRejectsPoolHoldingsOutsideTheCustodianAccount = script do
       poolHoldingCids = map (toInterfaceContractId . fst) pool <> [outside]
       validUntil = addRelTime now (hours 2)
 
--- | Shares in the owner's other account are not the ones being redeemed. The
--- owner signs those too, so the burn is authorized and only the guard refuses it.
+-- | The owner's other account is not the one being redeemed; only the guard refuses it.
 burningFromAnotherAccountIsRejected : Script ()
 burningFromAnotherAccountIsRejected = script do
   f <- setupVault
   first <- deposit f f.vaultTemplateCid f.alice 100.0
   let other = V2.Account with owner = Some f.alice; provider = None; id = "sub"
   otherCid <- submitMulti [f.alice, f.registrar] [] do
-    createCmd ShareHolding with
+    createCmd Token with
       holding = V2.HoldingView with
         account = other
         instrumentId = f.shares

@@ -154,8 +154,7 @@ convertShares f vaultCid shares =
       vaultCid = toInterfaceContractId vaultCid
       shares)
 
--- | Several depositors in one period all price the same, and exits leave the
--- rest untouched.
+-- | Depositors in one period price the same, and exits leave the rest untouched.
 manyDepositorsInOnePeriod : Script ()
 manyDepositorsInOnePeriod = script do
   f <- setupVault
@@ -278,8 +277,7 @@ redeemFeeStaysInThePool = script do
   bobWorth <- convertShares f rolledAgain 99.0
   assertMsg ("bob paid 100.0, now worth " <> show bobWorth) (bobWorth > 100.0)
 
--- | An uncapped vault reports its mint limit without overflowing. The limit is
--- far outside `Numeric 20`, so it must not be run through the share maths.
+-- | An uncapped vault reports its mint limit without the share maths overflowing.
 maxMintOnAnUncappedVault : Script ()
 maxMintOnAnUncappedVault = script do
   f <- setupVault
@@ -317,7 +315,7 @@ feesOutsideRangeAreRejected = script do
         vaultRegistrar = f.registrar
         custodian = f.custodian
         underlyingInstrument = f.underlying
-        shareInstrument = f.shares
+        shareInstrument = f.shares with id = "bad"
         totalShares = 0.0
         totalAssets = 0.0
         accrual = None
@@ -326,5 +324,32 @@ feesOutsideRangeAreRejected = script do
         rateValidFrom = now
         rateValidUntil = addRelTime now (hours 1)
         depositCap = None
+  _ <- submitMulti [f.registrar, f.custodian] [] (mk 100)
   submitMultiMustFail [f.registrar, f.custodian] [] (mk (-100))
   submitMultiMustFail [f.registrar, f.custodian] [] (mk 10001)
+
+-- | Each vault issues its own shares, named by its id.
+shareInstrumentIsTheVaults : Script ()
+shareInstrumentIsTheVaults = script do
+  f <- setupVault
+  stranger <- allocateParty "stranger"
+  now <- getTime
+  let mk shares = createCmd ReferenceVault with
+        vaultId = "second"
+        vaultRegistrar = f.registrar
+        custodian = f.custodian
+        underlyingInstrument = f.underlying
+        shareInstrument = shares
+        totalShares = 0.0
+        totalAssets = 0.0
+        accrual = None
+        depositFeeBps = 0
+        redeemFeeBps = 0
+        rateValidFrom = now
+        rateValidUntil = addRelTime now (hours 1)
+        depositCap = None
+  _ <- submitMulti [f.registrar, f.custodian] [] (mk (f.shares with id = "second"))
+  -- Another vault's shares.
+  submitMultiMustFail [f.registrar, f.custodian] [] (mk f.shares)
+  -- Shares administered by someone else.
+  submitMultiMustFail [f.registrar, f.custodian] [] (mk (f.shares with admin = stranger; id = "second"))

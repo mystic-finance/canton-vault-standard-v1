@@ -1,6 +1,7 @@
--- | A minimal token registry standing in for the vault's underlying.
--- Transfers settle immediately. Not a model for a real registry.
+-- | A minimal registry standing in for the vault's underlying; transfers settle at once.
 module Canton.Vault.Test.MockToken where
+
+import DA.TextMap qualified as TextMap
 
 import Splice.Api.Token.MetadataV1
 import Splice.Api.Token.HoldingV2 qualified as V2
@@ -35,48 +36,92 @@ template MockRegistry
       transferFactory_publicFetchImpl = publicFetchDefaultImpl this
       transferFactory_transferExtraObservers _arg = []
 
-      transferFactory_transferImpl _self arg = do
-        let transfer = arg.transfer
-        require "transfer names its input holdings" (transfer.inputHoldingCids /= [])
-        funded <- forA transfer.inputHoldingCids $ \cid -> do
-          let mockCid : ContractId MockHolding = fromInterfaceContractId cid
-          holding <- fetch mockCid
-          require' ("input.instrumentId", holding.holding.instrumentId)
-            isEqualR ("transfer.instrumentId", transfer.instrumentId)
-          require' ("input.account", holding.holding.account)
-            isEqualR ("transfer.sender", transfer.sender)
-          archive mockCid
-          pure holding.holding.amount
-        let available = sum funded
-        require' ("available", available) isGreaterOrEqualR ("transfer.amount", transfer.amount)
-        receiverCid <- create MockHolding with
-          holding = V2.HoldingView with
-            account = transfer.receiver
-            instrumentId = transfer.instrumentId
-            amount = transfer.amount
-            lock = None
-            meta = emptyMetadata
-        changeCids <- if available > transfer.amount
-          then do
-            changeCid <- create MockHolding with
-              holding = V2.HoldingView with
-                account = transfer.sender
-                instrumentId = transfer.instrumentId
-                amount = available - transfer.amount
-                lock = None
-                meta = emptyMetadata
-            pure [toInterfaceContractId changeCid]
-          else pure []
-        pure V2.TransferInstructionResult with
-          output = V2.TransferInstructionResult_Completed with
-            receiverHoldingCids = [toInterfaceContractId receiverCid]
-          senderChangeCids = changeCids
-          meta = emptyMetadata
+      transferFactory_transferImpl _self arg = settleTransfer arg.transfer
 
--- | Read methods only run on-ledger and only for a party that can fetch the
--- vault, so a script reaches them through a choice exercised by the registrar.
--- | A registry that never completes a transfer, answering with a pending
--- instruction the way a registry with a compliance step would.
+-- | Completes a transfer at once, whoever authorizes it.
+settleTransfer : V2.Transfer -> Update V2.TransferInstructionResult
+settleTransfer transfer = do
+  require "transfer names its input holdings" (transfer.inputHoldingCids /= [])
+  funded <- forA transfer.inputHoldingCids $ \cid -> do
+    let mockCid : ContractId MockHolding = fromInterfaceContractId cid
+    holding <- fetch mockCid
+    require' ("input.instrumentId", holding.holding.instrumentId)
+      isEqualR ("transfer.instrumentId", transfer.instrumentId)
+    require' ("input.account", holding.holding.account)
+      isEqualR ("transfer.sender", transfer.sender)
+    archive mockCid
+    pure holding.holding.amount
+  let available = sum funded
+  require' ("available", available) isGreaterOrEqualR ("transfer.amount", transfer.amount)
+  receiverCid <- create MockHolding with
+    holding = V2.HoldingView with
+      account = transfer.receiver
+      instrumentId = transfer.instrumentId
+      amount = transfer.amount
+      lock = None
+      meta = emptyMetadata
+  changeCids <- if available > transfer.amount
+    then do
+      changeCid <- create MockHolding with
+        holding = V2.HoldingView with
+          account = transfer.sender
+          instrumentId = transfer.instrumentId
+          amount = available - transfer.amount
+          lock = None
+          meta = emptyMetadata
+      pure [toInterfaceContractId changeCid]
+    else pure []
+  pure V2.TransferInstructionResult with
+    output = V2.TransferInstructionResult_Completed with
+      receiverHoldingCids = [toInterfaceContractId receiverCid]
+    senderChangeCids = changeCids
+    meta = emptyMetadata
+
+-- | A receiver's standing consent to be sent the registry's instrument.
+template MockPreapproval
+  with
+    admin : Party
+    receiver : Party
+  where
+    signatory receiver
+    observer admin
+
+preapprovalKey : Text
+preapprovalKey = "test/preapproval"
+
+-- | Completes a transfer only when the receiver acts or has a preapproval; otherwise pending.
+template StrictRegistry
+  with
+    admin : Party
+  where
+    signatory admin
+
+    interface instance V2.TransferFactory for StrictRegistry where
+      view = V2.TransferFactoryView with
+        admin
+        meta = emptyMetadata
+
+      transferFactory_publicFetchImpl = publicFetchDefaultImpl this
+      transferFactory_transferExtraObservers _arg = []
+
+      transferFactory_transferImpl _self arg = do
+        let receiverParties = regularAccountParties arg.transfer.receiver
+        preapproved <- case TextMap.lookup preapprovalKey arg.extraArgs.context.values of
+          Some (AV_ContractId cid) -> do
+            preapproval <- fetch (fromAnyContractId cid : ContractId MockPreapproval)
+            pure (preapproval.admin == admin && preapproval.receiver `elem` receiverParties)
+          _ -> pure False
+        if preapproved || all (`elem` arg.actors) receiverParties
+          then settleTransfer arg.transfer
+          else do
+            instructionCid <- create PendingInstruction with admin; transfer = arg.transfer
+            pure V2.TransferInstructionResult with
+              output = V2.TransferInstructionResult_Pending with
+                transferInstructionCid = toInterfaceContractId instructionCid
+              senderChangeCids = []
+              meta = emptyMetadata
+
+-- | A registry that always answers with a pending instruction.
 template PendingRegistry
   with
     admin : Party
@@ -123,8 +168,7 @@ template PendingInstruction
       transferInstruction_rejectExtraObservers _arg = []
       transferInstruction_withdrawExtraObservers _arg = []
 
--- | A factory that reports success without moving anything. Anyone can write
--- one; the question is whether a vault will accept it.
+-- | A factory that reports success without moving anything.
 template FreeMintRegistry
   with
     admin : Party
@@ -145,6 +189,7 @@ template FreeMintRegistry
           senderChangeCids = []
           meta = emptyMetadata
 
+-- | Reaches the read methods on-ledger, exercised by the registrar.
 template MaxRedeemProbe
   with
     caller : Party
@@ -179,3 +224,45 @@ template MaxRedeemProbe
       do
         vault <- fetch vaultCid
         maxRedeem vault party extraArgs
+
+-- | Every read method's answer at one moment, for conformance tests.
+data Quote = Quote with
+    toShares : Decimal
+    toAssets : Decimal
+    depositPreview : Decimal
+    mintPreview : Decimal
+    withdrawPreview : Decimal
+    redeemPreview : Decimal
+    depositMax : Decimal
+    mintMax : Decimal
+    withdrawMax : Decimal
+    redeemMax : Decimal
+  deriving (Eq, Show, Serializable)
+
+template QuoteProbe
+  with
+    caller : Party
+  where
+    signatory caller
+
+    choice Probe_Quote : Quote
+      with
+        vaultCid : ContractId Vault
+        party : Party
+        assets : Decimal
+        shares : Decimal
+        extraArgs : ExtraArgs
+      controller caller
+      do
+        vault <- fetch vaultCid
+        toShares <- convertToShares vault assets
+        toAssets <- convertToAssets vault shares
+        depositPreview <- previewDeposit vault assets
+        mintPreview <- previewMint vault shares
+        withdrawPreview <- previewWithdraw vault assets
+        redeemPreview <- previewRedeem vault shares
+        depositMax <- maxDeposit vault party extraArgs
+        mintMax <- maxMint vault party extraArgs
+        withdrawMax <- maxWithdraw vault party extraArgs
+        redeemMax <- maxRedeem vault party extraArgs
+        pure Quote with ..

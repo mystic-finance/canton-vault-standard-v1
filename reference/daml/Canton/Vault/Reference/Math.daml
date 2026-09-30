@@ -10,9 +10,7 @@ import Canton.Vault.V1
 ulp : Decimal
 ulp = 0.0000000001
 
--- `a * b` needs up to twenty decimals, so the product is held at that scale and
--- only the division rounds. Comparing against the exact product then corrects
--- the direction. Amounts at or above 10^18 overflow `Numeric 20` and fail.
+-- The product is held at twenty decimals so only the division rounds; 10^18 and above fail.
 mulDivDown : Decimal -> Decimal -> Decimal -> Decimal
 mulDivDown a b c =
   let p = N.mul @20 a b
@@ -40,8 +38,7 @@ accrue accrual assets asOf now =
       Some (AccrualSimple with ratePerSecond) -> assets * (1.0 + ratePerSecond * dt)
       Some (AccrualCompounding with ratePerSecond) -> assets * exp (ratePerSecond * dt)
 
--- | A unit on each side of the rate, so the first deposit cannot set an
--- arbitrary price. Included in the totals the vault publishes.
+-- | One share and one asset of offset, so the first deposit cannot set an arbitrary price.
 virtualOffset : Decimal
 virtualOffset = 1.0
 
@@ -73,3 +70,10 @@ addFeeBps feeBps amount =
 -- | Stands in for "no limit"; `Decimal` tops out just under 10^28.
 uncapped : Decimal
 uncapped = 1.0e27
+
+-- | The largest amount at or below `x`, one unit at a time, that `fits`.
+fitDown : (Decimal -> Bool) -> Decimal -> Decimal
+fitDown fits x
+  | x <= 0.0 = 0.0
+  | fits x = x
+  | otherwise = fitDown fits (x - ulp)

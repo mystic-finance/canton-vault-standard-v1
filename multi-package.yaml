@@ -1,4 +1,4 @@
 packages:
-  - api
+  - api/canton-vault-v1
   - reference
   - test
