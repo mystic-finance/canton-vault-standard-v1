@@ -1,0 +1,313 @@
+-- | Security regression tests. Each asserts the SECURE behaviour, so every
+-- script here FAILS against the current reference vault and should PASS once the
+-- corresponding fix lands. They are intentionally red.
+--
+-- Each test's header names the problem and the fix that turns it green.
+module Canton.Vault.Test.AuditFailing where
+
+import DA.Assert ((===))
+import DA.Foldable (forA_)
+import DA.Time (addRelTime, hours, minutes)
+import DA.TextMap qualified as TextMap
+import Daml.Script
+
+import Canton.Vault.V1
+import Canton.Vault.Reference.V1
+import Canton.Vault.Reference.Share
+import Canton.Vault.Test.MockToken
+import Canton.Vault.Test.Deposit
+
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.HoldingV2 qualified as V2
+import Splice.Api.Token.TransferInstructionV2 qualified as V2
+import Splice.TokenStandard.Utils
+
+-- A factory signed only by the attacker that lies about its admin, so the
+-- vault's self-reported-admin check passes. `NoOp` reports a completed transfer
+-- that moved nothing; `Drain` repurposes the authority it is handed.
+data Mode
+  = NoOp
+  | Drain with real : ContractId V2.TransferFactory; pool : [ContractId V2.Holding]; amount : Decimal
+  deriving (Eq, Show, Serializable)
+
+template ForgedFactory
+  with
+    attacker : Party
+    claimedAdmin : Party
+    mode : Mode
+  where
+    signatory attacker
+    interface instance V2.TransferFactory for ForgedFactory where
+      view = V2.TransferFactoryView with admin = claimedAdmin; meta = emptyMetadata
+      transferFactory_publicFetchImpl = publicFetchDefaultImpl this
+      transferFactory_transferExtraObservers _ = []
+      transferFactory_transferImpl _self arg = do
+        case mode of
+          NoOp -> pure ()
+          Drain real pool amt -> do
+            _ <- exercise real V2.TransferFactory_Transfer with
+              transfer = arg.transfer with
+                receiver = basicAccount attacker; amount = amt; inputHoldingCids = pool
+              actors = arg.actors
+              extraArgs = ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata
+            pure ()
+        pure V2.TransferInstructionResult with
+          output = V2.TransferInstructionResult_Completed with receiverHoldingCids = []
+          senderChangeCids = []
+          meta = emptyMetadata
+
+underlyingOf : Party -> V2.InstrumentId -> Script Decimal
+underlyingOf p inst = do
+  hs <- query @MockHolding p
+  pure (sum [ h.holding.amount | (_, h) <- hs
+            , h.holding.account == basicAccount p, h.holding.instrumentId == inst ])
+
+shareCidsOf : Party -> V2.Account -> Script [ContractId ShareHolding]
+shareCidsOf p acct = do
+  hs <- query @ShareHolding p
+  pure [ cid | (cid, h) <- hs, h.holding.account == acct ]
+
+poolOf : Fixture -> Script ([ContractId V2.Holding], [Disclosure])
+poolOf f = do
+  raw <- query @MockHolding f.custodian
+  let mine = [ (cid, h) | (cid, h) <- raw, h.holding.account == basicAccount f.custodian ]
+  ds <- forA mine $ \(cid, _) -> do Some d <- queryDisclosure f.underlyingAdmin cid; pure d
+  pure (map (toInterfaceContractId . fst) mine, ds)
+
+-- ===========================================================================
+-- 1. Factory authenticity.
+-- Problem: a caller-supplied factory that reports a completed transfer while
+-- moving nothing still mints shares; the admin check trusts the factory's own
+-- admin field, which the attacker sets to the real one.
+-- Fix: verify the factory is signed by the instrument administrator.
+-- Secure behaviour (asserted): the deposit is rejected.
+-- ===========================================================================
+factoryMustBeAuthentic : Script ()
+factoryMustBeAuthentic = script do
+  f <- setupVault
+  mallory <- allocateParty "mallory"
+  ds <- vaultDisclosure f
+  forged <- submit mallory do
+    createCmd ForgedFactory with attacker = mallory; claimedAdmin = f.underlyingAdmin; mode = NoOp
+  submitWithDisclosuresMustFail mallory ds do
+    exerciseCmd f.vaultCid Vault_Deposit with
+      assets = 1000.0; receiver = mallory; minSharesOut = None; actors = [mallory]
+      extraArgs = depositArgsFor f (toInterfaceContractId forged) []
+
+-- ===========================================================================
+-- 2. Payout authority.
+-- Problem: the payout leg hands the custodian's authority to the caller-named
+-- factory, which can drain the whole pool through the real registry.
+-- Fix: the vault performs the payout against a verified registry; it never
+-- delegates custodian authority to a caller-supplied factory.
+-- Secure behaviour (asserted): a dust redemption via a forged factory is
+-- rejected and the pool is untouched.
+-- ===========================================================================
+payoutMustNotLendCustodianAuthority : Script ()
+payoutMustNotLendCustodianAuthority = script do
+  f <- setupVault
+  mallory <- allocateParty "mallory"
+  ds <- vaultDisclosure f
+  aliceFunds <- fund f f.alice 10000.0
+  _ <- submitWithDisclosures f.alice ds do
+    exerciseCmd f.vaultCid Vault_Deposit with
+      assets = 10000.0; receiver = f.alice; minSharesOut = None; actors = [f.alice]
+      extraArgs = depositArgs f [aliceFunds]
+  malFunds <- fund f mallory 1.0
+  _ <- submitWithDisclosures mallory ds do
+    exerciseCmd f.vaultCid Vault_Deposit with
+      assets = 1.0; receiver = mallory; minSharesOut = None; actors = [mallory]
+      extraArgs = depositArgs f [malFunds]
+  (pool, poolDiscl) <- poolOf f
+  forged <- submit mallory do
+    createCmd ForgedFactory with
+      attacker = mallory; claimedAdmin = f.underlyingAdmin
+      mode = Drain with real = f.registryCid; pool; amount = 10001.0
+  ms <- shareCidsOf mallory (basicAccount mallory)
+  let forgedCid : ContractId V2.TransferFactory = toInterfaceContractId forged
+      args = ExtraArgs with
+        context = ChoiceContext with
+          values = TextMap.fromList
+            [ (underlyingTransferFactoryKey, AV_ContractId (toAnyContractId forgedCid))
+            , (underlyingHoldingsKey, AV_List [])
+            , (shareHoldingsKey, AV_List (map (AV_ContractId . toAnyContractId) ms)) ]
+        meta = emptyMetadata
+  submitWithDisclosuresMustFail mallory (ds <> poolDiscl) do
+    exerciseCmd f.vaultCid Vault_Redeem with
+      shares = 0.5; owner = mallory; receiver = mallory; minAssetsOut = None
+      actors = [mallory]; extraArgs = args
+
+-- ===========================================================================
+-- 3. Pool selection.
+-- Problem: redeemers name the shared pool holdings, which the transfer archives;
+-- one dust redemption consolidates the pool and invalidates every other
+-- redemption prepared against the old holdings.
+-- Fix: the vault/custodian selects pool holdings; callers cannot name them.
+-- Secure behaviour (asserted): after one redemption, an unrelated redemption
+-- prepared against a pool holding still succeeds.
+-- ===========================================================================
+redemptionsMustNotInvalidateEachOther : Script ()
+redemptionsMustNotInvalidateEachOther = script do
+  f <- setupVault
+  bob <- allocateParty "bob"
+  mallory <- allocateParty "mallory"
+  ds <- vaultDisclosure f
+  forA_ [f.alice, bob, mallory] $ \p -> do
+    h <- fund f p 100.0
+    submitWithDisclosures p ds do
+      exerciseCmd f.vaultCid Vault_Deposit with
+        assets = 100.0; receiver = p; minSharesOut = None; actors = [p]; extraArgs = depositArgs f [h]
+  (pool, poolDiscl) <- poolOf f
+  length pool === 3
+  aliceShares <- shareCidsOf f.alice (basicAccount f.alice)
+  mShares <- shareCidsOf mallory (basicAccount mallory)
+  _ <- submitWithDisclosures mallory (ds <> poolDiscl) do
+    exerciseCmd f.vaultCid Vault_Redeem with
+      shares = 0.0000000001; owner = mallory; receiver = mallory; minAssetsOut = None
+      actors = [mallory]; extraArgs = redeemArgs f pool mShares
+  -- Alice prepared against the first pool holding; it must still be redeemable.
+  submitWithDisclosures f.alice (ds <> poolDiscl) do
+    exerciseCmd f.vaultCid Vault_Redeem with
+      shares = 100.0; owner = f.alice; receiver = f.alice; minAssetsOut = None
+      actors = [f.alice]; extraArgs = redeemArgs f (take 1 pool) aliceShares
+  pure ()
+
+-- ===========================================================================
+-- 4. Period roll.
+-- Problem: a deposit that lands between the registrar reading the flow list and
+-- rolling the period loses its share contribution forever; the stray record can
+-- never be folded.
+-- Fix: fold all open flows for the period inside OpenPeriod, query-free.
+-- Secure behaviour (asserted): after the roll, totalShares equals every share
+-- actually minted in the period.
+-- ===========================================================================
+rollMustCountEveryDeposit : Script ()
+rollMustCountEveryDeposit = script do
+  f <- setupVault
+  bob <- allocateParty "bob"
+  ds <- vaultDisclosure f
+  a <- fund f f.alice 100.0
+  _ <- submitWithDisclosures f.alice ds do
+    exerciseCmd f.vaultCid Vault_Deposit with
+      assets = 100.0; receiver = f.alice; minSharesOut = None; actors = [f.alice]; extraArgs = depositArgs f [a]
+  seen <- query @PeriodFlow f.registrar          -- registrar's snapshot: one flow
+  b <- fund f bob 100.0
+  _ <- submitWithDisclosures bob ds do            -- lands in the gap
+    exerciseCmd f.vaultCid Vault_Deposit with
+      assets = 100.0; receiver = bob; minSharesOut = None; actors = [bob]; extraArgs = depositArgs f [b]
+  (pool, poolDiscl) <- poolOf f
+  passTime (minutes 5)
+  now <- getTime
+  rolled <- submit (actAs f.registrar <> discloseMany poolDiscl) do
+    exerciseCmd f.vaultTemplateCid ReferenceVault_OpenPeriod with
+      flowCids = map fst seen; poolHoldingCids = pool; validUntil = addRelTime now (hours 1)
+  Some v <- queryContractId f.registrar rolled
+  v.totalShares === 200.0
+
+-- ===========================================================================
+-- 5. External signing.
+-- Problem: every action requires the rate period to be open at execution time,
+-- so a transaction prepared for slow external signing expires before submission.
+-- Fix: validate against a caller-supplied validity, not the current ledger time.
+-- Secure behaviour (asserted): a deposit valid when prepared still executes a
+-- little later, within a normal signing delay.
+-- ===========================================================================
+actionMustSurviveSigningDelay : Script ()
+actionMustSurviveSigningDelay = script do
+  -- A short rate period stands in for any prepared-then-delayed submission.
+  registrar <- allocateParty "registrar"
+  custodian <- allocateParty "custodian"
+  underlyingAdmin <- allocateParty "underlyingAdmin"
+  alice <- allocateParty "alice"
+  let underlying = V2.InstrumentId with admin = underlyingAdmin; id = "USD"
+      shares = V2.InstrumentId with admin = registrar; id = "reference-1"
+  registryT <- submit underlyingAdmin do createCmd MockRegistry with admin = underlyingAdmin
+  now <- getTime
+  vaultT <- submitMulti [registrar, custodian] [] do
+    createCmd ReferenceVault with
+      vaultId = "reference-1"; vaultRegistrar = registrar; custodian
+      underlyingInstrument = underlying; shareInstrument = shares
+      totalShares = 0.0; totalAssets = 0.0; accrual = None
+      depositFeeBps = 0; redeemFeeBps = 0
+      rateValidFrom = now; rateValidUntil = addRelTime now (minutes 2)
+      depositCap = None
+  let f = Fixture with
+        registrar; custodian; underlyingAdmin; alice
+        vaultCid = toInterfaceContractId vaultT; vaultTemplateCid = vaultT
+        registryCid = toInterfaceContractId registryT; registryTemplateCid = registryT
+        underlying; shares = shares
+  ds <- vaultDisclosure f
+  h <- fund f alice 100.0
+  passTime (minutes 5)        -- the signer took five minutes; the window was two
+  submitWithDisclosures alice ds do
+    exerciseCmd f.vaultCid Vault_Deposit with
+      assets = 100.0; receiver = alice; minSharesOut = None; actors = [alice]; extraArgs = depositArgs f [h]
+  pure ()
+
+-- ===========================================================================
+-- 6. Pause that preserves exits.
+-- Problem: the only way to halt the vault is to let the rate period lapse, which
+-- also blocks redemptions, trapping funds.
+-- Fix: a guardian pause that stops entries while still allowing exits.
+-- Secure behaviour (asserted): once the period has lapsed, a holder can still
+-- redeem their shares.
+-- ===========================================================================
+holdersMustAlwaysBeAbleToExit : Script ()
+holdersMustAlwaysBeAbleToExit = script do
+  f <- setupVault
+  ds <- vaultDisclosure f
+  h <- fund f f.alice 100.0
+  _ <- submitWithDisclosures f.alice ds do
+    exerciseCmd f.vaultCid Vault_Deposit with
+      assets = 100.0; receiver = f.alice; minSharesOut = None; actors = [f.alice]; extraArgs = depositArgs f [h]
+  (pool, poolDiscl) <- poolOf f
+  aliceShares <- shareCidsOf f.alice (basicAccount f.alice)
+  passTime (hours 2)          -- the period lapsed; nobody rolled it
+  submitWithDisclosures f.alice (ds <> poolDiscl) do
+    exerciseCmd f.vaultCid Vault_Redeem with
+      shares = 100.0; owner = f.alice; receiver = f.alice; minAssetsOut = None
+      actors = [f.alice]; extraArgs = redeemArgs f pool aliceShares
+  pure ()
+
+-- ===========================================================================
+-- 7. Verifiable total.
+-- Problem: the pool total the vault publishes is bookkept and goes stale between
+-- rolls, so a quoted total cannot be checked against the real pool.
+-- Fix: expose a total bound to the actual custodian holdings.
+-- Secure behaviour (asserted): right after a deposit, the vault's recorded
+-- total equals the sum of the real pool holdings.
+-- ===========================================================================
+publishedTotalMustMatchThePool : Script ()
+publishedTotalMustMatchThePool = script do
+  f <- setupVault
+  ds <- vaultDisclosure f
+  h <- fund f f.alice 100.0
+  _ <- submitWithDisclosures f.alice ds do
+    exerciseCmd f.vaultCid Vault_Deposit with
+      assets = 100.0; receiver = f.alice; minSharesOut = None; actors = [f.alice]; extraArgs = depositArgs f [h]
+  Some vault <- queryContractId f.registrar f.vaultTemplateCid
+  (pool, _) <- poolOf f
+  poolSum <- do
+    raw <- query @MockHolding f.custodian
+    pure (sum [ h.holding.amount | (_, h) <- raw, h.holding.account == basicAccount f.custodian ])
+  vault.totalAssets === poolSum
+
+-- ===========================================================================
+-- 8. Event log.
+-- Problem: there is no durable, participant-visible record of an action; the
+-- only record is registrar-owned and prunable, so a depositor cannot audit.
+-- Fix: emit a durable event the acting party can see.
+-- Secure behaviour (asserted): after depositing, the depositor can find one
+-- on-ledger record of their action.
+-- ===========================================================================
+depositorMustHaveAnAuditableRecord : Script ()
+depositorMustHaveAnAuditableRecord = script do
+  f <- setupVault
+  ds <- vaultDisclosure f
+  h <- fund f f.alice 100.0
+  _ <- submitWithDisclosures f.alice ds do
+    exerciseCmd f.vaultCid Vault_Deposit with
+      assets = 100.0; receiver = f.alice; minSharesOut = None; actors = [f.alice]; extraArgs = depositArgs f [h]
+  -- The depositor queries for a durable record of their own deposit.
+  records <- query @PeriodFlow f.alice
+  length records === 1
