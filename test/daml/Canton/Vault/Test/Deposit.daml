@@ -69,6 +69,8 @@ setupVaultFull feeBps vaultAccrual cap = do
       rateValidFrom = now
       rateValidUntil = addRelTime now (hours 1)
       depositCap = cap
+      paused = False
+      underlyingTransferFactory = toInterfaceContractId registryTemplateCid
 
   pure Fixture with
     registrar; custodian; underlyingAdmin; alice
@@ -79,6 +81,17 @@ setupVaultFull feeBps vaultAccrual cap = do
     underlying; shares
 
 -- | The vault and registry, disclosed, since a depositor sees neither.
+-- | The fixture with the vault pinned to another factory, disclosed to the registrar.
+repin : Fixture -> ContractId V2.TransferFactory -> Disclosure -> Script Fixture
+repin f factory factoryD = do
+  vaultTemplateCid <- submit (actAs f.registrar <> discloseMany [factoryD]) do
+    exerciseCmd f.vaultTemplateCid ReferenceVault_SetTransferFactory with factory
+  pure f with vaultTemplateCid; vaultCid = toInterfaceContractId vaultTemplateCid; registryCid = factory
+
+-- | End the vault's period, so the next can be opened from its final flows.
+closePeriod : Fixture -> ContractId ReferenceVault -> Script (ContractId ClosedPeriod)
+closePeriod f vaultCid = submit f.registrar (exerciseCmd vaultCid ReferenceVault_ClosePeriod)
+
 vaultDisclosure : Fixture -> Script [Disclosure]
 vaultDisclosure f = do
   vault <- queryDisclosure f.registrar f.vaultTemplateCid
@@ -106,23 +119,17 @@ fundAccount f account instrumentId amount = do
   pure (toInterfaceContractId cid)
 
 depositArgs : Fixture -> [ContractId V2.Holding] -> ExtraArgs
-depositArgs f = depositArgsFor f f.registryCid
-
-depositArgsFor : Fixture -> ContractId V2.TransferFactory -> [ContractId V2.Holding] -> ExtraArgs
-depositArgsFor _f factoryCid holdingCids = ExtraArgs with
+depositArgs _f holdingCids = ExtraArgs with
   context = ChoiceContext with
     values = TextMap.fromList
-      [ (underlyingTransferFactoryKey, AV_ContractId (toAnyContractId factoryCid))
-      , (underlyingHoldingsKey, AV_List (map (AV_ContractId . toAnyContractId) holdingCids))
-      ]
+      [(underlyingHoldingsKey, AV_List (map (AV_ContractId . toAnyContractId) holdingCids))]
   meta = emptyMetadata
 
 redeemArgs : Fixture -> [ContractId V2.Holding] -> [ContractId ShareHolding] -> ExtraArgs
-redeemArgs f underlyingCids shareCids = ExtraArgs with
+redeemArgs _f underlyingCids shareCids = ExtraArgs with
   context = ChoiceContext with
     values = TextMap.fromList
-      [ (underlyingTransferFactoryKey, AV_ContractId (toAnyContractId f.registryCid))
-      , (underlyingHoldingsKey, AV_List (map (AV_ContractId . toAnyContractId) underlyingCids))
+      [ (underlyingHoldingsKey, AV_List (map (AV_ContractId . toAnyContractId) underlyingCids))
       , (shareHoldingsKey, AV_List (map (AV_ContractId . toAnyContractId) shareCids))
       ]
   meta = emptyMetadata
@@ -282,8 +289,9 @@ periodRollCarriesTotals = script do
       None -> abort "pool holding disclosure not available"
 
   now <- getTime
+  closed10 <- closePeriod f f.vaultTemplateCid
   rolledCid <- submitWithDisclosures f.registrar poolDisclosures do
-    exerciseCmd f.vaultTemplateCid ReferenceVault_OpenPeriod with
+    exerciseCmd closed10 ClosedPeriod_Open with
       flowCids = map fst flows
       poolHoldingCids = map (toInterfaceContractId . fst) custodianHoldings
       validUntil = addRelTime now (hours 2)
@@ -323,8 +331,9 @@ rollRejectsWrongInstrument = script do
 
   flows <- query @PeriodFlow f.registrar
   now <- getTime
+  closed11 <- closePeriod f f.vaultTemplateCid
   submitWithDisclosuresMustFail f.registrar poolDisclosures do
-    exerciseCmd f.vaultTemplateCid ReferenceVault_OpenPeriod with
+    exerciseCmd closed11 ClosedPeriod_Open with
       flowCids = map fst flows
       poolHoldingCids = map (toInterfaceContractId . fst) custodianHoldings
       validUntil = addRelTime now (hours 2)

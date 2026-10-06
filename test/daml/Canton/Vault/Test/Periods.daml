@@ -25,8 +25,9 @@ rollPeriod f vaultCid = do
       Some d' -> pure d'
       None -> abort "pool holding disclosure not available"
   now <- getTime
+  closed1 <- closePeriod f vaultCid
   submit (actAs f.registrar <> discloseMany poolDisclosures) do
-    exerciseCmd vaultCid ReferenceVault_OpenPeriod with
+    exerciseCmd closed1 ClosedPeriod_Open with
       flowCids = map fst flows
       poolHoldingCids = map (toInterfaceContractId . fst) pool
       validUntil = addRelTime now (hours 2)
@@ -205,14 +206,13 @@ pendingLegMintsNothing = script do
   f <- setupVault
   pendingCid <- submit f.underlyingAdmin do
     createCmd PendingRegistry with admin = f.underlyingAdmin
-  pendingDisclosure <- queryDisclosure f.underlyingAdmin pendingCid
-  vault <- queryDisclosure f.registrar f.vaultTemplateCid
-  ds <- case (vault, pendingDisclosure) of
-    (Some v, Some p) -> pure [v, p]
-    _ -> abort "disclosures not available"
+  Some pendingD <- queryDisclosure f.underlyingAdmin pendingCid
+  f <- repin f (toInterfaceContractId pendingCid) pendingD
+  Some vaultD <- queryDisclosure f.registrar f.vaultTemplateCid
+  let ds = [vaultD, pendingD]
 
   funds <- fund f f.alice 100.0
-  let args = depositArgsFor f (toInterfaceContractId pendingCid) [funds]
+  let args = depositArgs f [funds]
 
   submitWithDisclosuresMustFail f.alice ds do
     exerciseCmd f.vaultCid Vault_Deposit with
@@ -324,6 +324,8 @@ feesOutsideRangeAreRejected = script do
         rateValidFrom = now
         rateValidUntil = addRelTime now (hours 1)
         depositCap = None
+        paused = False
+        underlyingTransferFactory = f.registryCid
   _ <- submitMulti [f.registrar, f.custodian] [] (mk 100)
   submitMultiMustFail [f.registrar, f.custodian] [] (mk (-100))
   submitMultiMustFail [f.registrar, f.custodian] [] (mk 10001)
@@ -348,6 +350,8 @@ shareInstrumentIsTheVaults = script do
         rateValidFrom = now
         rateValidUntil = addRelTime now (hours 1)
         depositCap = None
+        paused = False
+        underlyingTransferFactory = f.registryCid
   _ <- submitMulti [f.registrar, f.custodian] [] (mk (f.shares with id = "second"))
   -- Another vault's shares.
   submitMultiMustFail [f.registrar, f.custodian] [] (mk f.shares)

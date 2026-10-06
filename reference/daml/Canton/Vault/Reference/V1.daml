@@ -14,22 +14,12 @@ import Splice.Api.Token.HoldingV2 qualified as V2
 import Splice.Api.Token.TransferInstructionV2 qualified as V2
 import Splice.TokenStandard.Utils
 
--- The caller names each leg's factory and holdings; neither vault nor registry can look them up.
-underlyingTransferFactoryKey : Text
-underlyingTransferFactoryKey = "cantonVaultV1/underlyingTransferFactory"
-
+-- The caller names each leg's holdings; neither vault nor registry can look them up.
 shareHoldingsKey : Text
 shareHoldingsKey = "cantonVaultV1/shareHoldings"
 
 underlyingHoldingsKey : Text
 underlyingHoldingsKey = "cantonVaultV1/underlyingHoldings"
-
-getUnderlyingTransferFactory : ChoiceContext -> Update (ContractId V2.TransferFactory)
-getUnderlyingTransferFactory context =
-  case TextMap.lookup underlyingTransferFactoryKey context.values of
-    Some (AV_ContractId cid) -> pure (fromAnyContractId cid)
-    None -> fail $ "Context value for '" <> underlyingTransferFactoryKey <> "' not found"
-    v -> fail $ "Failed to decode context value for '" <> underlyingTransferFactoryKey <> "': " <> show v
 
 getShareHoldings : ChoiceContext -> Update [ContractId ShareHolding]
 getShareHoldings = getHoldingCids shareHoldingsKey
@@ -57,6 +47,56 @@ template PeriodFlow
   where
     signatory vaultRegistrar
 
+-- | A record of one action, kept for the parties who took it.
+template VaultEvent
+  with
+    vaultId : Text
+    vaultRegistrar : Party
+    action : VaultAction
+    actors : [Party]
+    receiver : Party
+    assets : Decimal
+    shares : Decimal
+    periodStart : Time
+  where
+    signatory vaultRegistrar
+    observer actors, receiver
+
+data VaultAction = Deposited | Minted | Withdrew | Redeemed
+  deriving (Eq, Show, Serializable)
+
+-- | A period that takes no more actions, so its flows are final when it is opened again.
+template ClosedPeriod
+  with
+    vault : ReferenceVault
+  where
+    signatory vault.vaultRegistrar, vault.custodian
+
+    choice ClosedPeriod_Open : ContractId ReferenceVault
+      -- ^ Open the next period, folding in the closed one's flows and measuring the pool.
+      with
+        flowCids : [ContractId PeriodFlow]
+        poolHoldingCids : [ContractId V2.Holding]
+        validUntil : Time
+      controller vault.vaultRegistrar
+      do
+        now <- getTime
+        require "period ends in the future" (validUntil > now)
+        flows <- forA flowCids $ \cid -> do
+          flow <- fetch cid
+          require' ("flow.vaultId", flow.vaultId) isEqualR ("vaultId", vault.vaultId)
+          require' ("flow.periodStart", flow.periodStart) isEqualR ("rateValidFrom", vault.rateValidFrom)
+          archive cid
+          pure flow
+        assets <- sumPool vault poolHoldingCids
+        let shares = vault.totalShares + sum (map (.sharesDelta) flows)
+        require "shares stay non-negative" (shares >= 0.0)
+        create vault with
+          totalShares = shares
+          totalAssets = assets
+          rateValidFrom = now
+          rateValidUntil = validUntil
+
 template ReferenceVault
   with
     vaultId : Text
@@ -75,6 +115,10 @@ template ReferenceVault
     rateValidUntil : Time
     depositCap : Optional Decimal
       -- ^ The most one deposit may bring in; `None` for no limit.
+    paused : Bool
+      -- ^ Whether deposits and mints are refused; withdrawals and redemptions still run.
+    underlyingTransferFactory : ContractId V2.TransferFactory
+      -- ^ The registry's transfer factory, the only one the vault transfers through.
   where
     signatory vaultRegistrar, custodian
 
@@ -111,10 +155,11 @@ template ReferenceVault
         assets' <- currentAssets this
         pure (sharesToAssets totalShares assets' shares)
 
-      maxDeposit _party _extraArgs = pure (fromOptional uncapped depositCap)
+      maxDeposit _party _extraArgs = pure (if paused then 0.0 else fromOptional uncapped depositCap)
 
       -- The most shares whose cost, fee included, fits under the cap.
       maxMint _party _extraArgs = case depositCap of
+        _ | paused -> pure 0.0
         None -> pure uncapped
         Some cap -> do
           assets' <- currentAssets this
@@ -155,6 +200,7 @@ template ReferenceVault
         sender <- fundingAccount arg.actors arg.extraArgs
         requireReceiverAuthorizes arg.receiver arg.actors
         requirePeriodOpen this
+        require "vault is not paused" (not paused)
         require "deposit within cap" (arg.assets <= fromOptional uncapped depositCap)
         assets' <- currentAssets this
         let net = deductFeeBps depositFeeBps arg.assets
@@ -165,6 +211,7 @@ template ReferenceVault
         pullUnderlying this arg.extraArgs sender arg.assets
         holdingCid <- mintShares shareInstrument (basicAccount arg.receiver) shares
         recordFlow this arg.assets shares
+        recordEvent this Deposited arg.actors arg.receiver arg.assets shares
         pure VaultActionResult with
           vaultCid = None
           assets = arg.assets
@@ -176,6 +223,7 @@ template ReferenceVault
         sender <- fundingAccount arg.actors arg.extraArgs
         requireReceiverAuthorizes arg.receiver arg.actors
         requirePeriodOpen this
+        require "vault is not paused" (not paused)
         require "mint is positive" (arg.shares > 0.0)
         assets' <- currentAssets this
         let assets = addFeeBps depositFeeBps (sharesToAssetsUp totalShares assets' arg.shares)
@@ -184,6 +232,7 @@ template ReferenceVault
         pullUnderlying this arg.extraArgs sender assets
         holdingCid <- mintShares shareInstrument (basicAccount arg.receiver) arg.shares
         recordFlow this assets arg.shares
+        recordEvent this Minted arg.actors arg.receiver assets arg.shares
         pure VaultActionResult with
           vaultCid = None
           assets
@@ -201,6 +250,7 @@ template ReferenceVault
         burnFrom this arg.extraArgs arg.owner shares
         holdingCids <- pushUnderlying this arg.extraArgs arg.actors arg.receiver arg.assets
         recordFlow this (negate arg.assets) (negate shares)
+        recordEvent this Withdrew arg.actors arg.receiver arg.assets shares
         pure VaultActionResult with
           vaultCid = None
           assets = arg.assets
@@ -220,6 +270,7 @@ template ReferenceVault
         burnFrom this arg.extraArgs arg.owner arg.shares
         holdingCids <- pushUnderlying this arg.extraArgs arg.actors arg.receiver assets
         recordFlow this (negate assets) (negate arg.shares)
+        recordEvent this Redeemed arg.actors arg.receiver assets arg.shares
         pure VaultActionResult with
           vaultCid = None
           assets
@@ -227,33 +278,60 @@ template ReferenceVault
           holdingCids
           meta = emptyMetadata
 
-    choice ReferenceVault_OpenPeriod : ContractId ReferenceVault
-      -- ^ Roll the rate period, summing the pool from holdings the custodian exhibits.
+    choice ReferenceVault_ClosePeriod : ContractId ClosedPeriod
+      -- ^ End the period; actions against this vault fail from here on.
+      controller vaultRegistrar
+      do create ClosedPeriod with vault = this
+
+    choice ReferenceVault_SetTransferFactory : ContractId ReferenceVault
+      -- ^ Pin another transfer factory, when the registry replaces its own.
       with
-        flowCids : [ContractId PeriodFlow]
-        poolHoldingCids : [ContractId V2.Holding]
-        validUntil : Time
+        factory : ContractId V2.TransferFactory
       controller vaultRegistrar
       do
-        now <- getTime
-        require "period ends in the future" (validUntil > now)
-        flows <- forA flowCids $ \cid -> do
-          flow <- fetch cid
-          require' ("flow.vaultId", flow.vaultId) isEqualR ("vaultId", vaultId)
-          require' ("flow.periodStart", flow.periodStart) isEqualR ("rateValidFrom", rateValidFrom)
-          archive cid
-          pure flow
-        assets <- sumPool this poolHoldingCids
-        let shares = totalShares + sum (map (.sharesDelta) flows)
-        require "shares stay non-negative" (shares >= 0.0)
-        create this with
-          totalShares = shares
-          totalAssets = assets
-          rateValidFrom = now
-          rateValidUntil = validUntil
+        -- Catches pinning another registry's factory by mistake.
+        factoryView <- exercise factory V2.TransferFactory_PublicFetch with actors = [vaultRegistrar]
+        require' ("transfer factory admin", factoryView.admin)
+          isEqualR ("underlying instrument admin", underlyingInstrument.admin)
+        create this with underlyingTransferFactory = factory
+
+    choice ReferenceVault_SetPaused : ContractId ReferenceVault
+      -- ^ Pause or resume deposits and mints.
+      with
+        pause : Bool
+      controller vaultRegistrar
+      do create this with paused = pause
+
+    nonconsuming choice ReferenceVault_PoolTotal : Decimal
+      -- ^ The pool summed from the holdings named, for checking the books between periods.
+      with
+        caller : Party
+        poolHoldingCids : [ContractId V2.Holding]
+      controller caller
+      do sumPool this poolHoldingCids
+
+    nonconsuming choice ReferenceVault_Fetch : ReferenceVault
+      -- ^ The vault itself, for a party that is not its stakeholder.
+      with
+        caller : Party
+      controller caller
+      do pure this
 
 -- Helpers
 -----------
+
+recordEvent : ReferenceVault -> VaultAction -> [Party] -> Party -> Decimal -> Decimal -> Update ()
+recordEvent vault action actors receiver assets shares = do
+  _ <- create VaultEvent with
+    vaultId = vault.vaultId
+    vaultRegistrar = vault.vaultRegistrar
+    action
+    actors
+    receiver
+    assets
+    shares
+    periodStart = vault.rateValidFrom
+  pure ()
 
 recordFlow : ReferenceVault -> Decimal -> Decimal -> Update ()
 recordFlow vault assetsDelta sharesDelta = do
@@ -341,26 +419,32 @@ checkMinAssetsOut limit assets = case limit of
 -- | Only the depositor authorizes; a receiver's consent comes from the custodian's preapproval.
 pullUnderlying : ReferenceVault -> ExtraArgs -> V2.Account -> Decimal -> Update ()
 pullUnderlying vault extraArgs from amount = do
-  _ <- transferUnderlying vault extraArgs (regularAccountParties from) from (basicAccount vault.custodian) amount
+  inputHoldingCids <- getUnderlyingHoldings extraArgs.context
+  _ <- transferUnderlying vault extraArgs (regularAccountParties from) from (basicAccount vault.custodian) amount inputHoldingCids
   pure ()
 
 -- The receiver authorizes receipt only if they are acting in this choice.
 pushUnderlying : ReferenceVault -> ExtraArgs -> [Party] -> Party -> Decimal -> Update [ContractId V2.Holding]
 pushUnderlying vault extraArgs callerActors to amount = do
   let actors = vault.custodian :: [to | to `elem` callerActors, to /= vault.custodian]
-  transferUnderlying vault extraArgs actors (basicAccount vault.custodian) (basicAccount to) amount
+  named <- getUnderlyingHoldings extraArgs.context
+  inputHoldingCids <- coveringHoldings amount named
+  transferUnderlying vault extraArgs actors (basicAccount vault.custodian) (basicAccount to) amount inputHoldingCids
 
-transferUnderlying : ReferenceVault -> ExtraArgs -> [Party] -> V2.Account -> V2.Account -> Decimal -> Update [ContractId V2.Holding]
-transferUnderlying vault extraArgs actors sender receiver amount = do
-  factoryCid <- getUnderlyingTransferFactory extraArgs.context
-  -- A caller-named factory must administer the instrument, or it could fake a transfer.
-  factoryView <- exercise factoryCid V2.TransferFactory_PublicFetch with
-    actors = regularAccountParties sender
-  require' ("transfer factory admin", factoryView.admin)
-    isEqualR ("underlying instrument admin", vault.underlyingInstrument.admin)
-  inputHoldingCids <- getUnderlyingHoldings extraArgs.context
+-- | The leading holdings that cover the payout, so one payout cannot consume the whole pool.
+coveringHoldings : Decimal -> [ContractId V2.Holding] -> Update [ContractId V2.Holding]
+coveringHoldings _ [] = pure []
+coveringHoldings remaining (cid :: rest) =
+  if remaining <= 0.0
+    then pure []
+    else do
+      holding <- view <$> fetch cid
+      (cid ::) <$> coveringHoldings (remaining - holding.amount) rest
+
+transferUnderlying : ReferenceVault -> ExtraArgs -> [Party] -> V2.Account -> V2.Account -> Decimal -> [ContractId V2.Holding] -> Update [ContractId V2.Holding]
+transferUnderlying vault extraArgs actors sender receiver amount inputHoldingCids = do
   now <- getTime
-  result <- exercise factoryCid V2.TransferFactory_Transfer with
+  result <- exercise vault.underlyingTransferFactory V2.TransferFactory_Transfer with
     transfer = V2.Transfer with
       sender
       receiver
