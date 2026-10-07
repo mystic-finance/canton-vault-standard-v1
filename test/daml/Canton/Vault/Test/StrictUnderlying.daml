@@ -20,11 +20,10 @@ setupStrict = do
   f <- setupVault
   strictCid <- submit f.underlyingAdmin do
     createCmd StrictRegistry with admin = f.underlyingAdmin
-  vaultD <- queryDisclosure f.registrar f.vaultTemplateCid
-  strictD <- queryDisclosure f.underlyingAdmin strictCid
-  case (vaultD, strictD) of
-    (Some v, Some s) -> pure ((f with registryCid = toInterfaceContractId strictCid), [v, s])
-    _ -> abort "disclosures not available"
+  Some strictD <- queryDisclosure f.underlyingAdmin strictCid
+  strict <- repin f (toInterfaceContractId strictCid) strictD
+  Some vaultD <- queryDisclosure strict.registrar strict.vaultTemplateCid
+  pure (strict, [vaultD, strictD])
 
 -- | The standing preapproval a vault's custodian holds from launch.
 custodianPreapproval : Fixture -> Script (ContractId MockPreapproval, Disclosure)
@@ -52,7 +51,7 @@ depositWithPreapproval f ds = do
       receiver = f.alice
       minSharesOut = None
       actors = [f.alice]
-      extraArgs = withPreapproval preCid (depositArgsFor f f.registryCid [funds])
+      extraArgs = withPreapproval preCid (depositArgs f [funds])
 
 depositCompletesWithTheCustodiansPreapproval : Script ()
 depositCompletesWithTheCustodiansPreapproval = script do
@@ -71,7 +70,7 @@ depositWithoutAPreapprovalIsRefused = script do
       receiver = f.alice
       minSharesOut = None
       actors = [f.alice]
-      extraArgs = depositArgsFor f f.registryCid [funds]
+      extraArgs = depositArgs f [funds]
 
 redeemCompletesWhenTheRegistryWantsTheReceiver : Script ()
 redeemCompletesWhenTheRegistryWantsTheReceiver = script do
