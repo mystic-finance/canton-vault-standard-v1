@@ -122,8 +122,8 @@ type RequestId = Int
 -- deposits and redemptions.
 data AsyncView = AsyncView with
     executors : [Party]
-      -- ^ The parties who fulfil and cancel requests. Any one of them can settle
-      -- or cancel a pending escrow.
+      -- ^ The parties who fulfil and cancel requests, acting together: settling
+      -- or cancelling a pending escrow needs all of them.
     settlementDeadlineWindow : RelTime
       -- ^ The least time a request's allocations stay committed after it is
       -- made. Until their deadline only the executors can settle or cancel
@@ -134,7 +134,8 @@ data AsyncView = AsyncView with
 
 -- | The settlement id every allocation for a request to the vault carries, in
 -- any period, so its requests can settle in one batch. Wallets compute it
--- before allocating.
+-- before allocating. The rest of the settlement is the vault's `executors`, no
+-- contract id and no metadata.
 requestSettlementId : Text -> Text
 requestSettlementId vaultId = vaultId <> "/requests"
 

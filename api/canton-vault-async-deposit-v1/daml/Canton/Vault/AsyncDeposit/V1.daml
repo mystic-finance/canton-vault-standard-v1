@@ -9,21 +9,26 @@ import Canton.Vault.V1
 
 -- | An interface for queuing deposits. A vault implements it alongside `Vault`
 -- when deposits are fulfilled later rather than at once; its `Vault_Deposit`,
--- `Vault_Mint`, `previewDeposit` and `previewMint` then fail.
+-- `Vault_Mint`, `previewDeposit` and `previewMint` then fail, and its
+-- `maxDeposit` and `maxMint` return zero.
 --
 -- The depositor escrows a request with two allocations made before requesting:
 -- one funded, sending the underlying to the custodian, and one authorizing the
 -- receiver to be issued shares from the mint account. Both are committed for at
--- least the vault's `settlementDeadlineWindow`, and carry the settlement id
--- `requestSettlementId` and the leg ids `requestLegId`. The executors fulfil a
--- request at any time before its deadline, at the rate when they strike it,
--- settling both legs; how they do so is the vault's own.
+-- least the vault's `settlementDeadlineWindow` and carry the settlement id
+-- `requestSettlementId`; the escrow's leg carries the leg id `requestLegId`, and
+-- the authorization has no legs. Each is issued by its instrument's registry,
+-- signed by the registry's admin. The executors fulfil a request at any time
+-- before its deadline, at the rate when they strike it, settling both legs; how
+-- they do so is the vault's own.
 interface VaultAsyncDeposit requires Vault where
   viewtype AsyncView
 
-  -- | Units of the underlying the party still has queued under the request id,
-  -- as escrowed by the allocations named in `extraArgs`. A vault cannot look
-  -- allocations up, so one not named does not count.
+  -- | Units of the underlying the party has escrowed for the vault's requests
+  -- under the request id, in the allocations named in `extraArgs` that the
+  -- underlying's registry issued. A vault cannot look allocations up, so one not
+  -- named does not count, and one named twice counts once. An escrow counts until
+  -- it is settled, cancelled or withdrawn; naming one that is gone fails.
   pendingDepositRequest : RequestId -> Party -> ExtraArgs -> Update Decimal
 
   vault_requestDepositImpl : ContractId VaultAsyncDeposit -> Vault_RequestDeposit -> Update RequestId
@@ -36,8 +41,8 @@ interface VaultAsyncDeposit requires Vault where
     -- Takes no slippage limit: the rate is not known until fulfilment.
     with
       label : Text
-        -- ^ The requester's label for the request, in its leg ids; unique among
-        -- their pending requests.
+        -- ^ The requester's label for the request, in its leg ids. Requests that
+        -- share a label cannot be fulfilled together.
       assets : Decimal
         -- ^ Units of the underlying to deposit.
       receiver : Party

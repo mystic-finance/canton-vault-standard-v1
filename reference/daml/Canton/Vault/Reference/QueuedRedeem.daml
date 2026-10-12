@@ -2,6 +2,7 @@
 module Canton.Vault.Reference.QueuedRedeem where
 
 import DA.Foldable (forA_)
+import DA.List (dedup)
 import DA.Optional (isNone)
 import DA.TextMap qualified as TextMap
 import DA.Time (RelTime)
@@ -40,7 +41,7 @@ template ReferenceQueuedRedeemVault
     depositCap : Optional Decimal
       -- ^ The most one deposit may bring in; `None` for no limit.
     executors : [Party]
-      -- ^ The parties who fulfil and cancel redemption requests.
+      -- ^ The parties who fulfil redemption requests together; any one of them may drop a request.
     settlementDeadlineWindow : RelTime
       -- ^ The least time a request's allocations must be committed for.
     paused : Bool
@@ -94,13 +95,16 @@ template ReferenceQueuedRedeemVault
 
       -- Every request has id 0, so a party's pending shares are all their escrows together.
       pendingRedeemRequest requestId party extraArgs = do
-        allocationCids <- getAllocations shareAllocationsKey extraArgs.context
+        allocationCids <- dedup <$> getAllocations shareAllocationsKey extraArgs.context
         amounts <- forA allocationCids $ \cid -> do
-          allocation <- view <$> fetch cid
-          pure $ if requestId == 0 && allocation.settlement == settlementFor this
-                      && allocation.allocation.authorizer.owner == Some party
-            then sum [ leg.amount | leg <- allocation.allocation.transferLegSides
-                     , leg.side == V2.SenderSide, leg.otherside == burnAccount ]
+          allocation <- fetch cid
+          let escrow = view allocation
+          pure $ if requestId == 0 && signedBy vaultRegistrar allocation
+                      && escrow.settlement == settlementFor this
+                      && escrow.allocation.authorizer.owner == Some party
+            then sum [ leg.amount | leg <- escrow.allocation.transferLegSides
+                     , leg.side == V2.SenderSide, leg.otherside == burnAccount
+                     , leg.instrumentId == shareInstrument.id ]
             else 0.0
         pure (sum amounts)
 
@@ -108,24 +112,23 @@ template ReferenceQueuedRedeemVault
 
       vault_requestRedeemImpl _self arg = do
         requirePeriodOpen (instantOf' this)
-        require "redemption is positive" (arg.shares > 0.0)
+        assets' <- currentAssets (instantOf' this)
+        require "the redemption pays out at the current rate"
+          (deductFeeBps redeemFeeBps (sharesToAssets totalShares assets' arg.shares) > 0.0)
         let settlement = settlementFor this
 
-        escrowed <- view <$> fetch arg.shareAllocation
+        escrowed <- fetchSigned "escrow" vaultRegistrar arg.shareAllocation
         let owner = escrowed.allocation.authorizer
         checkActors arg.actors [regularAccountParties owner]
         require' ("escrow.settlement", escrowed.settlement) isEqualR ("settlement", settlement)
-        require' ("escrow.admin", escrowed.allocation.admin) isEqualR ("registrar", vaultRegistrar)
         require "escrow is not iterated" (isNone escrowed.allocation.nextIterationFunding)
         require' ("escrow legs", map legKey escrowed.allocation.transferLegSides) isEqualR
           ("request legs", [ ( requestLegId (regularAccountOwner owner) arg.label "shares"
                              , V2.SenderSide, burnAccount, arg.shares, shareInstrument.id ) ])
         requireCommittedFor "escrow" settlementDeadlineWindow escrowed.allocation
 
-        receiving <- view <$> fetch arg.underlyingAllocation
+        receiving <- fetchSigned "receipt authorization" underlyingInstrument.admin arg.underlyingAllocation
         require' ("receipt authorization.settlement", receiving.settlement) isEqualR ("settlement", settlement)
-        require' ("receipt authorization.admin", receiving.allocation.admin) isEqualR
-          ("underlying admin", underlyingInstrument.admin)
         require' ("receipt authorization.authorizer.owner", receiving.allocation.authorizer.owner) isEqualR
           ("receiver", Some arg.receiver)
         -- The payout is set at fulfilment, which adds the receiving leg.
@@ -161,8 +164,11 @@ template ReferenceQueuedRedeemVault
         require "fulfils at least one request" (requestCids /= [])
         requests <- forA requestCids $ \cid -> do
           request <- fetch cid
+          require' ("request.vaultRegistrar", request.vaultRegistrar) isEqualR ("vaultRegistrar", vaultRegistrar)
           archive cid
           pure request
+        requireDistinct [(r.owner, r.label) | r <- requests]
+          (concat [[r.shareAllocation, r.underlyingAllocation] | r <- requests])
         assets' <- currentAssets (instantOf' this)
         -- Each leg uses the account its allocation names, which may have a provider.
         accounts <- forA requests $ \r -> do

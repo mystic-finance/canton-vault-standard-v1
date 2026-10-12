@@ -2,6 +2,7 @@
 module Canton.Vault.Reference.QueuedDeposit where
 
 import DA.Foldable (forA_)
+import DA.List (dedup)
 import DA.Optional (isNone)
 import DA.TextMap qualified as TextMap
 import DA.Time (RelTime)
@@ -39,7 +40,7 @@ template ReferenceQueuedDepositVault
     rateValidFrom : Time
     rateValidUntil : Time
     executors : [Party]
-      -- ^ The parties who fulfil and cancel deposit requests.
+      -- ^ The parties who fulfil deposit requests together; any one of them may drop a request.
     settlementDeadlineWindow : RelTime
       -- ^ The least time a request's allocations must be committed for.
     paused : Bool
@@ -93,13 +94,16 @@ template ReferenceQueuedDepositVault
 
       -- Every request has id 0, so a party's pending amount is all their escrows together.
       pendingDepositRequest requestId party extraArgs = do
-        allocationCids <- getAllocations underlyingAllocationsKey extraArgs.context
+        allocationCids <- dedup <$> getAllocations underlyingAllocationsKey extraArgs.context
         amounts <- forA allocationCids $ \cid -> do
-          allocation <- view <$> fetch cid
-          pure $ if requestId == 0 && allocation.settlement == settlementFor this
-                      && allocation.allocation.authorizer.owner == Some party
-            then sum [ leg.amount | leg <- allocation.allocation.transferLegSides
-                     , leg.side == V2.SenderSide, leg.otherside == basicAccount custodian ]
+          allocation <- fetch cid
+          let escrow = view allocation
+          pure $ if requestId == 0 && signedBy underlyingInstrument.admin allocation
+                      && escrow.settlement == settlementFor this
+                      && escrow.allocation.authorizer.owner == Some party
+            then sum [ leg.amount | leg <- escrow.allocation.transferLegSides
+                     , leg.side == V2.SenderSide, leg.otherside == basicAccount custodian
+                     , leg.instrumentId == underlyingInstrument.id ]
             else 0.0
         pure (sum amounts)
 
@@ -108,23 +112,23 @@ template ReferenceQueuedDepositVault
       vault_requestDepositImpl _self arg = do
         requirePeriodOpen (instantOf' this)
         require "vault is not paused" (not paused)
-        require "deposit is positive" (arg.assets > 0.0)
+        assets' <- currentAssets (instantOf' this)
+        require "the deposit is worth shares at the current rate"
+          (assetsToShares totalShares assets' (deductFeeBps depositFeeBps arg.assets) > 0.0)
         let settlement = settlementFor this
 
-        funded <- view <$> fetch arg.underlyingAllocation
+        funded <- fetchSigned "escrow" underlyingInstrument.admin arg.underlyingAllocation
         let requester = funded.allocation.authorizer
         checkActors arg.actors [regularAccountParties requester]
         require' ("escrow.settlement", funded.settlement) isEqualR ("settlement", settlement)
-        require' ("escrow.admin", funded.allocation.admin) isEqualR ("underlying admin", underlyingInstrument.admin)
         require "escrow is not iterated" (isNone funded.allocation.nextIterationFunding)
         require' ("escrow legs", map legKey funded.allocation.transferLegSides) isEqualR
           ("request legs", [ ( requestLegId (regularAccountOwner requester) arg.label "underlying"
                              , V2.SenderSide, basicAccount custodian, arg.assets, underlyingInstrument.id ) ])
         requireCommittedFor "escrow" settlementDeadlineWindow funded.allocation
 
-        receiving <- view <$> fetch arg.shareAllocation
+        receiving <- fetchSigned "share authorization" vaultRegistrar arg.shareAllocation
         require' ("share authorization.settlement", receiving.settlement) isEqualR ("settlement", settlement)
-        require' ("share authorization.admin", receiving.allocation.admin) isEqualR ("registrar", vaultRegistrar)
         require' ("share authorization.authorizer.owner", receiving.allocation.authorizer.owner) isEqualR
           ("receiver", Some arg.receiver)
         -- The share amount is set at fulfilment, which adds the receiving leg.
@@ -159,8 +163,11 @@ template ReferenceQueuedDepositVault
         require "fulfils at least one request" (requestCids /= [])
         requests <- forA requestCids $ \cid -> do
           request <- fetch cid
+          require' ("request.vaultRegistrar", request.vaultRegistrar) isEqualR ("vaultRegistrar", vaultRegistrar)
           archive cid
           pure request
+        requireDistinct [(r.requester, r.label) | r <- requests]
+          (concat [[r.underlyingAllocation, r.shareAllocation] | r <- requests])
         assets' <- currentAssets (instantOf' this)
         -- Each leg uses the account its allocation names, which may have a provider.
         accounts <- forA requests $ \r -> do
@@ -236,7 +243,7 @@ template ReferenceQueuedDepositVault
           shareFactories = shares
 
     choice ReferenceQueuedDepositVault_ClosePeriod : ContractId ClosedQueuedPeriod
-      -- ^ End the period; requests and fulfilments against this vault fail from here on.
+      -- ^ End the period; redemptions, requests and fulfilments against this vault fail from here on.
       controller vaultRegistrar
       do create ClosedQueuedPeriod with vault = this
 
