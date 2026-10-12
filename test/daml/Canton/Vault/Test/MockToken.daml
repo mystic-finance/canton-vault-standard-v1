@@ -161,7 +161,9 @@ template PendingInstruction
         availableActions = mempty
         meta = emptyMetadata
 
-      transferInstruction_acceptImpl _self _arg = abort "not needed"
+      transferInstruction_acceptImpl _self arg = do
+        require "the receiver accepts" (all (`elem` arg.actors) (regularAccountParties transfer.receiver))
+        settleTransfer transfer
       transferInstruction_rejectImpl _self _arg = abort "not needed"
       transferInstruction_withdrawImpl _self _arg = abort "not needed"
       transferInstruction_acceptExtraObservers _arg = []
