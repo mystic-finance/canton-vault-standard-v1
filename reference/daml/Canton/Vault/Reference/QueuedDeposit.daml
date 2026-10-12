@@ -4,12 +4,13 @@ module Canton.Vault.Reference.QueuedDeposit where
 import DA.Foldable (forA_)
 import DA.Optional (isNone)
 import DA.TextMap qualified as TextMap
-import DA.Time (RelTime, addRelTime)
+import DA.Time (RelTime)
 
 import Canton.Vault.V1
 import Canton.Vault.AsyncDeposit.V1
 import Canton.Vault.Reference.Math
 import Canton.Vault.Reference.V1
+import Canton.Vault.Reference.Queue
 
 import Splice.Api.Token.MetadataV1
 import Splice.Api.Token.HoldingV2 qualified as V2
@@ -96,7 +97,7 @@ template ReferenceQueuedDepositVault
         amounts <- forA allocationCids $ \cid -> do
           allocation <- view <$> fetch cid
           pure $ if requestId == 0 && allocation.settlement == settlementFor this
-                      && allocation.allocation.authorizer == basicAccount party
+                      && allocation.allocation.authorizer.owner == Some party
             then sum [ leg.amount | leg <- allocation.allocation.transferLegSides
                      , leg.side == V2.SenderSide, leg.otherside == basicAccount custodian ]
             else 0.0
@@ -108,35 +109,29 @@ template ReferenceQueuedDepositVault
         requirePeriodOpen (instantOf' this)
         require "vault is not paused" (not paused)
         require "deposit is positive" (arg.assets > 0.0)
-        now <- getTime
         let settlement = settlementFor this
-            committedFor what deadline = case deadline of
-              Some d -> require (what <> " is committed for the vault's window") (d >= addRelTime now settlementDeadlineWindow)
-              None -> fail (what <> " needs a settlement deadline")
 
         funded <- view <$> fetch arg.underlyingAllocation
         let requester = funded.allocation.authorizer
         checkActors arg.actors [regularAccountParties requester]
         require' ("escrow.settlement", funded.settlement) isEqualR ("settlement", settlement)
         require' ("escrow.admin", funded.allocation.admin) isEqualR ("underlying admin", underlyingInstrument.admin)
-        require "escrow is committed" funded.allocation.committed
         require "escrow is not iterated" (isNone funded.allocation.nextIterationFunding)
         require' ("escrow legs", map legKey funded.allocation.transferLegSides) isEqualR
           ("request legs", [ ( requestLegId (regularAccountOwner requester) arg.label "underlying"
                              , V2.SenderSide, basicAccount custodian, arg.assets, underlyingInstrument.id ) ])
-        committedFor "escrow" funded.allocation.settlementDeadline
+        requireCommittedFor "escrow" settlementDeadlineWindow funded.allocation
 
         receiving <- view <$> fetch arg.shareAllocation
         require' ("share authorization.settlement", receiving.settlement) isEqualR ("settlement", settlement)
         require' ("share authorization.admin", receiving.allocation.admin) isEqualR ("registrar", vaultRegistrar)
-        require' ("share authorization.authorizer", receiving.allocation.authorizer) isEqualR
-          ("receiver", basicAccount arg.receiver)
+        require' ("share authorization.authorizer.owner", receiving.allocation.authorizer.owner) isEqualR
+          ("receiver", Some arg.receiver)
         -- The share amount is set at fulfilment, which adds the receiving leg.
         require "share authorization names no legs" (receiving.allocation.transferLegSides == [])
         require "share authorization allows the executors to add a leg"
           (receiving.allocation.nextIterationFunding == Some TextMap.empty)
-        require "share authorization is committed" receiving.allocation.committed
-        committedFor "share authorization" receiving.allocation.settlementDeadline
+        requireCommittedFor "share authorization" settlementDeadlineWindow receiving.allocation
 
         recordRequestEvent this Requested (regularAccountOwner requester) arg.receiver arg.label arg.assets None
         pure 0
@@ -155,46 +150,52 @@ template ReferenceQueuedDepositVault
         require "vault is not paused" (not paused)
         require "fulfils at least one request" (requests /= [])
         assets' <- currentAssets (instantOf' this)
+        -- Each leg uses the account its allocation names, which may have a provider.
+        accounts <- forA requests $ \r -> do
+          funded <- view <$> fetch r.underlyingAllocation
+          receiving <- view <$> fetch r.shareAllocation
+          pure (funded.allocation.authorizer, receiving.allocation.authorizer)
         let settlement = settlementFor this
-            priced = [ (r, assetsToShares totalShares assets' (deductFeeBps depositFeeBps r.assets)) | r <- requests ]
-            underlyingLeg r = V2.TransferLeg with
+            priced = [ (r, from, to, assetsToShares totalShares assets' (deductFeeBps depositFeeBps r.assets))
+                     | (r, (from, to)) <- zip requests accounts ]
+            underlyingLeg (r, from, _, _) = V2.TransferLeg with
               transferLegId = requestLegId r.requester r.label "underlying"
-              sender = basicAccount r.requester
+              sender = from
               receiver = basicAccount custodian
               amount = r.assets
               instrumentId = underlyingInstrument.id
               meta = emptyMetadata
-            shareLeg (r, s) = V2.TransferLeg with
+            shareLeg (r, _, to, s) = V2.TransferLeg with
               transferLegId = requestLegId r.requester r.label "shares"
               sender = mintAccount
-              receiver = basicAccount r.receiver
+              receiver = to
               amount = s
               instrumentId = shareInstrument.id
               meta = emptyMetadata
-        forA_ priced $ \(_, s) -> require "each request mints a positive number of shares" (s > 0.0)
+        forA_ priced $ \(_, _, _, s) -> require "each request mints a positive number of shares" (s > 0.0)
 
         -- The vault's own sides: the custodian receives, the mint account sends.
         custodianSide <- allocateSides underlyingFactories underlyingExtraArgs settlement underlyingInstrument.admin
-          (basicAccount custodian) [custodian] [receiverSide (underlyingLeg r) | (r, _) <- priced]
+          (basicAccount custodian) [custodian] [] [receiverSide (underlyingLeg p) | p <- priced]
         mintSide <- allocateSides shareFactories shareExtraArgs settlement vaultRegistrar
-          mintAccount [vaultRegistrar] [senderSide (shareLeg p) | p <- priced]
+          mintAccount [vaultRegistrar] [] [senderSide (shareLeg p) | p <- priced]
 
         _ <- exercise underlyingFactories.settlementFactory V2.SettlementFactory_SettleBatch with
           settlement
-          transferLegs = map (underlyingLeg . fst) priced
-          allocations = finalized custodianSide [] :: [finalized r.underlyingAllocation [] | (r, _) <- priced]
+          transferLegs = map underlyingLeg priced
+          allocations = finalized custodianSide [] :: [finalized r.underlyingAllocation [] | (r, _, _, _) <- priced]
           actors = executors
           extraArgs = underlyingExtraArgs
         _ <- exercise shareFactories.settlementFactory V2.SettlementFactory_SettleBatch with
           settlement
           transferLegs = map shareLeg priced
           allocations = finalized mintSide []
-            :: [finalized r.shareAllocation [receiverSide (shareLeg p)] | p@(r, _) <- priced]
+            :: [finalized r.shareAllocation [receiverSide (shareLeg p)] | p@(r, _, _, _) <- priced]
           actors = executors
           extraArgs = shareExtraArgs
 
-        recordFlow (instantOf' this) (sum (map (.assets) requests)) (sum (map snd priced))
-        forA_ priced $ \(r, s) ->
+        recordFlow (instantOf' this) (sum (map (.assets) requests)) (sum [s | (_, _, _, s) <- priced])
+        forA_ priced $ \(r, _, _, s) ->
           recordRequestEvent this Fulfilled r.requester r.receiver r.label r.assets (Some s)
 
     choice ReferenceQueuedDepositVault_SetPaused : ContractId ReferenceQueuedDepositVault
@@ -271,9 +272,6 @@ template QueuedDepositEvent
     signatory vaultRegistrar
     observer requester, receiver
 
-data RequestStage = Requested | Fulfilled
-  deriving (Eq, Show, Serializable)
-
 -- | One request to fulfil, as the executors read it from its escrow.
 data DepositRequest = DepositRequest with
     requester : Party
@@ -282,12 +280,6 @@ data DepositRequest = DepositRequest with
     assets : Decimal
     underlyingAllocation : ContractId V2.Allocation
     shareAllocation : ContractId V2.Allocation
-  deriving (Show, Eq, Serializable)
-
--- | A registry's allocation and settlement factories.
-data Factories = Factories with
-    allocationFactory : ContractId V2.AllocationFactory
-    settlementFactory : ContractId V2.SettlementFactory
   deriving (Show, Eq, Serializable)
 
 -- | The same vault as an instant one, for everything but deposits.
@@ -332,49 +324,3 @@ recordRequestEvent v stage requester receiver label assets shares = do
     shares
     periodStart = v.rateValidFrom
   pure ()
-
-requireFactoriesOf : Party -> Party -> Factories -> Update ()
-requireFactoriesOf actor admin factories = do
-  allocationView <- exercise factories.allocationFactory V2.AllocationFactory_PublicFetch with actors = [actor]
-  require' ("allocation factory admin", allocationView.admin) isEqualR ("registry admin", admin)
-  settlementView <- exercise factories.settlementFactory V2.SettlementFactory_PublicFetch with actors = [actor]
-  require' ("settlement factory admin", settlementView.admin) isEqualR ("registry admin", admin)
-
-legKey : V2.TransferLegSide -> (Text, V2.TransferSide, V2.Account, Decimal, Text)
-legKey leg = (leg.transferLegId, leg.side, leg.otherside, leg.amount, leg.instrumentId)
-
-finalized : ContractId V2.Allocation -> [V2.TransferLegSide] -> V2.FinalizedAllocation
-finalized allocationCid extra = V2.FinalizedAllocation with
-  allocationCid
-  extraTransferLegSides = extra
-  nextIterationFunding = None
-
--- | Allocates the vault's side of every leg in a batch, which settles at once.
-allocateSides : Factories -> ExtraArgs -> V2.SettlementInfo -> Party -> V2.Account -> [Party] -> [V2.TransferLegSide] -> Update (ContractId V2.Allocation)
-allocateSides factories extraArgs settlement admin authorizer actors sides = do
-  now <- getTime
-  result <- exercise factories.allocationFactory V2.AllocationFactory_Allocate with
-    settlement
-    allocation = V2.AllocationSpecification with
-      admin
-      authorizer
-      transferLegSides = sides
-      settlementDeadline = None
-      nextIterationFunding = None
-      committed = False
-      meta = emptyMetadata
-    requestedAt = now
-    inputHoldingCids = []
-    extraArgs
-    actors
-  case result.output of
-    V2.AllocationInstructionResult_Completed with allocationCid -> pure allocationCid
-    _ -> fail "the vault's own allocation did not complete"
-
-getAllocations : Text -> ChoiceContext -> Update [ContractId V2.Allocation]
-getAllocations key context = case TextMap.lookup key context.values of
-  Some (AV_List cids) -> forA cids $ \v -> case v of
-    AV_ContractId cid -> pure (fromAnyContractId cid)
-    _ -> fail $ "Failed to decode an allocation id under '" <> key <> "': " <> show v
-  None -> pure []
-  v -> fail $ "Failed to decode context value for '" <> key <> "': " <> show v

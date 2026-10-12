@@ -1,0 +1,330 @@
+-- | A reference vault whose deposits are instant and redemptions queued.
+module Canton.Vault.Reference.QueuedRedeem where
+
+import DA.Foldable (forA_)
+import DA.Optional (isNone)
+import DA.TextMap qualified as TextMap
+import DA.Time (RelTime)
+
+import Canton.Vault.V1
+import Canton.Vault.AsyncRedeem.V1
+import Canton.Vault.Reference.Math
+import Canton.Vault.Reference.V1
+import Canton.Vault.Reference.Queue
+
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.HoldingV2 qualified as V2
+import Splice.Api.Token.AllocationV2 qualified as V2
+import Splice.Api.Token.TransferInstructionV2 qualified as V2
+import Splice.TokenStandard.Utils
+
+shareAllocationsKey : Text
+shareAllocationsKey = "cantonVaultV1/shareAllocations"
+
+template ReferenceQueuedRedeemVault
+  with
+    vaultId : Text
+    vaultRegistrar : Party
+    custodian : Party
+    underlyingInstrument : V2.InstrumentId
+    shareInstrument : V2.InstrumentId
+    totalShares : Decimal
+      -- ^ The shares in issue as of `rateValidFrom`.
+    totalAssets : Decimal
+      -- ^ The pool as of `rateValidFrom`, before the virtual offset.
+    accrual : Optional Accrual
+    depositFeeBps : Int
+    redeemFeeBps : Int
+    rateValidFrom : Time
+    rateValidUntil : Time
+    depositCap : Optional Decimal
+      -- ^ The most one deposit may bring in; `None` for no limit.
+    executors : [Party]
+      -- ^ The parties who fulfil and cancel redemption requests.
+    settlementDeadlineWindow : RelTime
+      -- ^ The least time a request's allocations must be committed for.
+    paused : Bool
+      -- ^ Whether deposits and mints are refused; redemptions still run.
+    underlyingTransferFactory : ContractId V2.TransferFactory
+      -- ^ The underlying registry's transfer factory, the only one deposits pay in through.
+    underlyingFactories : Factories
+      -- ^ The underlying registry's factories, the only ones fulfilment uses for it.
+    shareFactories : Factories
+      -- ^ The share registry's factories, the only ones fulfilment uses for it.
+  where
+    signatory vaultRegistrar, custodian
+    observer executors
+
+    ensure totalShares >= 0.0 && totalAssets >= 0.0
+        && rateValidUntil > rateValidFrom
+        && shareInstrument == V2.InstrumentId with admin = vaultRegistrar; id = vaultId
+        && depositFeeBps >= 0 && depositFeeBps <= 10000
+        && redeemFeeBps >= 0 && redeemFeeBps <= 10000
+        && executors /= []
+
+    -- Pricing, deposits and the period accounting are the instant vault's.
+    interface instance Vault for ReferenceQueuedRedeemVault where
+      view = view (instantOf this)
+      convertToShares = convertToShares (instantOf this)
+      convertToAssets = convertToAssets (instantOf this)
+      maxDeposit = maxDeposit (instantOf this)
+      maxMint = maxMint (instantOf this)
+      maxWithdraw _party _extraArgs = pure 0.0
+      maxRedeem _party _extraArgs = pure 0.0
+      previewDeposit = previewDeposit (instantOf this)
+      previewMint = previewMint (instantOf this)
+      previewWithdraw _assets = fail "redemptions are queued: use Vault_RequestRedeem"
+      previewRedeem _shares = fail "redemptions are queued: use Vault_RequestRedeem"
+
+      vault_depositExtraObservers _arg = []
+      vault_mintExtraObservers _arg = []
+      vault_withdrawExtraObservers _arg = []
+      vault_redeemExtraObservers _arg = []
+
+      vault_depositImpl = vault_depositImpl (instantOf this)
+      vault_mintImpl = vault_mintImpl (instantOf this)
+      vault_withdrawImpl _self _arg = fail "redemptions are queued: use Vault_RequestRedeem"
+      vault_redeemImpl _self _arg = fail "redemptions are queued: use Vault_RequestRedeem"
+
+    interface instance VaultAsyncRedeem for ReferenceQueuedRedeemVault where
+      view = AsyncView with
+        executors
+        settlementDeadlineWindow
+        meta = emptyMetadata
+
+      -- Every request has id 0, so a party's pending shares are all their escrows together.
+      pendingRedeemRequest requestId party extraArgs = do
+        allocationCids <- getAllocations shareAllocationsKey extraArgs.context
+        amounts <- forA allocationCids $ \cid -> do
+          allocation <- view <$> fetch cid
+          pure $ if requestId == 0 && allocation.settlement == settlementFor this
+                      && allocation.allocation.authorizer.owner == Some party
+            then sum [ leg.amount | leg <- allocation.allocation.transferLegSides
+                     , leg.side == V2.SenderSide, leg.otherside == burnAccount ]
+            else 0.0
+        pure (sum amounts)
+
+      vault_requestRedeemExtraObservers _arg = []
+
+      vault_requestRedeemImpl _self arg = do
+        requirePeriodOpen (instantOf' this)
+        require "redemption is positive" (arg.shares > 0.0)
+        let settlement = settlementFor this
+
+        escrowed <- view <$> fetch arg.shareAllocation
+        let owner = escrowed.allocation.authorizer
+        checkActors arg.actors [regularAccountParties owner]
+        require' ("escrow.settlement", escrowed.settlement) isEqualR ("settlement", settlement)
+        require' ("escrow.admin", escrowed.allocation.admin) isEqualR ("registrar", vaultRegistrar)
+        require "escrow is not iterated" (isNone escrowed.allocation.nextIterationFunding)
+        require' ("escrow legs", map legKey escrowed.allocation.transferLegSides) isEqualR
+          ("request legs", [ ( requestLegId (regularAccountOwner owner) arg.label "shares"
+                             , V2.SenderSide, burnAccount, arg.shares, shareInstrument.id ) ])
+        requireCommittedFor "escrow" settlementDeadlineWindow escrowed.allocation
+
+        receiving <- view <$> fetch arg.underlyingAllocation
+        require' ("receipt authorization.settlement", receiving.settlement) isEqualR ("settlement", settlement)
+        require' ("receipt authorization.admin", receiving.allocation.admin) isEqualR
+          ("underlying admin", underlyingInstrument.admin)
+        require' ("receipt authorization.authorizer.owner", receiving.allocation.authorizer.owner) isEqualR
+          ("receiver", Some arg.receiver)
+        -- The payout is set at fulfilment, which adds the receiving leg.
+        require "receipt authorization names no legs" (receiving.allocation.transferLegSides == [])
+        require "receipt authorization allows the executors to add a leg"
+          (receiving.allocation.nextIterationFunding == Some TextMap.empty)
+        requireCommittedFor "receipt authorization" settlementDeadlineWindow receiving.allocation
+
+        recordRequestEvent this Requested (regularAccountOwner owner) arg.receiver arg.label arg.shares None
+        pure 0
+
+    nonconsuming choice ReferenceQueuedRedeemVault_Fulfil : ()
+      -- ^ Fulfil requests at the current rate, in one transaction.
+      with
+        requests : [RedeemRequest]
+        poolHoldingCids : [ContractId V2.Holding]
+          -- ^ The custodian's holdings to pay from; only those the payout needs are used.
+        underlyingExtraArgs : ExtraArgs
+          -- ^ The underlying registry's context for allocating and settling.
+        shareExtraArgs : ExtraArgs
+          -- ^ The share registry's context for allocating and settling.
+      controller executors
+      do
+        requirePeriodOpen (instantOf' this)
+        require "fulfils at least one request" (requests /= [])
+        assets' <- currentAssets (instantOf' this)
+        -- Each leg uses the account its allocation names, which may have a provider.
+        accounts <- forA requests $ \r -> do
+          escrowed <- view <$> fetch r.shareAllocation
+          receiving <- view <$> fetch r.underlyingAllocation
+          pure (escrowed.allocation.authorizer, receiving.allocation.authorizer)
+        let settlement = settlementFor this
+            priced = [ (r, from, to, deductFeeBps redeemFeeBps (sharesToAssets totalShares assets' r.shares))
+                     | (r, (from, to)) <- zip requests accounts ]
+            shareLeg (r, from, _, _) = V2.TransferLeg with
+              transferLegId = requestLegId r.owner r.label "shares"
+              sender = from
+              receiver = burnAccount
+              amount = r.shares
+              instrumentId = shareInstrument.id
+              meta = emptyMetadata
+            payoutLeg (r, _, to, a) = V2.TransferLeg with
+              transferLegId = requestLegId r.owner r.label "underlying"
+              sender = basicAccount custodian
+              receiver = to
+              amount = a
+              instrumentId = underlyingInstrument.id
+              meta = emptyMetadata
+            payout = sum [a | (_, _, _, a) <- priced]
+        forA_ priced $ \(_, _, _, a) -> require "each request pays out a positive amount" (a > 0.0)
+        pool <- coveringHoldings payout poolHoldingCids
+
+        -- The vault's own sides: the burn account receives the shares, the custodian pays out.
+        burnSide <- allocateSides shareFactories shareExtraArgs settlement vaultRegistrar
+          burnAccount [vaultRegistrar] [] [receiverSide (shareLeg p) | p <- priced]
+        custodianSide <- allocateSides underlyingFactories underlyingExtraArgs settlement underlyingInstrument.admin
+          (basicAccount custodian) [custodian] pool [senderSide (payoutLeg p) | p <- priced]
+
+        _ <- exercise shareFactories.settlementFactory V2.SettlementFactory_SettleBatch with
+          settlement
+          transferLegs = map shareLeg priced
+          allocations = finalized burnSide [] :: [finalized r.shareAllocation [] | (r, _, _, _) <- priced]
+          actors = executors
+          extraArgs = shareExtraArgs
+        _ <- exercise underlyingFactories.settlementFactory V2.SettlementFactory_SettleBatch with
+          settlement
+          transferLegs = map payoutLeg priced
+          allocations = finalized custodianSide []
+            :: [finalized r.underlyingAllocation [receiverSide (payoutLeg p)] | p@(r, _, _, _) <- priced]
+          actors = executors
+          extraArgs = underlyingExtraArgs
+
+        recordFlow (instantOf' this) (negate payout) (negate (sum (map (.shares) requests)))
+        forA_ priced $ \(r, _, _, a) ->
+          recordRequestEvent this Fulfilled r.owner r.receiver r.label r.shares (Some a)
+
+    choice ReferenceQueuedRedeemVault_SetPaused : ContractId ReferenceQueuedRedeemVault
+      -- ^ Pause or resume deposits and mints.
+      with
+        pause : Bool
+      controller vaultRegistrar
+      do create this with paused = pause
+
+    choice ReferenceQueuedRedeemVault_SetFactories : ContractId ReferenceQueuedRedeemVault
+      -- ^ Pin other factories, when a registry replaces its own.
+      with
+        transferFactory : ContractId V2.TransferFactory
+        underlying : Factories
+        shares : Factories
+      controller vaultRegistrar
+      do
+        -- Catches pinning another registry's factories by mistake.
+        transferView <- exercise transferFactory V2.TransferFactory_PublicFetch with actors = [vaultRegistrar]
+        require' ("transfer factory admin", transferView.admin) isEqualR ("underlying admin", underlyingInstrument.admin)
+        requireFactoriesOf vaultRegistrar underlyingInstrument.admin underlying
+        requireFactoriesOf vaultRegistrar vaultRegistrar shares
+        create this with
+          underlyingTransferFactory = transferFactory
+          underlyingFactories = underlying
+          shareFactories = shares
+
+    choice ReferenceQueuedRedeemVault_ClosePeriod : ContractId ClosedQueuedRedeemPeriod
+      -- ^ End the period; deposits, requests and fulfilments against this vault fail from here on.
+      controller vaultRegistrar
+      do create ClosedQueuedRedeemPeriod with vault = this
+
+-- | A queued-redemption vault's period that takes no more actions, so its flows are final when it is opened again.
+template ClosedQueuedRedeemPeriod
+  with
+    vault : ReferenceQueuedRedeemVault
+  where
+    signatory vault.vaultRegistrar, vault.custodian
+
+    choice ClosedQueuedRedeemPeriod_Open : ContractId ReferenceQueuedRedeemVault
+      -- ^ Open the next period, folding in the closed one's flows and measuring the pool.
+      with
+        flowCids : [ContractId PeriodFlow]
+        poolHoldingCids : [ContractId V2.Holding]
+        validUntil : Time
+      controller vault.vaultRegistrar
+      do
+        (shares, assets, now) <- rollTotals (instantOf' vault) flowCids poolHoldingCids validUntil
+        create vault with
+          totalShares = shares
+          totalAssets = assets
+          rateValidFrom = now
+          rateValidUntil = validUntil
+
+    choice ClosedQueuedRedeemPeriod_Reopen : ContractId ReferenceQueuedRedeemVault
+      -- ^ Undo the close when the next period cannot be opened, restoring the vault as it was.
+      controller vault.vaultRegistrar
+      do create vault
+
+-- | A record of one redemption request, kept for its owner and receiver.
+template QueuedRedeemEvent
+  with
+    vaultId : Text
+    vaultRegistrar : Party
+    stage : RequestStage
+    owner : Party
+    receiver : Party
+    label : Text
+    shares : Decimal
+    assets : Optional Decimal
+      -- ^ The underlying paid out, once the request is fulfilled.
+    periodStart : Time
+  where
+    signatory vaultRegistrar
+    observer owner, receiver
+
+-- | One request to fulfil, as the executors read it from its escrow.
+data RedeemRequest = RedeemRequest with
+    owner : Party
+    label : Text
+    receiver : Party
+    shares : Decimal
+    shareAllocation : ContractId V2.Allocation
+    underlyingAllocation : ContractId V2.Allocation
+  deriving (Show, Eq, Serializable)
+
+-- | The same vault as an instant one, for everything but redemptions.
+instantOf' : ReferenceQueuedRedeemVault -> ReferenceVault
+instantOf' v = ReferenceVault with
+  vaultId = v.vaultId
+  vaultRegistrar = v.vaultRegistrar
+  custodian = v.custodian
+  underlyingInstrument = v.underlyingInstrument
+  shareInstrument = v.shareInstrument
+  totalShares = v.totalShares
+  totalAssets = v.totalAssets
+  accrual = v.accrual
+  depositFeeBps = v.depositFeeBps
+  redeemFeeBps = v.redeemFeeBps
+  rateValidFrom = v.rateValidFrom
+  rateValidUntil = v.rateValidUntil
+  depositCap = v.depositCap
+  paused = v.paused
+  underlyingTransferFactory = v.underlyingTransferFactory
+
+instantOf : ReferenceQueuedRedeemVault -> Vault
+instantOf = toInterface . instantOf'
+
+settlementFor : ReferenceQueuedRedeemVault -> V2.SettlementInfo
+settlementFor v = V2.SettlementInfo with
+  executors = v.executors
+  id = requestSettlementId v.vaultId
+  cid = None
+  meta = emptyMetadata
+
+recordRequestEvent : ReferenceQueuedRedeemVault -> RequestStage -> Party -> Party -> Text -> Decimal -> Optional Decimal -> Update ()
+recordRequestEvent v stage owner receiver label shares assets = do
+  _ <- create QueuedRedeemEvent with
+    vaultId = v.vaultId
+    vaultRegistrar = v.vaultRegistrar
+    stage
+    owner
+    receiver
+    label
+    shares
+    assets
+    periodStart = v.rateValidFrom
+  pure ()

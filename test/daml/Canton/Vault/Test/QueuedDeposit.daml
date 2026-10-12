@@ -10,6 +10,7 @@ import Daml.Script
 import Canton.Vault.V1
 import Canton.Vault.AsyncDeposit.V1
 import Canton.Vault.Reference.QueuedDeposit qualified as Q
+import Canton.Vault.Reference.Queue qualified as Q
 import Canton.Vault.Reference.V1 (PeriodFlow(..), shareHoldingsKey, underlyingHoldingsKey)
 import Canton.Vault.Test.CrossAdminSettlement (Registry(..), setupTokenRegistry, tokenArgs, lockedTokens)
 
@@ -21,6 +22,7 @@ import Splice.Api.Token.TransferInstructionV2 qualified as V2
 import Splice.TokenStandard.Utils
 import Splice.Testing.Tokens.TestTokenV2 (TokenRules(..))
 import Splice.Testing.Tokens.TestTokenV2.Allocation (TokenAllocationV2)
+import Splice.Testing.Tokens.TestTokenV2.AccountConfig (AccountConfig(..), PartyConfig(..), accountConfigsContextKey)
 import Splice.Testing.Tokens.TestTokenV2.Holding (Token(..))
 
 data Env = Env with
@@ -712,3 +714,100 @@ repinToAnotherRegistrysFactoriesIsRefused = script do
     exerciseCmd env.vaultCid Q.ReferenceQueuedDepositVault_SetFactories with
       transferFactory = usdFactory; underlying = factoriesOf env.usd; shares = factoriesOf env.shares
   pure ()
+
+-- | One fulfilment settles a large queue: thirty requests in a single batch per registry.
+fulfilsALargeQueueInOneBatch : Script ()
+fulfilsALargeQueueInOneBatch = script do
+  env <- setup
+  requests <- forA [1 .. 30] $ \i -> snd <$> request env env.alice ("r" <> show i) 10.0
+  Right () <- fulfilAs env env.venue requests
+  tokens env (sharesId env) env.alice >>= (=== 300.0)
+  tokens env (usdId env) env.custodian >>= (=== 300.0)
+
+-- Accounts with a provider
+----------------------------
+
+-- | An account Alice holds with a provider who must approve every allocation from it.
+providerAccount : Registry -> Party -> Party -> Script (V2.Account, ExtraArgs, Disclosure)
+providerAccount registry owner provider = do
+  let account = V2.Account with owner = Some owner; provider = Some provider; id = "custody"
+  cfg <- submitMulti [owner, provider] [] do
+    createCmd AccountConfig with
+      admin = registry.admin; account
+      ownerConfig = PartyConfig with canInitiate = True; mustApprove = False
+      providerConfig = PartyConfig with canInitiate = True; mustApprove = True
+  cfgD <- fromSome <$> queryDisclosure registry.admin cfg
+  let args = (tokenArgs registry) with
+        context = (tokenArgs registry).context with
+          values = TextMap.insert accountConfigsContextKey (AV_List [AV_ContractId (toAnyContractId cfg)])
+            (tokenArgs registry).context.values
+  pure (account, args, cfgD)
+
+-- | Allocates from a provider account: the owner initiates, it goes pending, the provider approves.
+allocateApproved : Registry -> Party -> Party -> ExtraArgs -> Disclosure -> V2.AllocationSpecification -> V2.SettlementInfo -> [ContractId V2.Holding] -> Script (ContractId V2.Allocation)
+allocateApproved registry owner provider args cfgD spec settlement inputs = do
+  now <- getTime
+  result <- submit (actAs owner <> discloseMany [registry.disclosure, cfgD]) do
+    exerciseCmd (toInterfaceContractId registry.rulesCid : ContractId V2.AllocationFactory) V2.AllocationFactory_Allocate with
+      settlement; allocation = spec; requestedAt = now; inputHoldingCids = inputs; extraArgs = args; actors = [owner]
+  instruction <- case result.output of
+    V2.AllocationInstructionResult_Pending with allocationInstructionCid -> pure allocationInstructionCid
+    other -> abort ("expected the allocation to wait for the provider, got " <> show other)
+  approved <- submit (actAs provider <> discloseMany [registry.disclosure, cfgD]) do
+    exerciseCmd instruction V2.AllocationInstruction_Accept with actors = [provider]; extraArgs = args
+  case approved.output of
+    V2.AllocationInstructionResult_Completed with allocationCid -> pure allocationCid
+    other -> abort ("expected the allocation once approved, got " <> show other)
+
+-- | An escrow held in a provider account, approved by the provider, is fulfilled from that account.
+providerAccountEscrowIsFulfilled : Script ()
+providerAccountEscrowIsFulfilled = script do
+  env <- setup
+  bank <- allocateParty "bank"
+  (account, args, cfgD) <- providerAccount env.usd env.alice bank
+  funds <- submitMulti [env.alice, bank, env.usd.admin] [] do
+    createCmd Token with holding = V2.HoldingView with account; instrumentId = usdId env; amount = 100.0; lock = None; meta = emptyMetadata
+  now <- getTime
+  escrowed <- allocateApproved env.usd env.alice bank args cfgD (V2.AllocationSpecification with
+      admin = env.usd.admin; authorizer = account
+      transferLegSides = [V2.TransferLegSide with
+        transferLegId = requestLegId env.alice "r1" "underlying"; side = V2.SenderSide
+        otherside = basicAccount env.custodian; amount = 100.0; instrumentId = "USD"; meta = emptyMetadata]
+      settlementDeadline = Some (addRelTime now (window + hours 1)); nextIterationFunding = None
+      committed = True; meta = emptyMetadata)
+    (settlementOf env) [toInterfaceContractId funds]
+  receiving <- authorize env env.alice (settlementOf env)
+  vd <- vaultDisclosure env
+  _ <- submit (actAs [env.alice, bank] <> discloseMany [vd]) do
+    exerciseCmd (toInterfaceContractId env.vaultCid : ContractId VaultAsyncDeposit) Vault_RequestDeposit with
+      label = "r1"; assets = 100.0; receiver = env.alice; underlyingAllocation = escrowed; shareAllocation = receiving
+      actors = [env.alice, bank]; extraArgs = ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata
+  locked <- lockedTokens env.usd [escrowed]
+  Right () <- trySubmit (actAs env.venue <> discloseMany ([env.usd.disclosure, env.shares.disclosure, cfgD] <> locked)) do
+    exerciseCmd env.vaultCid Q.ReferenceQueuedDepositVault_Fulfil with
+      requests = [Q.DepositRequest with requester = env.alice; label = "r1"; receiver = env.alice; assets = 100.0
+                                        underlyingAllocation = escrowed; shareAllocation = receiving]
+      underlyingExtraArgs = args; shareExtraArgs = tokenArgs env.shares
+  tokens env (sharesId env) env.alice >>= (=== 100.0)
+  tokens env (usdId env) env.custodian >>= (=== 100.0)
+
+-- | A receiver who authorizes shares into a provider account, approved by the provider, is issued them there.
+providerAccountReceiverIsIssuedShares : Script ()
+providerAccountReceiverIsIssuedShares = script do
+  env <- setup
+  bank <- allocateParty "bank"
+  (account, args, cfgD) <- providerAccount env.shares env.alice bank
+  now <- getTime
+  receiving <- allocateApproved env.shares env.alice bank args cfgD ((shareSpec env env.alice now) with authorizer = account)
+    (settlementOf env) []
+  funded <- fund env env.alice "r1" (standardEscrow env 100.0)
+  vd <- vaultDisclosure env
+  _ <- submit (actAs env.alice <> discloseMany [vd]) (requestCmd env env.alice "r1" 100.0 funded receiving)
+  locked <- lockedTokens env.usd [funded]
+  Right () <- trySubmit (actAs env.venue <> discloseMany ([env.usd.disclosure, env.shares.disclosure, cfgD] <> locked)) do
+    exerciseCmd env.vaultCid Q.ReferenceQueuedDepositVault_Fulfil with
+      requests = [Q.DepositRequest with requester = env.alice; label = "r1"; receiver = env.alice; assets = 100.0
+                                        underlyingAllocation = funded; shareAllocation = receiving]
+      underlyingExtraArgs = tokenArgs env.usd; shareExtraArgs = args
+  held <- query @Token env.alice
+  sum [h.holding.amount | (_, h) <- held, h.holding.account == account, h.holding.instrumentId == sharesId env] === 100.0

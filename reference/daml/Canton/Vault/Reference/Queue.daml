@@ -1,0 +1,75 @@
+-- | What the queued vaults share: pinned factories, records of requests, and the vault's own allocations.
+module Canton.Vault.Reference.Queue where
+
+import DA.TextMap qualified as TextMap
+import DA.Time (RelTime, addRelTime)
+
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.HoldingV2 qualified as V2
+import Splice.Api.Token.AllocationV2 qualified as V2
+import Splice.Api.Token.AllocationInstructionV2 qualified as V2
+import Splice.TokenStandard.Utils
+
+-- | A registry's allocation and settlement factories.
+data Factories = Factories with
+    allocationFactory : ContractId V2.AllocationFactory
+    settlementFactory : ContractId V2.SettlementFactory
+  deriving (Show, Eq, Serializable)
+
+data RequestStage = Requested | Fulfilled
+  deriving (Eq, Show, Serializable)
+
+-- | Refuses an allocation that is not committed for at least the vault's window from now.
+requireCommittedFor : Text -> RelTime -> V2.AllocationSpecification -> Update ()
+requireCommittedFor what window allocation = do
+  now <- getTime
+  require (what <> " is committed") allocation.committed
+  case allocation.settlementDeadline of
+    Some deadline -> require (what <> " is committed for the vault's window") (deadline >= addRelTime now window)
+    None -> fail (what <> " needs a settlement deadline")
+
+requireFactoriesOf : Party -> Party -> Factories -> Update ()
+requireFactoriesOf actor admin factories = do
+  allocationView <- exercise factories.allocationFactory V2.AllocationFactory_PublicFetch with actors = [actor]
+  require' ("allocation factory admin", allocationView.admin) isEqualR ("registry admin", admin)
+  settlementView <- exercise factories.settlementFactory V2.SettlementFactory_PublicFetch with actors = [actor]
+  require' ("settlement factory admin", settlementView.admin) isEqualR ("registry admin", admin)
+
+legKey : V2.TransferLegSide -> (Text, V2.TransferSide, V2.Account, Decimal, Text)
+legKey leg = (leg.transferLegId, leg.side, leg.otherside, leg.amount, leg.instrumentId)
+
+finalized : ContractId V2.Allocation -> [V2.TransferLegSide] -> V2.FinalizedAllocation
+finalized allocationCid extra = V2.FinalizedAllocation with
+  allocationCid
+  extraTransferLegSides = extra
+  nextIterationFunding = None
+
+-- | Allocates the vault's side of every leg in a batch, which settles at once.
+allocateSides : Factories -> ExtraArgs -> V2.SettlementInfo -> Party -> V2.Account -> [Party] -> [ContractId V2.Holding] -> [V2.TransferLegSide] -> Update (ContractId V2.Allocation)
+allocateSides factories extraArgs settlement admin authorizer actors inputHoldingCids sides = do
+  now <- getTime
+  result <- exercise factories.allocationFactory V2.AllocationFactory_Allocate with
+    settlement
+    allocation = V2.AllocationSpecification with
+      admin
+      authorizer
+      transferLegSides = sides
+      settlementDeadline = None
+      nextIterationFunding = None
+      committed = False
+      meta = emptyMetadata
+    requestedAt = now
+    inputHoldingCids
+    extraArgs
+    actors
+  case result.output of
+    V2.AllocationInstructionResult_Completed with allocationCid -> pure allocationCid
+    _ -> fail "the vault's own allocation did not complete"
+
+getAllocations : Text -> ChoiceContext -> Update [ContractId V2.Allocation]
+getAllocations key context = case TextMap.lookup key context.values of
+  Some (AV_List cids) -> forA cids $ \v -> case v of
+    AV_ContractId cid -> pure (fromAnyContractId cid)
+    _ -> fail $ "Failed to decode an allocation id under '" <> key <> "': " <> show v
+  None -> pure []
+  v -> fail $ "Failed to decode context value for '" <> key <> "': " <> show v

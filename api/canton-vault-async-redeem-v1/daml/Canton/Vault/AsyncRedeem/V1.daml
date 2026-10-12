@@ -1,0 +1,61 @@
+-- | Queued redemptions: the holder escrows shares, and is paid the underlying
+-- when the vault's executors fulfil the request.
+module Canton.Vault.AsyncRedeem.V1 where
+
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.AllocationV2 (Allocation)
+
+import Canton.Vault.V1
+
+-- | An interface for queuing redemptions. A vault implements it alongside
+-- `Vault` when redemptions are fulfilled later rather than at once; its
+-- `Vault_Withdraw`, `Vault_Redeem`, `previewWithdraw` and `previewRedeem` then
+-- fail.
+--
+-- The holder escrows a request with two allocations made before requesting:
+-- one funded, sending the shares to the burn account, and one authorizing the
+-- receiver to be paid the underlying by the custodian. Both are committed for at
+-- least the vault's `settlementDeadlineWindow`, and carry the settlement id
+-- `requestSettlementId` and the leg ids `requestLegId`. The executors fulfil a
+-- request at any time before its deadline, at the rate when they strike it,
+-- settling both legs; how they do so is the vault's own.
+interface VaultAsyncRedeem requires Vault where
+  viewtype AsyncView
+
+  -- | Shares the party still has queued under the request id, as escrowed by
+  -- the allocations named in `extraArgs`. A vault cannot look allocations up, so
+  -- one not named does not count.
+  pendingRedeemRequest : RequestId -> Party -> ExtraArgs -> Update Decimal
+
+  vault_requestRedeemImpl : ContractId VaultAsyncRedeem -> Vault_RequestRedeem -> Update RequestId
+  vault_requestRedeemExtraObservers : Vault_RequestRedeem -> [Party]
+
+  nonconsuming choice Vault_RequestRedeem : RequestId
+    -- ^ Queue a redemption of `shares`, paying `receiver` the underlying at the
+    -- rate the executors strike when they fulfil the request.
+    --
+    -- Takes no slippage limit: the rate is not known until fulfilment.
+    with
+      label : Text
+        -- ^ The holder's label for the request, in its leg ids; unique among
+        -- their pending requests.
+      shares : Decimal
+        -- ^ Shares to redeem.
+      receiver : Party
+        -- ^ The party to be paid the underlying.
+      shareAllocation : ContractId Allocation
+        -- ^ The funded escrow, sending `shares` to the burn account. Committed
+        -- until a deadline at least the vault's window away.
+      underlyingAllocation : ContractId Allocation
+        -- ^ The receiver's authorization to be paid the underlying by the
+        -- custodian. It has no legs of its own, leaves the settlement open to
+        -- further iterations, where the executors add the payout leg, and is
+        -- committed as the escrow is.
+      actors : [Party]
+        -- ^ Parties executing the request. Checked against the party whose
+        -- shares are escrowed.
+      extraArgs : ExtraArgs
+        -- ^ Additional context required in order to exercise the choice.
+    observer vault_requestRedeemExtraObservers this arg
+    controller actors
+    do vault_requestRedeemImpl this self arg
