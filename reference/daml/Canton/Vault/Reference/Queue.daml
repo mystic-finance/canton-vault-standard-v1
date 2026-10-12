@@ -1,6 +1,7 @@
 -- | What the queued vaults share: pinned factories, allocation checks, and the vault's own allocations.
 module Canton.Vault.Reference.Queue where
 
+import DA.List (unique)
 import DA.TextMap qualified as TextMap
 import DA.Time (RelTime, addRelTime)
 
@@ -24,6 +25,23 @@ requireCommittedFor what window allocation = do
   case allocation.settlementDeadline of
     Some deadline -> require (what <> " is committed for the vault's window") (deadline >= addRelTime now window)
     None -> fail (what <> " needs a settlement deadline")
+
+-- | Fetches an allocation, refusing one its registry's admin did not sign.
+fetchSigned : Text -> Party -> ContractId V2.Allocation -> Update V2.AllocationView
+fetchSigned what admin cid = do
+  allocation <- fetch cid
+  require (what <> " is signed by its registry") (signedBy admin allocation)
+  pure (view allocation)
+
+-- | Whether the registry's admin signed the allocation, so its view can be believed.
+signedBy : Party -> V2.Allocation -> Bool
+signedBy admin allocation = admin `elem` signatory allocation
+
+-- | Refuses a batch whose requests share a label or an allocation, which would collide when settled.
+requireDistinct : [(Party, Text)] -> [ContractId V2.Allocation] -> Update ()
+requireDistinct labels allocations = do
+  require "each request in the batch has its own label" (unique labels)
+  require "each request in the batch has its own allocations" (unique allocations)
 
 requireFactoriesOf : Party -> Party -> Factories -> Update ()
 requireFactoriesOf actor admin factories = do

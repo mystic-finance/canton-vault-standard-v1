@@ -1,0 +1,59 @@
+-- | What the queued-vault tests share: refusals checked by reason, and allocations no registry issued.
+module Canton.Vault.Test.QueueSupport where
+
+import DA.Map qualified as Map
+import DA.Text qualified as T
+import DA.TextMap qualified as TextMap
+import Daml.Script
+
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.AllocationV2 qualified as V2
+
+-- | Passes only if the submission was refused, and for the given reason.
+failsWith : Text -> Either SubmitError a -> Script ()
+failsWith reason result = case result of
+  Left e | reason `T.isInfixOf` show e -> pure ()
+  Left e -> abort ("refused for another reason than '" <> reason <> "': " <> show e)
+  Right _ -> abort ("accepted, though it should be refused: " <> reason)
+
+-- | An allocation its owner wrote and signed alone, claiming whatever its view says.
+template FakeAllocation
+  with
+    owner : Party
+    claimed : V2.AllocationView
+  where
+    signatory owner
+    observer claimed.settlement.executors
+
+    interface instance V2.Allocation for FakeAllocation where
+      view = claimed
+      allocation_settleImpl _ _ = pure settledNothing
+      allocation_cancelImpl _ _ = pure settledNothing
+      allocation_withdrawImpl _ _ = pure settledNothing
+      allocation_settleExtraObservers _ = []
+      allocation_cancelExtraObservers _ = []
+      allocation_withdrawExtraObservers _ = []
+
+settledNothing : V2.AllocationResult
+settledNothing = V2.AllocationResult with
+  output = V2.AllocationResult_Settled with nextIterationAllocationCid = None
+  authorizerHoldingCids = TextMap.empty
+  meta = emptyMetadata
+
+fakeAllocation : Party -> V2.SettlementInfo -> V2.AllocationSpecification -> Script (ContractId V2.Allocation)
+fakeAllocation owner settlement allocation = do
+  now <- getTime
+  cid <- submit owner do
+    createCmd FakeAllocation with
+      owner
+      claimed = V2.AllocationView with
+        originalAllocationCid = None
+        settlement
+        allocation
+        holdingCids = []
+        createdAt = now
+        numIterations = 0
+        expiresAt = None
+        availableActions = Map.empty
+        meta = emptyMetadata
+  pure (toInterfaceContractId cid)
