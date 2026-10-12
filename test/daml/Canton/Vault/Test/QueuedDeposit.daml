@@ -1,0 +1,714 @@
+-- | Queued deposits: request, fulfilment, and what each refuses.
+module Canton.Vault.Test.QueuedDeposit where
+
+import DA.Assert ((===))
+import DA.Optional (fromSome)
+import DA.TextMap qualified as TextMap
+import DA.Time (RelTime, addRelTime, days, hours)
+import Daml.Script
+
+import Canton.Vault.V1
+import Canton.Vault.AsyncDeposit.V1
+import Canton.Vault.Reference.QueuedDeposit qualified as Q
+import Canton.Vault.Reference.V1 (PeriodFlow(..), shareHoldingsKey, underlyingHoldingsKey)
+import Canton.Vault.Test.CrossAdminSettlement (Registry(..), setupTokenRegistry, tokenArgs, lockedTokens)
+
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.HoldingV2 qualified as V2
+import Splice.Api.Token.AllocationV2 qualified as V2
+import Splice.Api.Token.AllocationInstructionV2 qualified as V2
+import Splice.Api.Token.TransferInstructionV2 qualified as V2
+import Splice.TokenStandard.Utils
+import Splice.Testing.Tokens.TestTokenV2 (TokenRules(..))
+import Splice.Testing.Tokens.TestTokenV2.Allocation (TokenAllocationV2)
+import Splice.Testing.Tokens.TestTokenV2.Holding (Token(..))
+
+data Env = Env with
+  usd : Registry
+  shares : Registry
+  registrar : Party
+  custodian : Party
+  venue : Party
+  alice : Party
+  vaultCid : ContractId Q.ReferenceQueuedDepositVault
+  vaultId : Text
+
+window : RelTime
+window = days 1
+
+factoriesOf : Registry -> Q.Factories
+factoriesOf r = Q.Factories with
+  allocationFactory = toInterfaceContractId r.rulesCid
+  settlementFactory = toInterfaceContractId r.rulesCid
+
+setup : Script Env
+setup = do
+  usd <- setupTokenRegistry "usdAdmin"
+  shares <- setupTokenRegistry "registrar"
+  let registrar = shares.admin
+  custodian <- allocateParty "custodian"
+  venue <- allocateParty "venue"
+  alice <- allocateParty "alice"
+  now <- getTime
+  let vaultId = "queued-1"
+  vaultCid <- submitMulti [registrar, custodian] [] do
+    createCmd Q.ReferenceQueuedDepositVault with
+      vaultId
+      vaultRegistrar = registrar
+      custodian
+      underlyingInstrument = V2.InstrumentId with admin = usd.admin; id = "USD"
+      shareInstrument = V2.InstrumentId with admin = registrar; id = vaultId
+      totalShares = 0.0
+      totalAssets = 0.0
+      accrual = None
+      depositFeeBps = 0
+      redeemFeeBps = 0
+      rateValidFrom = now
+      rateValidUntil = addRelTime now (hours 1)
+      executors = [venue]
+      settlementDeadlineWindow = window
+      paused = False
+      underlyingTransferFactory = toInterfaceContractId usd.rulesCid
+      underlyingFactories = factoriesOf usd
+      shareFactories = factoriesOf shares
+  pure Env with usd; shares; registrar; custodian; venue; alice; vaultCid; vaultId
+
+usdOf : Env -> Party -> Decimal -> Script (ContractId V2.Holding)
+usdOf env party amount = do
+  cid <- submitMulti [party, env.usd.admin] [] do
+    createCmd Token with
+      holding = V2.HoldingView with
+        account = basicAccount party
+        instrumentId = V2.InstrumentId with admin = env.usd.admin; id = "USD"
+        amount
+        lock = None
+        meta = emptyMetadata
+  pure (toInterfaceContractId cid)
+
+settlementOf : Env -> V2.SettlementInfo
+settlementOf env = V2.SettlementInfo with
+  executors = [env.venue]
+  id = requestSettlementId env.vaultId
+  cid = None
+  meta = emptyMetadata
+
+data Escrow = Escrow with
+  committed : Bool
+  deadline : Optional RelTime
+  amount : Decimal
+  settlement : V2.SettlementInfo
+
+standardEscrow : Env -> Decimal -> Escrow
+standardEscrow env amount = Escrow with
+  committed = True
+  deadline = Some (window + hours 1)
+  amount
+  settlement = settlementOf env
+
+allocateWith : Registry -> Party -> V2.AllocationSpecification -> V2.SettlementInfo -> [ContractId V2.Holding] -> Script (ContractId V2.Allocation)
+allocateWith registry party spec settlement inputs = do
+  now <- getTime
+  result <- submit (actAs party <> discloseMany [registry.disclosure]) do
+    exerciseCmd (toInterfaceContractId registry.rulesCid : ContractId V2.AllocationFactory)
+      V2.AllocationFactory_Allocate with
+        settlement
+        allocation = spec
+        requestedAt = now
+        inputHoldingCids = inputs
+        extraArgs = tokenArgs registry
+        actors = [party]
+  case result.output of
+    V2.AllocationInstructionResult_Completed with allocationCid -> pure allocationCid
+    other -> abort ("expected a completed allocation, got " <> show other)
+
+-- | The requester's funded escrow for one request.
+fund : Env -> Party -> Text -> Escrow -> Script (ContractId V2.Allocation)
+fund env party label escrow = do
+  now <- getTime
+  funds <- usdOf env party escrow.amount
+  allocateWith env.usd party V2.AllocationSpecification with
+      admin = env.usd.admin
+      authorizer = basicAccount party
+      transferLegSides = [V2.TransferLegSide with
+        transferLegId = requestLegId party label "underlying"
+        side = V2.SenderSide
+        otherside = basicAccount env.custodian
+        amount = escrow.amount
+        instrumentId = "USD"
+        meta = emptyMetadata]
+      settlementDeadline = fmap (addRelTime now) escrow.deadline
+      nextIterationFunding = None
+      committed = escrow.committed
+      meta = emptyMetadata
+    escrow.settlement [funds]
+
+-- | The receiver's committed authorization to be issued shares, the amount left to fulfilment.
+shareSpec : Env -> Party -> Time -> V2.AllocationSpecification
+shareSpec env party now = V2.AllocationSpecification with
+  admin = env.registrar
+  authorizer = basicAccount party
+  transferLegSides = []
+  settlementDeadline = Some (addRelTime now (window + hours 1))
+  nextIterationFunding = Some TextMap.empty
+  committed = True
+  meta = emptyMetadata
+
+authorizeWith : Env -> Party -> V2.SettlementInfo -> (V2.AllocationSpecification -> V2.AllocationSpecification) -> Script (ContractId V2.Allocation)
+authorizeWith env party settlement change = do
+  now <- getTime
+  allocateWith env.shares party (change (shareSpec env party now)) settlement []
+
+authorize : Env -> Party -> V2.SettlementInfo -> Script (ContractId V2.Allocation)
+authorize env party settlement = authorizeWith env party settlement identity
+
+vaultDisclosure : Env -> Script Disclosure
+vaultDisclosure env = fromSome <$> queryDisclosure env.registrar env.vaultCid
+
+requestCmd : Env -> Party -> Text -> Decimal -> ContractId V2.Allocation -> ContractId V2.Allocation -> Commands RequestId
+requestCmd env party label assets funded receiving =
+  exerciseCmd (toInterfaceContractId env.vaultCid : ContractId VaultAsyncDeposit) Vault_RequestDeposit with
+    label
+    assets
+    receiver = party
+    underlyingAllocation = funded
+    shareAllocation = receiving
+    actors = [party]
+    extraArgs = ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata
+
+request : Env -> Party -> Text -> Decimal -> Script (RequestId, Q.DepositRequest)
+request env party label assets = do
+  funded <- fund env party label (standardEscrow env assets)
+  receiving <- authorize env party (settlementOf env)
+  vd <- vaultDisclosure env
+  rid <- submit (actAs party <> discloseMany [vd]) (requestCmd env party label assets funded receiving)
+  pure (rid, Q.DepositRequest with
+    requester = party; label; receiver = party; assets
+    underlyingAllocation = funded; shareAllocation = receiving)
+
+fulfilCmd : Env -> [Q.DepositRequest] -> Commands ()
+fulfilCmd env requests = exerciseCmd env.vaultCid Q.ReferenceQueuedDepositVault_Fulfil with
+  requests
+  underlyingExtraArgs = tokenArgs env.usd
+  shareExtraArgs = tokenArgs env.shares
+
+fulfilAs : Env -> Party -> [Q.DepositRequest] -> Script (Either SubmitError ())
+fulfilAs env party requests = do
+  locked <- lockedTokens env.usd (map (.underlyingAllocation) requests)
+  trySubmit (actAs party <> discloseMany ([env.usd.disclosure, env.shares.disclosure] <> locked)) (fulfilCmd env requests)
+
+tokens : Env -> V2.InstrumentId -> Party -> Script Decimal
+tokens env instrument party = do
+  held <- query @Token party
+  pure (sum [h.holding.amount | (_, h) <- held, h.holding.instrumentId == instrument, h.holding.account.owner == Some party])
+
+usdId, sharesId : Env -> V2.InstrumentId
+usdId env = V2.InstrumentId with admin = env.usd.admin; id = "USD"
+sharesId env = V2.InstrumentId with admin = env.registrar; id = env.vaultId
+
+-- | Reads what is still queued, as a party able to see the escrow.
+template PendingProbe
+  with
+    caller : Party
+  where
+    signatory caller
+    choice Probe_Pending : Decimal
+      with
+        vaultCid : ContractId VaultAsyncDeposit
+        requestId : RequestId
+        party : Party
+        allocations : [ContractId V2.Allocation]
+      controller caller
+      do
+        vault <- fetch vaultCid
+        pendingDepositRequest vault requestId party ExtraArgs with
+          context = ChoiceContext with
+            values = TextMap.fromList
+              [(Q.underlyingAllocationsKey, AV_List (map (AV_ContractId . toAnyContractId) allocations))]
+          meta = emptyMetadata
+
+pending : Env -> RequestId -> Party -> [ContractId V2.Allocation] -> Script Decimal
+pending env rid party allocations = submit env.venue do
+  createAndExerciseCmd (PendingProbe with caller = env.venue) Probe_Pending with
+    vaultCid = toInterfaceContractId env.vaultCid
+    requestId = rid
+    party
+    allocations
+
+-- Requests and fulfilment
+---------------------------
+
+requestThenFulfil : Script ()
+requestThenFulfil = script do
+  env <- setup
+  (rid, req) <- request env env.alice "r1" 100.0
+  rid === 0
+  pending env rid env.alice [req.underlyingAllocation] >>= (=== 100.0)
+  result <- fulfilAs env env.venue [req]
+  case result of
+    Right () -> pure ()
+    Left e -> abort ("fulfilment failed: " <> show e)
+  tokens env (sharesId env) env.alice >>= (=== 100.0)
+  tokens env (usdId env) env.custodian >>= (=== 100.0)
+
+-- | A requester's requests share id 0, so what they have pending is all of them together.
+requestsAggregateUnderOneId : Script ()
+requestsAggregateUnderOneId = script do
+  env <- setup
+  (r1, a) <- request env env.alice "r1" 100.0
+  (r2, b) <- request env env.alice "r2" 50.0
+  r1 === r2
+  pending env 0 env.alice [a.underlyingAllocation, b.underlyingAllocation] >>= (=== 150.0)
+  pending env 1 env.alice [a.underlyingAllocation, b.underlyingAllocation] >>= (=== 0.0)
+  Right () <- fulfilAs env env.venue [a, b]
+  tokens env (sharesId env) env.alice >>= (=== 150.0)
+
+-- What a queued-deposit vault refuses
+---------------------------------------
+
+instantDepositIsRefused : Script ()
+instantDepositIsRefused = script do
+  env <- setup
+  funds <- usdOf env env.alice 100.0
+  vd <- vaultDisclosure env
+  submitMustFail (actAs env.alice <> discloseMany [vd]) do
+    exerciseCmd (toInterfaceContractId env.vaultCid : ContractId Vault) Vault_Deposit with
+      assets = 100.0
+      receiver = env.alice
+      minSharesOut = None
+      actors = [env.alice]
+      extraArgs = ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata
+
+requestRefused : Env -> Text -> Escrow -> Script ()
+requestRefused env label escrow = do
+  funded <- fund env env.alice label escrow
+  receiving <- authorize env env.alice (settlementOf env)
+  vd <- vaultDisclosure env
+  submitMustFail (actAs env.alice <> discloseMany [vd]) (requestCmd env env.alice label 100.0 funded receiving)
+
+uncommittedEscrowIsRefused : Script ()
+uncommittedEscrowIsRefused = script do
+  env <- setup
+  requestRefused env "r1" (standardEscrow env 100.0) with committed = False
+
+escrowOfAnotherAmountIsRefused : Script ()
+escrowOfAnotherAmountIsRefused = script do
+  env <- setup
+  requestRefused env "r1" (standardEscrow env 90.0)
+
+escrowForAnotherSettlementIsRefused : Script ()
+escrowForAnotherSettlementIsRefused = script do
+  env <- setup
+  requestRefused env "r1" (standardEscrow env 100.0) with
+    settlement = (settlementOf env) with id = "somewhere-else"
+
+escrowShorterThanTheWindowIsRefused : Script ()
+escrowShorterThanTheWindowIsRefused = script do
+  env <- setup
+  requestRefused env "r1" (standardEscrow env 100.0) with deadline = Some (hours 1)
+
+-- | A share authorization that fixes its own amount would pre-empt the rate.
+shareAuthorizationWithLegsIsRefused : Script ()
+shareAuthorizationWithLegsIsRefused = script do
+  env <- setup
+  funded <- fund env env.alice "r1" (standardEscrow env 100.0)
+  receiving <- authorizeWith env env.alice (settlementOf env) \spec -> spec with
+    transferLegSides = [V2.TransferLegSide with
+      transferLegId = "fixed"
+      side = V2.ReceiverSide
+      otherside = mintAccount
+      amount = 1000.0
+      instrumentId = env.vaultId
+      meta = emptyMetadata]
+  vd <- vaultDisclosure env
+  submitMustFail (actAs env.alice <> discloseMany [vd]) (requestCmd env env.alice "r1" 100.0 funded receiving)
+
+fulfilmentByAnotherPartyIsRefused : Script ()
+fulfilmentByAnotherPartyIsRefused = script do
+  env <- setup
+  (_, req) <- request env env.alice "r1" 100.0
+  Left _ <- fulfilAs env env.alice [req]
+  tokens env (sharesId env) env.alice >>= (=== 0.0)
+
+-- | Without the receiver's authorization the share batch fails and takes the underlying batch with it.
+fulfilmentIsAtomic : Script ()
+fulfilmentIsAtomic = script do
+  env <- setup
+  (_, req) <- request env env.alice "r1" 100.0
+  _ <- submit (actAs env.venue <> discloseMany [env.shares.disclosure]) do
+    exerciseCmd req.shareAllocation V2.Allocation_Cancel with actors = [env.venue]; extraArgs = tokenArgs env.shares
+  Left _ <- fulfilAs env env.venue [req]
+  tokens env (usdId env) env.custodian >>= (=== 0.0)
+  tokens env (sharesId env) env.alice >>= (=== 0.0)
+
+-- | The receiver cannot pull their authorization from under the executors before its deadline.
+shareAuthorizationCannotBeWithdrawnBeforeTheDeadline : Script ()
+shareAuthorizationCannotBeWithdrawnBeforeTheDeadline = script do
+  env <- setup
+  (_, req) <- request env env.alice "r1" 100.0
+  submitMustFail (actAs env.alice <> discloseMany [env.shares.disclosure]) do
+    exerciseCmd req.shareAllocation V2.Allocation_Withdraw with actors = [env.alice]; extraArgs = tokenArgs env.shares
+
+-- | Past the deadline, the requester recovers their escrow without the executors.
+requesterRecoversAfterTheDeadline : Script ()
+requesterRecoversAfterTheDeadline = script do
+  env <- setup
+  (_, req) <- request env env.alice "r1" 100.0
+  passTime (window + hours 2)
+  _ <- submit (actAs env.alice <> discloseMany [env.usd.disclosure]) do
+    exerciseCmd req.underlyingAllocation V2.Allocation_Withdraw with actors = [env.alice]; extraArgs = tokenArgs env.usd
+  held <- query @Token env.alice
+  sum [h.holding.amount | (_, h) <- held, h.holding.instrumentId == usdId env, h.holding.lock == None] === 100.0
+
+-- | A committed escrow cannot be withdrawn before its deadline, which is what holds it for the executors.
+escrowCannotBeWithdrawnBeforeTheDeadline : Script ()
+escrowCannotBeWithdrawnBeforeTheDeadline = script do
+  env <- setup
+  (_, req) <- request env env.alice "r1" 100.0
+  submitMustFail (actAs env.alice <> discloseMany [env.usd.disclosure]) do
+    exerciseCmd req.underlyingAllocation V2.Allocation_Withdraw with actors = [env.alice]; extraArgs = tokenArgs env.usd
+
+-- | Before the deadline, the executors cancel a request and the escrow returns to the requester.
+executorsCancelBeforeTheDeadline : Script ()
+executorsCancelBeforeTheDeadline = script do
+  env <- setup
+  (_, req) <- request env env.alice "r1" 100.0
+  locked <- lockedTokens env.usd [req.underlyingAllocation]
+  _ <- submit (actAs env.venue <> discloseMany (env.usd.disclosure :: locked)) do
+    exerciseCmd req.underlyingAllocation V2.Allocation_Cancel with actors = [env.venue]; extraArgs = tokenArgs env.usd
+  _ <- submit (actAs env.venue <> discloseMany [env.shares.disclosure]) do
+    exerciseCmd req.shareAllocation V2.Allocation_Cancel with actors = [env.venue]; extraArgs = tokenArgs env.shares
+  held <- query @Token env.alice
+  sum [h.holding.amount | (_, h) <- held, h.holding.instrumentId == usdId env, h.holding.lock == None] === 100.0
+
+escrowWithoutADeadlineIsRefused : Script ()
+escrowWithoutADeadlineIsRefused = script do
+  env <- setup
+  requestRefused env "r1" (standardEscrow env 100.0) with deadline = None
+
+iteratedEscrowIsRefused : Script ()
+iteratedEscrowIsRefused = script do
+  env <- setup
+  now <- getTime
+  funds <- usdOf env env.alice 100.0
+  funded <- allocateWith env.usd env.alice V2.AllocationSpecification with
+      admin = env.usd.admin
+      authorizer = basicAccount env.alice
+      transferLegSides = [V2.TransferLegSide with
+        transferLegId = requestLegId env.alice "r1" "underlying"
+        side = V2.SenderSide
+        otherside = basicAccount env.custodian
+        amount = 100.0
+        instrumentId = "USD"
+        meta = emptyMetadata]
+      settlementDeadline = Some (addRelTime now (window + hours 1))
+      nextIterationFunding = Some TextMap.empty
+      committed = True
+      meta = emptyMetadata
+    (settlementOf env) [funds]
+  receiving <- authorize env env.alice (settlementOf env)
+  vd <- vaultDisclosure env
+  submitMustFail (actAs env.alice <> discloseMany [vd]) (requestCmd env env.alice "r1" 100.0 funded receiving)
+
+-- | USD issued by another admin, under the same instrument name.
+escrowOfAnotherRegistryIsRefused : Script ()
+escrowOfAnotherRegistryIsRefused = script do
+  env <- setup
+  other <- setupTokenRegistry "otherUsdAdmin"
+  now <- getTime
+  cid <- submitMulti [env.alice, other.admin] [] do
+    createCmd Token with
+      holding = V2.HoldingView with
+        account = basicAccount env.alice
+        instrumentId = V2.InstrumentId with admin = other.admin; id = "USD"
+        amount = 100.0
+        lock = None
+        meta = emptyMetadata
+  funded <- allocateWith other env.alice V2.AllocationSpecification with
+      admin = other.admin
+      authorizer = basicAccount env.alice
+      transferLegSides = [V2.TransferLegSide with
+        transferLegId = requestLegId env.alice "r1" "underlying"
+        side = V2.SenderSide
+        otherside = basicAccount env.custodian
+        amount = 100.0
+        instrumentId = "USD"
+        meta = emptyMetadata]
+      settlementDeadline = Some (addRelTime now (window + hours 1))
+      nextIterationFunding = None
+      committed = True
+      meta = emptyMetadata
+    (settlementOf env) [toInterfaceContractId cid]
+  receiving <- authorize env env.alice (settlementOf env)
+  vd <- vaultDisclosure env
+  submitMustFail (actAs env.alice <> discloseMany [vd]) (requestCmd env env.alice "r1" 100.0 funded receiving)
+
+-- | The escrow is Alice's, so only Alice may request with it, not Alice and a stranger.
+requestWithAStrangerIsRefused : Script ()
+requestWithAStrangerIsRefused = script do
+  env <- setup
+  carol <- allocateParty "carol"
+  funded <- fund env env.alice "r1" (standardEscrow env 100.0)
+  receiving <- authorize env env.alice (settlementOf env)
+  vd <- vaultDisclosure env
+  submitMustFail (actAs [env.alice, carol] <> discloseMany [vd]) do
+    exerciseCmd (toInterfaceContractId env.vaultCid : ContractId VaultAsyncDeposit) Vault_RequestDeposit with
+      label = "r1"
+      assets = 100.0
+      receiver = env.alice
+      underlyingAllocation = funded
+      shareAllocation = receiving
+      actors = [env.alice, carol]
+      extraArgs = ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata
+
+shareAuthorizationRefused : Env -> ContractId V2.Allocation -> Script ()
+shareAuthorizationRefused env receiving = do
+  funded <- fund env env.alice "r1" (standardEscrow env 100.0)
+  vd <- vaultDisclosure env
+  submitMustFail (actAs env.alice <> discloseMany [vd]) (requestCmd env env.alice "r1" 100.0 funded receiving)
+
+shareAuthorizationForAnotherReceiverIsRefused : Script ()
+shareAuthorizationForAnotherReceiverIsRefused = script do
+  env <- setup
+  bob <- allocateParty "bob"
+  receiving <- authorize env bob (settlementOf env)
+  bd <- fromSome <$> queryDisclosure bob (fromInterfaceContractId receiving : ContractId TokenAllocationV2)
+  funded <- fund env env.alice "r1" (standardEscrow env 100.0)
+  vd <- vaultDisclosure env
+  submitMustFail (actAs env.alice <> discloseMany [vd, bd]) (requestCmd env env.alice "r1" 100.0 funded receiving)
+
+-- | An authorization that also locks the receiver's shares would hand them to the executors.
+shareAuthorizationThatFundsTheNextIterationIsRefused : Script ()
+shareAuthorizationThatFundsTheNextIterationIsRefused = script do
+  env <- setup
+  held <- submitMulti [env.alice, env.registrar] [] do
+    createCmd Token with
+      holding = V2.HoldingView with
+        account = basicAccount env.alice
+        instrumentId = sharesId env
+        amount = 10.0
+        lock = None
+        meta = emptyMetadata
+  now <- getTime
+  receiving <- allocateWith env.shares env.alice ((shareSpec env env.alice now) with
+      nextIterationFunding = Some (TextMap.fromList [(env.vaultId, 10.0)]))
+    (settlementOf env) [toInterfaceContractId held]
+  shareAuthorizationRefused env receiving
+
+shareAuthorizationForAnotherSettlementIsRefused : Script ()
+shareAuthorizationForAnotherSettlementIsRefused = script do
+  env <- setup
+  shareAuthorizationRefused env =<< authorize env env.alice (settlementOf env) with id = "somewhere-else"
+
+-- | An authorization with another registry, which cannot issue the vault's shares.
+shareAuthorizationOfAnotherRegistryIsRefused : Script ()
+shareAuthorizationOfAnotherRegistryIsRefused = script do
+  env <- setup
+  now <- getTime
+  receiving <- allocateWith env.usd env.alice ((shareSpec env env.alice now) with admin = env.usd.admin)
+    (settlementOf env) []
+  shareAuthorizationRefused env receiving
+
+requestAfterThePeriodEndsIsRefused : Script ()
+requestAfterThePeriodEndsIsRefused = script do
+  env <- setup
+  funded <- fund env env.alice "r1" (standardEscrow env 100.0) with deadline = Some (days 2)
+  receiving <- authorize env env.alice (settlementOf env)
+  vd <- vaultDisclosure env
+  passTime (hours 2)
+  submitMustFail (actAs env.alice <> discloseMany [vd]) (requestCmd env env.alice "r1" 100.0 funded receiving)
+
+fulfilmentAfterThePeriodEndsIsRefused : Script ()
+fulfilmentAfterThePeriodEndsIsRefused = script do
+  env <- setup
+  (_, req) <- request env env.alice "r1" 100.0
+  passTime (hours 2)
+  Left _ <- fulfilAs env env.venue [req]
+  tokens env (sharesId env) env.alice >>= (=== 0.0)
+
+-- Closing a period
+--------------------
+
+closeQueued : Env -> Script (ContractId Q.ClosedQueuedPeriod)
+closeQueued env = submit env.registrar (exerciseCmd env.vaultCid Q.ReferenceQueuedDepositVault_ClosePeriod)
+
+-- | Opens the next period from the closed one's flows and the custodian's USD.
+openQueued : Env -> ContractId Q.ClosedQueuedPeriod -> Script Env
+openQueued env closed = do
+  flows <- query @PeriodFlow env.registrar
+  pool <- query @Token env.custodian
+  now <- getTime
+  vaultCid <- submit (actAs env.registrar <> readAs env.custodian) do
+    exerciseCmd closed Q.ClosedQueuedPeriod_Open with
+      flowCids = [cid | (cid, flow) <- flows, flow.vaultId == env.vaultId]
+      poolHoldingCids = [toInterfaceContractId cid | (cid, t) <- pool, t.holding.instrumentId == usdId env
+                                                   , t.holding.account.owner == Some env.custodian]
+      validUntil = addRelTime now (hours 1)
+  pure env with vaultCid
+
+-- | Nothing lands in a closed period: neither a new request nor a fulfilment.
+closedPeriodRefusesRequestsAndFulfilment : Script ()
+closedPeriodRefusesRequestsAndFulfilment = script do
+  env <- setup
+  (_, req) <- request env env.alice "r1" 100.0
+  funded <- fund env env.alice "r2" (standardEscrow env 100.0)
+  receiving <- authorize env env.alice (settlementOf env)
+  vd <- vaultDisclosure env
+  _ <- closeQueued env
+  submitMustFail (actAs env.alice <> discloseMany [vd]) (requestCmd env env.alice "r2" 100.0 funded receiving)
+  Left _ <- fulfilAs env env.venue [req]
+  pure ()
+
+-- | The next period counts the shares fulfilled in the closed one.
+nextPeriodCountsFulfilments : Script ()
+nextPeriodCountsFulfilments = script do
+  env <- setup
+  (_, req) <- request env env.alice "r1" 100.0
+  Right () <- fulfilAs env env.venue [req]
+  closed <- closeQueued env
+  next <- openQueued env closed
+  Some vault <- queryContractId env.registrar next.vaultCid
+  vault.totalShares === 100.0
+  vault.totalAssets === 100.0
+
+-- | A close can be undone: the vault comes back as it was, taking requests and fulfilments as before.
+reopenRestoresTheQueuedVault : Script ()
+reopenRestoresTheQueuedVault = script do
+  env <- setup
+  (_, first) <- request env env.alice "r1" 100.0
+  closed <- closeQueued env
+  reopened <- submit env.registrar (exerciseCmd closed Q.ClosedQueuedPeriod_Reopen)
+  let env' = env with vaultCid = reopened
+  (_, second) <- request env' env.alice "r2" 50.0
+  Right () <- fulfilAs env' env.venue [first, second]
+  tokens env (sharesId env) env.alice >>= (=== 150.0)
+
+-- | Each request leaves a record for its requester: one when made, one when fulfilled.
+requestAndFulfilmentLeaveRecords : Script ()
+requestAndFulfilmentLeaveRecords = script do
+  env <- setup
+  (_, req) <- request env env.alice "r1" 100.0
+  made <- map snd <$> query @Q.QueuedDepositEvent env.alice
+  map (\e -> (e.stage, e.label, e.assets, e.shares)) made === [(Q.Requested, "r1", 100.0, None)]
+  Right () <- fulfilAs env env.venue [req]
+  events <- map snd <$> query @Q.QueuedDepositEvent env.alice
+  [(e.label, e.shares) | e <- events, e.stage == Q.Fulfilled] === [("r1", Some 100.0)]
+
+-- | An escrow names only the vault, so a roll between signing and requesting leaves it usable.
+escrowSurvivesARoll : Script ()
+escrowSurvivesARoll = script do
+  env <- setup
+  funded <- fund env env.alice "r1" (standardEscrow env 100.0)
+  receiving <- authorize env env.alice (settlementOf env)
+  closed <- closeQueued env
+  next <- openQueued env closed
+  vd <- vaultDisclosure next
+  _ <- submit (actAs env.alice <> discloseMany [vd]) (requestCmd next env.alice "r1" 100.0 funded receiving)
+  let req = Q.DepositRequest with
+        requester = env.alice; label = "r1"; receiver = env.alice; assets = 100.0
+        underlyingAllocation = funded; shareAllocation = receiving
+  Right () <- fulfilAs next env.venue [req]
+  tokens env (sharesId env) env.alice >>= (=== 100.0)
+
+-- | The receiver's authorization is committed too, so they cannot withdraw it under the executors.
+uncommittedShareAuthorizationIsRefused : Script ()
+uncommittedShareAuthorizationIsRefused = script do
+  env <- setup
+  shareAuthorizationRefused env =<< authorizeWith env env.alice (settlementOf env) (\spec -> spec with committed = False)
+
+shareAuthorizationShorterThanTheWindowIsRefused : Script ()
+shareAuthorizationShorterThanTheWindowIsRefused = script do
+  env <- setup
+  now <- getTime
+  shareAuthorizationRefused env =<< authorizeWith env env.alice (settlementOf env)
+    (\spec -> spec with settlementDeadline = Some (addRelTime now (hours 1)))
+
+shareAuthorizationWithoutADeadlineIsRefused : Script ()
+shareAuthorizationWithoutADeadlineIsRefused = script do
+  env <- setup
+  shareAuthorizationRefused env =<< authorizeWith env env.alice (settlementOf env) (\spec -> spec with settlementDeadline = None)
+
+-- Pausing
+-----------
+
+setPaused : Env -> Bool -> Script Env
+setPaused env flag = do
+  vaultCid <- submit env.registrar (exerciseCmd env.vaultCid Q.ReferenceQueuedDepositVault_SetPaused with pause = flag)
+  pure env with vaultCid
+
+-- | A paused vault takes no requests and fulfils none, but still redeems; resumed, it fulfils again.
+pauseStopsRequestsAndFulfilmentNotRedemption : Script ()
+pauseStopsRequestsAndFulfilmentNotRedemption = script do
+  env <- setup
+  (_, first) <- request env env.alice "r1" 100.0
+  Right () <- fulfilAs env env.venue [first]
+  (_, waiting) <- request env env.alice "r2" 50.0
+  paused <- setPaused env True
+
+  funded <- fund paused env.alice "r3" (standardEscrow paused 10.0)
+  receiving <- authorize paused env.alice (settlementOf paused)
+  vd <- vaultDisclosure paused
+  submitMustFail (actAs env.alice <> discloseMany [vd]) (requestCmd paused env.alice "r3" 10.0 funded receiving)
+  Left _ <- fulfilAs paused env.venue [waiting]
+
+  shares <- query @Token env.alice
+  pool <- query @Token env.custodian
+  let shareCids = [cid | (cid, t) <- shares, t.holding.instrumentId == sharesId env]
+      poolCids = [cid | (cid, t) <- pool, t.holding.instrumentId == usdId env]
+      ids cids = AV_List [AV_ContractId (toAnyContractId c) | c <- cids]
+      args = (tokenArgs env.usd) with
+        context = (tokenArgs env.usd).context with
+          values = TextMap.union (TextMap.fromList [(underlyingHoldingsKey, ids poolCids), (shareHoldingsKey, ids shareCids)])
+            (tokenArgs env.usd).context.values
+  poolDs <- forA poolCids $ \cid -> fromSome <$> queryDisclosure env.custodian cid
+  _ <- submit (actAs env.alice <> discloseMany ([vd, env.usd.disclosure] <> poolDs)) do
+    exerciseCmd (toInterfaceContractId paused.vaultCid : ContractId Vault) Vault_Redeem with
+      shares = 40.0; owner = env.alice; receiver = env.alice; minAssetsOut = None
+      actors = [env.alice]; extraArgs = args
+  tokens env (sharesId env) env.alice >>= (=== 60.0)
+  held <- query @Token env.alice
+  sum [h.holding.amount | (_, h) <- held, h.holding.instrumentId == usdId env, h.holding.lock == None] === 40.0
+
+  resumed <- setPaused paused False
+  Right () <- fulfilAs resumed env.venue [waiting]
+  tokens env (sharesId env) env.alice >>= (=== 110.0)
+
+-- Pinned factories
+--------------------
+
+-- | Fulfilment goes through the factories the vault pins, so re-pinning moves it.
+repinnedFactoriesCarryFulfilment : Script ()
+repinnedFactoriesCarryFulfilment = script do
+  env <- setup
+  (_, req) <- request env env.alice "r1" 100.0
+  rulesCid <- submit env.usd.admin (createCmd TokenRules with admin = env.usd.admin)
+  Some disclosure <- queryDisclosure env.usd.admin rulesCid
+  let usd' = env.usd with rulesCid; disclosure
+  vaultCid <- submit (actAs env.registrar <> discloseMany [disclosure, env.shares.disclosure]) do
+    exerciseCmd env.vaultCid Q.ReferenceQueuedDepositVault_SetFactories with
+      transferFactory = toInterfaceContractId rulesCid
+      underlying = factoriesOf usd'
+      shares = factoriesOf env.shares
+  -- The old factory is gone, so only the re-pinned one can settle.
+  submit env.usd.admin (archiveCmd env.usd.rulesCid)
+  Right () <- fulfilAs (env with usd = usd'; vaultCid) env.venue [req]
+  tokens env (sharesId env) env.alice >>= (=== 100.0)
+
+repinRefused : Env -> ContractId V2.TransferFactory -> Q.Factories -> Q.Factories -> [Disclosure] -> Script ()
+repinRefused env transferFactory underlying shares ds =
+  submitMustFail (actAs env.registrar <> discloseMany ds) do
+    exerciseCmd env.vaultCid Q.ReferenceQueuedDepositVault_SetFactories with transferFactory; underlying; shares
+
+-- | Each pinned factory must belong to its registry, which catches pinning the wrong one.
+repinToAnotherRegistrysFactoriesIsRefused : Script ()
+repinToAnotherRegistrysFactoriesIsRefused = script do
+  env <- setup
+  let ds = [env.usd.disclosure, env.shares.disclosure]
+      usdFactory = toInterfaceContractId env.usd.rulesCid
+      shareFactory = toInterfaceContractId env.shares.rulesCid
+  repinRefused env shareFactory (factoriesOf env.usd) (factoriesOf env.shares) ds
+  repinRefused env usdFactory (factoriesOf env.shares) (factoriesOf env.shares) ds
+  repinRefused env usdFactory (factoriesOf env.usd) (factoriesOf env.usd) ds
+  _ <- submit (actAs env.registrar <> discloseMany ds) do
+    exerciseCmd env.vaultCid Q.ReferenceQueuedDepositVault_SetFactories with
+      transferFactory = usdFactory; underlying = factoriesOf env.usd; shares = factoriesOf env.shares
+  pure ()

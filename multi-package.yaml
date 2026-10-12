@@ -1,4 +1,5 @@
 packages:
   - api/canton-vault-v1
+  - api/canton-vault-async-deposit-v1
   - reference
   - test

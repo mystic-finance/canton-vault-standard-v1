@@ -1,0 +1,60 @@
+-- | Queued deposits: the depositor escrows the underlying, and is issued shares
+-- when the vault's executors fulfil the request.
+module Canton.Vault.AsyncDeposit.V1 where
+
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.AllocationV2 (Allocation)
+
+import Canton.Vault.V1
+
+-- | An interface for queuing deposits. A vault implements it alongside `Vault`
+-- when deposits are fulfilled later rather than at once; its `Vault_Deposit`,
+-- `Vault_Mint`, `previewDeposit` and `previewMint` then fail.
+--
+-- The depositor escrows a request with two allocations made before requesting:
+-- one funded, sending the underlying to the custodian, and one authorizing the
+-- receiver to be issued shares from the mint account. Both are committed for at
+-- least the vault's `settlementDeadlineWindow`, and carry the settlement id
+-- `requestSettlementId` and the leg ids `requestLegId`. The executors fulfil a
+-- request at any time before its deadline, at the rate when they strike it,
+-- settling both legs; how they do so is the vault's own.
+interface VaultAsyncDeposit requires Vault where
+  viewtype AsyncView
+
+  -- | Units of the underlying the party still has queued under the request id,
+  -- as escrowed by the allocations named in `extraArgs`. A vault cannot look
+  -- allocations up, so one not named does not count.
+  pendingDepositRequest : RequestId -> Party -> ExtraArgs -> Update Decimal
+
+  vault_requestDepositImpl : ContractId VaultAsyncDeposit -> Vault_RequestDeposit -> Update RequestId
+  vault_requestDepositExtraObservers : Vault_RequestDeposit -> [Party]
+
+  nonconsuming choice Vault_RequestDeposit : RequestId
+    -- ^ Queue a deposit of `assets`, for shares issued to `receiver` at the rate
+    -- the executors strike when they fulfil the request.
+    --
+    -- Takes no slippage limit: the rate is not known until fulfilment.
+    with
+      label : Text
+        -- ^ The requester's label for the request, in its leg ids; unique among
+        -- their pending requests.
+      assets : Decimal
+        -- ^ Units of the underlying to deposit.
+      receiver : Party
+        -- ^ The party to be issued the shares.
+      underlyingAllocation : ContractId Allocation
+        -- ^ The funded escrow, sending `assets` of the underlying to the
+        -- custodian. Committed until a deadline at least the vault's window away.
+      shareAllocation : ContractId Allocation
+        -- ^ The receiver's authorization to be issued shares from the mint
+        -- account. It has no legs of its own, leaves the settlement open to
+        -- further iterations, where the executors add the share legs, and is
+        -- committed as the escrow is.
+      actors : [Party]
+        -- ^ Parties executing the request. Checked against the party whose
+        -- underlying is escrowed.
+      extraArgs : ExtraArgs
+        -- ^ Additional context required in order to exercise the choice.
+    observer vault_requestDepositExtraObservers this arg
+    controller actors
+    do vault_requestDepositImpl this self arg
