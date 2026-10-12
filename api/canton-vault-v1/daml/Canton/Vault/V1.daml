@@ -37,9 +37,10 @@ data ComputedRate = ComputedRate with
       -- off-ledger readers accrue `VaultView.totalAssets` forwards using it.
       -- When absent, the rate moves only when a transaction touches the vault.
     depositFeeBps : Int
-      -- ^ Fee charged on deposits, in basis points.
+      -- ^ The fee on deposits and mints, in basis points of the assets paid in.
     redeemFeeBps : Int
-      -- ^ Fee charged on redemptions, in basis points.
+      -- ^ The fee on redemptions and withdrawals, in basis points of what the
+      -- shares are worth. Both paths out pay the same fee.
   deriving (Show, Eq, Serializable)
 
 -- | Everything a wallet needs to quote a vault and decide whether to transact.
@@ -56,7 +57,9 @@ data VaultView = VaultView with
       -- ^ Admin of the share instrument, and the party that operates the vault.
     custodian : Party
       -- ^ The party holding the pooled underlying. A contract cannot own
-      -- holdings, so a vault names a party for them.
+      -- holdings, so a vault names a party for them. Every unlocked holding of
+      -- the underlying it owns counts as the vault's pool, so no two vaults
+      -- share a custodian.
     underlyingInstrument : InstrumentId
       -- ^ The instrument the vault accepts. There is exactly one per vault.
     shareInstrument : InstrumentId

@@ -2,6 +2,7 @@
 module Canton.Vault.Test.Rounding where
 
 import DA.Assert ((===), assertMsg)
+import DA.Action (when)
 import DA.Foldable (forA_)
 import Daml.Script
 
@@ -72,5 +73,8 @@ feesFavourTheVault = script do
     forA_ [1.0, 0.1234567891, 99999.9999999999] $ \amount -> do
       assertMsg "deducting a fee never increases the amount"
         (deductFeeBps bps amount <= amount)
-      assertMsg "adding a fee never decreases the amount"
-        (addFeeBps bps amount >= amount)
+      when (bps < 10000) do
+        let gross = grossUpFeeBps bps amount
+        assertMsg "grossing up never decreases the amount" (gross >= amount)
+        assertMsg "the grossed-up amount nets at least the amount" (deductFeeBps bps gross >= amount)
+        assertMsg "one unit less nets less" (deductFeeBps bps (gross - ulp) < amount)

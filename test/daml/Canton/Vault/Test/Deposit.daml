@@ -41,7 +41,10 @@ setupVaultWith : Int -> Optional Accrual -> Script Fixture
 setupVaultWith feeBps vaultAccrual = setupVaultFull feeBps vaultAccrual None
 
 setupVaultFull : Int -> Optional Accrual -> Optional Decimal -> Script Fixture
-setupVaultFull feeBps vaultAccrual cap = do
+setupVaultFull feeBps = setupVaultFees feeBps feeBps
+
+setupVaultFees : Int -> Int -> Optional Accrual -> Optional Decimal -> Script Fixture
+setupVaultFees depositFeeBps redeemFeeBps vaultAccrual cap = do
   registrar <- allocateParty "registrar"
   custodian <- allocateParty "custodian"
   underlyingAdmin <- allocateParty "underlyingAdmin"
@@ -64,8 +67,8 @@ setupVaultFull feeBps vaultAccrual cap = do
       totalShares = 0.0
       totalAssets = 0.0
       accrual = vaultAccrual
-      depositFeeBps = feeBps
-      redeemFeeBps = feeBps
+      depositFeeBps
+      redeemFeeBps
       rateValidFrom = now
       rateValidUntil = addRelTime now (hours 1)
       depositCap = cap
