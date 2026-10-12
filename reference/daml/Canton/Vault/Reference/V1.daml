@@ -92,6 +92,14 @@ template ClosedPeriod
       controller vault.vaultRegistrar
       do create vault
 
+-- | A full fee leaves nothing to mint, as it leaves nothing to deposit.
+requireMintable : ReferenceVault -> Update ()
+requireMintable v = require "the deposit fee leaves something to mint" (v.depositFeeBps < 10000)
+
+-- | A full fee leaves nothing to withdraw, as it leaves nothing to redeem.
+requireWithdrawable : ReferenceVault -> Update ()
+requireWithdrawable v = require "the redemption fee leaves something to withdraw" (v.redeemFeeBps < 10000)
+
 template ReferenceVault
   with
     vaultId : Text
@@ -154,18 +162,18 @@ template ReferenceVault
 
       -- The most shares whose cost, fee included, fits under the cap.
       maxMint _party _extraArgs = case depositCap of
-        _ | paused -> pure 0.0
+        _ | paused || depositFeeBps >= 10000 -> pure 0.0
         None -> pure uncapped
         Some cap -> do
           assets' <- currentAssets this
-          let cost shares = addFeeBps depositFeeBps (sharesToAssetsUp totalShares assets' shares)
+          let cost shares = grossUpFeeBps depositFeeBps (sharesToAssetsUp totalShares assets' shares)
           pure (fitDown (\s -> cost s <= cap) (assetsToShares totalShares assets' (deductFeeBps depositFeeBps cap)))
 
       -- The most assets whose shares, fee included, the party holds.
       maxWithdraw party extraArgs = do
         assets' <- currentAssets this
         held <- heldShares this extraArgs party
-        let burned assets = assetsToSharesUp totalShares assets' (addFeeBps redeemFeeBps assets)
+        let burned assets = assetsToSharesUp totalShares assets' (grossUpFeeBps redeemFeeBps assets)
         pure (fitDown (\a -> burned a <= held) (deductFeeBps redeemFeeBps (sharesToAssets totalShares assets' held)))
 
       maxRedeem party extraArgs = heldShares this extraArgs party
@@ -175,12 +183,14 @@ template ReferenceVault
         pure (assetsToShares totalShares assets' (deductFeeBps depositFeeBps assets))
 
       previewMint shares = do
+        requireMintable this
         assets' <- currentAssets this
-        pure (addFeeBps depositFeeBps (sharesToAssetsUp totalShares assets' shares))
+        pure (grossUpFeeBps depositFeeBps (sharesToAssetsUp totalShares assets' shares))
 
       previewWithdraw assets = do
+        requireWithdrawable this
         assets' <- currentAssets this
-        pure (assetsToSharesUp totalShares assets' (addFeeBps redeemFeeBps assets))
+        pure (assetsToSharesUp totalShares assets' (grossUpFeeBps redeemFeeBps assets))
 
       previewRedeem shares = do
         assets' <- currentAssets this
@@ -220,8 +230,9 @@ template ReferenceVault
         requirePeriodOpen this
         require "vault is not paused" (not paused)
         require "mint is positive" (arg.shares > 0.0)
+        requireMintable this
         assets' <- currentAssets this
-        let assets = addFeeBps depositFeeBps (sharesToAssetsUp totalShares assets' arg.shares)
+        let assets = grossUpFeeBps depositFeeBps (sharesToAssetsUp totalShares assets' arg.shares)
         require "mint within cap" (assets <= fromOptional uncapped depositCap)
         checkMaxAssetsIn arg.maxAssetsIn assets
         pullUnderlying this arg.extraArgs sender assets
@@ -239,8 +250,9 @@ template ReferenceVault
         checkActors arg.actors [[arg.owner]]
         requirePeriodOpen this
         require "withdrawal is positive" (arg.assets > 0.0)
+        requireWithdrawable this
         assets' <- currentAssets this
-        let shares = assetsToSharesUp totalShares assets' (addFeeBps redeemFeeBps arg.assets)
+        let shares = assetsToSharesUp totalShares assets' (grossUpFeeBps redeemFeeBps arg.assets)
         checkMaxSharesIn arg.maxSharesIn shares
         burnFrom this arg.extraArgs arg.owner shares
         holdingCids <- pushUnderlying this arg.extraArgs arg.actors arg.receiver arg.assets
