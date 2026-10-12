@@ -134,13 +134,21 @@ template ReferenceQueuedRedeemVault
           (receiving.allocation.nextIterationFunding == Some TextMap.empty)
         requireCommittedFor "receipt authorization" settlementDeadlineWindow receiving.allocation
 
-        recordRequestEvent this Requested (regularAccountOwner owner) arg.receiver arg.label arg.shares None
+        _ <- create QueuedRedeemRequest with
+          vaultId; vaultRegistrar; executors
+          owner = regularAccountOwner owner
+          receiver = arg.receiver
+          label = arg.label
+          shares = arg.shares
+          shareAllocation = arg.shareAllocation
+          underlyingAllocation = arg.underlyingAllocation
         pure 0
 
     nonconsuming choice ReferenceQueuedRedeemVault_Fulfil : ()
       -- ^ Fulfil requests at the current rate, in one transaction.
       with
-        requests : [RedeemRequest]
+        requestCids : [ContractId QueuedRedeemRequest]
+          -- ^ The requests to fulfil, each binding its escrow to its receiver's authorization.
         poolHoldingCids : [ContractId V2.Holding]
           -- ^ The custodian's holdings to pay from; only those the payout needs are used.
         underlyingExtraArgs : ExtraArgs
@@ -150,7 +158,12 @@ template ReferenceQueuedRedeemVault
       controller executors
       do
         requirePeriodOpen (instantOf' this)
-        require "fulfils at least one request" (requests /= [])
+        require "fulfils at least one request" (requestCids /= [])
+        requests <- forA requestCids $ \cid -> do
+          request <- fetch cid
+          require' ("request.vaultId", request.vaultId) isEqualR ("vaultId", vaultId)
+          archive cid
+          pure request
         assets' <- currentAssets (instantOf' this)
         -- Each leg uses the account its allocation names, which may have a provider.
         accounts <- forA requests $ \r -> do
@@ -200,7 +213,7 @@ template ReferenceQueuedRedeemVault
 
         recordFlow (instantOf' this) (negate payout) (negate (sum (map (.shares) requests)))
         forA_ priced $ \(r, _, _, a) ->
-          recordRequestEvent this Fulfilled r.owner r.receiver r.label r.shares (Some a)
+          recordFulfilment this r.owner r.receiver r.label r.shares a
 
     choice ReferenceQueuedRedeemVault_SetPaused : ContractId ReferenceQueuedRedeemVault
       -- ^ Pause or resume deposits and mints.
@@ -259,32 +272,46 @@ template ClosedQueuedRedeemPeriod
       controller vault.vaultRegistrar
       do create vault
 
--- | A record of one redemption request, kept for its owner and receiver.
+-- | A queued redemption, binding its escrow to its receiver's authorization until it is fulfilled.
+template QueuedRedeemRequest
+  with
+    vaultId : Text
+    vaultRegistrar : Party
+    executors : [Party]
+    owner : Party
+    receiver : Party
+    label : Text
+    shares : Decimal
+    shareAllocation : ContractId V2.Allocation
+      -- ^ The owner's escrowed shares.
+    underlyingAllocation : ContractId V2.Allocation
+      -- ^ The receiver's authorization to be paid.
+  where
+    signatory vaultRegistrar
+    observer owner, receiver, executors
+
+    choice QueuedRedeemRequest_Archive : ()
+      -- ^ Drop a request whose escrow was cancelled or withdrawn, or that the owner gives up.
+      with
+        actor : Party
+      controller actor
+      do require' ("actor", actor) isMemberR ("executors and owner", owner :: executors)
+
+-- | A record of one fulfilled redemption, kept for its owner and receiver.
 template QueuedRedeemEvent
   with
     vaultId : Text
     vaultRegistrar : Party
-    stage : RequestStage
     owner : Party
     receiver : Party
     label : Text
     shares : Decimal
-    assets : Optional Decimal
-      -- ^ The underlying paid out, once the request is fulfilled.
+    assets : Decimal
+      -- ^ The underlying paid out.
     periodStart : Time
   where
     signatory vaultRegistrar
     observer owner, receiver
-
--- | One request to fulfil, as the executors read it from its escrow.
-data RedeemRequest = RedeemRequest with
-    owner : Party
-    label : Text
-    receiver : Party
-    shares : Decimal
-    shareAllocation : ContractId V2.Allocation
-    underlyingAllocation : ContractId V2.Allocation
-  deriving (Show, Eq, Serializable)
 
 -- | The same vault as an instant one, for everything but redemptions.
 instantOf' : ReferenceQueuedRedeemVault -> ReferenceVault
@@ -315,12 +342,11 @@ settlementFor v = V2.SettlementInfo with
   cid = None
   meta = emptyMetadata
 
-recordRequestEvent : ReferenceQueuedRedeemVault -> RequestStage -> Party -> Party -> Text -> Decimal -> Optional Decimal -> Update ()
-recordRequestEvent v stage owner receiver label shares assets = do
+recordFulfilment : ReferenceQueuedRedeemVault -> Party -> Party -> Text -> Decimal -> Decimal -> Update ()
+recordFulfilment v owner receiver label shares assets = do
   _ <- create QueuedRedeemEvent with
     vaultId = v.vaultId
     vaultRegistrar = v.vaultRegistrar
-    stage
     owner
     receiver
     label

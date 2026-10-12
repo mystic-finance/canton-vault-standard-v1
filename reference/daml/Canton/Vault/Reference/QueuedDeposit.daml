@@ -133,13 +133,21 @@ template ReferenceQueuedDepositVault
           (receiving.allocation.nextIterationFunding == Some TextMap.empty)
         requireCommittedFor "share authorization" settlementDeadlineWindow receiving.allocation
 
-        recordRequestEvent this Requested (regularAccountOwner requester) arg.receiver arg.label arg.assets None
+        _ <- create QueuedDepositRequest with
+          vaultId; vaultRegistrar; executors
+          requester = regularAccountOwner requester
+          receiver = arg.receiver
+          label = arg.label
+          assets = arg.assets
+          underlyingAllocation = arg.underlyingAllocation
+          shareAllocation = arg.shareAllocation
         pure 0
 
     nonconsuming choice ReferenceQueuedDepositVault_Fulfil : ()
       -- ^ Fulfil requests at the current rate, in one transaction.
       with
-        requests : [DepositRequest]
+        requestCids : [ContractId QueuedDepositRequest]
+          -- ^ The requests to fulfil, each binding its escrow to its receiver's authorization.
         underlyingExtraArgs : ExtraArgs
           -- ^ The underlying registry's context for allocating and settling.
         shareExtraArgs : ExtraArgs
@@ -148,7 +156,12 @@ template ReferenceQueuedDepositVault
       do
         requirePeriodOpen (instantOf' this)
         require "vault is not paused" (not paused)
-        require "fulfils at least one request" (requests /= [])
+        require "fulfils at least one request" (requestCids /= [])
+        requests <- forA requestCids $ \cid -> do
+          request <- fetch cid
+          require' ("request.vaultId", request.vaultId) isEqualR ("vaultId", vaultId)
+          archive cid
+          pure request
         assets' <- currentAssets (instantOf' this)
         -- Each leg uses the account its allocation names, which may have a provider.
         accounts <- forA requests $ \r -> do
@@ -196,7 +209,7 @@ template ReferenceQueuedDepositVault
 
         recordFlow (instantOf' this) (sum (map (.assets) requests)) (sum [s | (_, _, _, s) <- priced])
         forA_ priced $ \(r, _, _, s) ->
-          recordRequestEvent this Fulfilled r.requester r.receiver r.label r.assets (Some s)
+          recordFulfilment this r.requester r.receiver r.label r.assets s
 
     choice ReferenceQueuedDepositVault_SetPaused : ContractId ReferenceQueuedDepositVault
       -- ^ Pause or resume requests and fulfilments.
@@ -255,32 +268,46 @@ template ClosedQueuedPeriod
       controller vault.vaultRegistrar
       do create vault
 
--- | A record of one deposit request, kept for its requester and receiver.
+-- | A queued deposit, binding its escrow to its receiver's authorization until it is fulfilled.
+template QueuedDepositRequest
+  with
+    vaultId : Text
+    vaultRegistrar : Party
+    executors : [Party]
+    requester : Party
+    receiver : Party
+    label : Text
+    assets : Decimal
+    underlyingAllocation : ContractId V2.Allocation
+      -- ^ The requester's funded escrow.
+    shareAllocation : ContractId V2.Allocation
+      -- ^ The receiver's authorization to be issued shares.
+  where
+    signatory vaultRegistrar
+    observer requester, receiver, executors
+
+    choice QueuedDepositRequest_Archive : ()
+      -- ^ Drop a request whose escrow was cancelled or withdrawn, or that the requester gives up.
+      with
+        actor : Party
+      controller actor
+      do require' ("actor", actor) isMemberR ("executors and requester", requester :: executors)
+
+-- | A record of one fulfilled deposit, kept for its requester and receiver.
 template QueuedDepositEvent
   with
     vaultId : Text
     vaultRegistrar : Party
-    stage : RequestStage
     requester : Party
     receiver : Party
     label : Text
     assets : Decimal
-    shares : Optional Decimal
-      -- ^ The shares issued, once the request is fulfilled.
+    shares : Decimal
+      -- ^ The shares issued.
     periodStart : Time
   where
     signatory vaultRegistrar
     observer requester, receiver
-
--- | One request to fulfil, as the executors read it from its escrow.
-data DepositRequest = DepositRequest with
-    requester : Party
-    label : Text
-    receiver : Party
-    assets : Decimal
-    underlyingAllocation : ContractId V2.Allocation
-    shareAllocation : ContractId V2.Allocation
-  deriving (Show, Eq, Serializable)
 
 -- | The same vault as an instant one, for everything but deposits.
 instantOf' : ReferenceQueuedDepositVault -> ReferenceVault
@@ -311,12 +338,11 @@ settlementFor v = V2.SettlementInfo with
   cid = None
   meta = emptyMetadata
 
-recordRequestEvent : ReferenceQueuedDepositVault -> RequestStage -> Party -> Party -> Text -> Decimal -> Optional Decimal -> Update ()
-recordRequestEvent v stage requester receiver label assets shares = do
+recordFulfilment : ReferenceQueuedDepositVault -> Party -> Party -> Text -> Decimal -> Decimal -> Update ()
+recordFulfilment v requester receiver label assets shares = do
   _ <- create QueuedDepositEvent with
     vaultId = v.vaultId
     vaultRegistrar = v.vaultRegistrar
-    stage
     requester
     receiver
     label

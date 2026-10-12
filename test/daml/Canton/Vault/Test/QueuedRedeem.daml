@@ -200,31 +200,42 @@ requestCmdAs env actors label shares escrowed receiving =
     actors
     extraArgs = ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata
 
-redeemRequest : Env -> Party -> Text -> Decimal -> ContractId V2.Allocation -> ContractId V2.Allocation -> R.RedeemRequest
-redeemRequest _env party label shares escrowed receiving = R.RedeemRequest with
-  owner = party; label; receiver = party; shares; shareAllocation = escrowed; underlyingAllocation = receiving
+-- | A request the vault recorded, with the allocations it binds.
+data Req = Req with
+  requestCid : ContractId R.QueuedRedeemRequest
+  shareAllocation : ContractId V2.Allocation
+  underlyingAllocation : ContractId V2.Allocation
 
-request : Env -> Party -> Text -> Decimal -> Script (RequestId, R.RedeemRequest)
+-- | The request the party made under the label, as the vault recorded it.
+requestOf : Env -> Party -> Text -> Script Req
+requestOf env party label = do
+  held <- query @R.QueuedRedeemRequest party
+  case [(cid, r) | (cid, r) <- held, r.vaultId == env.vaultId, r.label == label] of
+    (cid, r) :: _ -> pure Req with requestCid = cid; shareAllocation = r.shareAllocation; underlyingAllocation = r.underlyingAllocation
+    [] -> abort ("no request recorded under " <> label)
+
+request : Env -> Party -> Text -> Decimal -> Script (RequestId, Req)
 request env party label shares = do
   escrowed <- escrow env party label shares
   receiving <- receipt env party
   vd <- vaultDisclosure env
   rid <- submit (actAs party <> discloseMany [vd]) (requestCmd env party label shares escrowed receiving)
-  pure (rid, redeemRequest env party label shares escrowed receiving)
+  req <- requestOf env party label
+  pure (rid, req)
 
 -- | The executors fulfil the requests, naming the custodian's pool in the order given.
-fulfilWith : Env -> Party -> [ContractId Token] -> [R.RedeemRequest] -> Script (Either SubmitError ())
+fulfilWith : Env -> Party -> [ContractId Token] -> [Req] -> Script (Either SubmitError ())
 fulfilWith env party pool requests = do
   locked <- lockedTokens env.shares (map (.shareAllocation) requests)
   poolDs <- forA pool $ \cid -> fromSome <$> queryDisclosure env.custodian cid
   trySubmit (actAs party <> discloseMany ([env.usd.disclosure, env.shares.disclosure] <> locked <> poolDs)) do
     exerciseCmd env.vaultCid R.ReferenceQueuedRedeemVault_Fulfil with
-      requests
+      requestCids = map (.requestCid) requests
       poolHoldingCids = map toInterfaceContractId pool
       underlyingExtraArgs = tokenArgs env.usd
       shareExtraArgs = tokenArgs env.shares
 
-fulfilAs : Env -> Party -> [R.RedeemRequest] -> Script (Either SubmitError ())
+fulfilAs : Env -> Party -> [Req] -> Script (Either SubmitError ())
 fulfilAs env party requests = do
   pool <- map fst <$> heldBy env (usdId env) env.custodian
   fulfilWith env party pool requests
@@ -311,16 +322,17 @@ requestsAggregateUnderOneId = script do
   Right () <- fulfilAs env env.venue [a, b]
   unlocked env (usdId env) env.alice >>= (=== 50.0)
 
--- | Each request leaves a record for its owner: one when made, one when fulfilled with the payout.
+-- | A request is recorded for its owner while pending, and its fulfilment once fulfilled.
 requestAndFulfilmentLeaveRecords : Script ()
 requestAndFulfilmentLeaveRecords = script do
   env <- setup
   (_, req) <- request env env.alice "r1" 40.0
-  made <- map snd <$> query @R.QueuedRedeemEvent env.alice
-  map (\e -> (e.stage, e.label, e.shares, e.assets)) made === [(R.Requested, "r1", 40.0, None)]
+  pendingNow <- map snd <$> query @R.QueuedRedeemRequest env.alice
+  map (\r -> (r.label, r.shares, r.receiver)) pendingNow === [("r1", 40.0, env.alice)]
   Right () <- fulfilAs env env.venue [req]
+  query @R.QueuedRedeemRequest env.alice >>= (=== []) . map snd
   events <- map snd <$> query @R.QueuedRedeemEvent env.alice
-  [(e.label, e.assets) | e <- events, e.stage == R.Fulfilled] === [("r1", Some 40.0)]
+  map (\e -> (e.label, e.shares, e.assets)) events === [("r1", 40.0, 40.0)]
 
 -- | The payout is priced when struck: yield folded in after the request raises it.
 payoutIsPricedWhenStruck : Script ()
@@ -365,7 +377,8 @@ escrowSurvivesARoll = script do
   next <- openQueued env closed
   vd <- vaultDisclosure next
   _ <- submit (actAs env.alice <> discloseMany [vd]) (requestCmd next env.alice "r1" 40.0 escrowed receiving)
-  Right () <- fulfilAs next env.venue [redeemRequest env env.alice "r1" 40.0 escrowed receiving]
+  req <- requestOf next env.alice "r1"
+  Right () <- fulfilAs next env.venue [req]
   unlocked env (usdId env) env.alice >>= (=== 40.0)
 
 -- What a queued-redemption vault refuses
@@ -780,12 +793,13 @@ providerAccountReceiverIsPaid = script do
   escrowed <- escrow env env.alice "r1" 40.0
   vd <- vaultDisclosure env
   _ <- submit (actAs env.alice <> discloseMany [vd]) (requestCmd env env.alice "r1" 40.0 escrowed receiving)
+  req <- requestOf env env.alice "r1"
   locked <- lockedTokens env.shares [escrowed]
   pool <- map fst <$> heldBy env (usdId env) env.custodian
   poolDs <- forA pool $ \cid -> fromSome <$> queryDisclosure env.custodian cid
   Right () <- trySubmit (actAs env.venue <> discloseMany ([env.usd.disclosure, env.shares.disclosure, cfgD] <> locked <> poolDs)) do
     exerciseCmd env.vaultCid R.ReferenceQueuedRedeemVault_Fulfil with
-      requests = [redeemRequest env env.alice "r1" 40.0 escrowed receiving]
+      requestCids = [req.requestCid]
       poolHoldingCids = map toInterfaceContractId pool
       underlyingExtraArgs = args; shareExtraArgs = tokenArgs env.shares
   held <- query @Token env.alice
@@ -805,14 +819,70 @@ providerAccountSharesAreRedeemed = script do
   receiving <- receipt env env.alice
   vd <- vaultDisclosure env
   _ <- submit (actAs [env.alice, bank] <> discloseMany [vd]) (requestCmdAs env [env.alice, bank] "r1" 40.0 escrowed receiving)
+  req <- requestOf env env.alice "r1"
   locked <- lockedTokens env.shares [escrowed]
   pool <- map fst <$> heldBy env (usdId env) env.custodian
   poolDs <- forA pool $ \cid -> fromSome <$> queryDisclosure env.custodian cid
   Right () <- trySubmit (actAs env.venue <> discloseMany ([env.usd.disclosure, env.shares.disclosure, cfgD] <> locked <> poolDs)) do
     exerciseCmd env.vaultCid R.ReferenceQueuedRedeemVault_Fulfil with
-      requests = [redeemRequest env env.alice "r1" 40.0 escrowed receiving]
+      requestCids = [req.requestCid]
       poolHoldingCids = map toInterfaceContractId pool
       underlyingExtraArgs = tokenArgs env.usd; shareExtraArgs = args
   unlocked env (usdId env) env.alice >>= (=== 40.0)
   left <- query @Token env.alice
   sum [h.holding.amount | (_, h) <- left, h.holding.account == account] === 0.0
+
+-- Request records
+-------------------
+
+-- | Only the registrar records a request, so no executor can pair one holder's escrow with another's receipt.
+executorCannotForgeARequest : Script ()
+executorCannotForgeARequest = script do
+  env <- setup
+  (_, req) <- request env env.alice "r1" 40.0
+  bob <- allocateParty "bob"
+  bobs <- receipt env bob
+  submitMustFail env.venue do
+    createCmd R.QueuedRedeemRequest with
+      vaultId = env.vaultId; vaultRegistrar = env.registrar; executors = [env.venue]
+      owner = env.alice; receiver = bob; label = "r1"; shares = 40.0
+      shareAllocation = req.shareAllocation; underlyingAllocation = bobs
+
+-- | A copy of the vault under another id, sharing the pool, with Alice holding 100 of its shares.
+anotherVault : Env -> Text -> Script Env
+anotherVault env vaultId = do
+  Some vault <- queryContractId env.registrar env.vaultCid
+  vaultCid <- submitMulti [env.registrar, env.custodian] [] do
+    createCmd vault with vaultId; shareInstrument = vault.shareInstrument with id = vaultId
+  let other = env with vaultCid; vaultId
+  _ <- holdingOf env.alice env.registrar (sharesId other) 100.0
+  pure other
+
+-- | Executors shared between vaults cannot fulfil one vault's request through another.
+requestOfAnotherVaultIsRefused : Script ()
+requestOfAnotherVaultIsRefused = script do
+  env <- setup
+  other <- anotherVault env "queued-redeem-2"
+  (_, req) <- request other env.alice "r1" 40.0
+  Left _ <- fulfilAs env env.venue [req]
+  Right () <- fulfilAs other env.venue [req]
+  unlocked env (usdId env) env.alice >>= (=== 40.0)
+
+ownerAndExecutorsArchiveRequests : Script ()
+ownerAndExecutorsArchiveRequests = script do
+  env <- setup
+  (_, r1) <- request env env.alice "r1" 40.0
+  (_, r2) <- request env env.alice "r2" 20.0
+  submit env.alice (exerciseCmd r1.requestCid R.QueuedRedeemRequest_Archive with actor = env.alice)
+  submit env.venue (exerciseCmd r2.requestCid R.QueuedRedeemRequest_Archive with actor = env.venue)
+  query @R.QueuedRedeemRequest env.alice >>= (=== []) . map snd
+
+-- | A party shown a request cannot drop it.
+strangerCannotArchiveARequest : Script ()
+strangerCannotArchiveARequest = script do
+  env <- setup
+  (_, req) <- request env env.alice "r1" 40.0
+  carol <- allocateParty "carol"
+  rd <- fromSome <$> queryDisclosure env.registrar req.requestCid
+  submitMustFail (actAs carol <> discloseMany [rd]) do
+    exerciseCmd req.requestCid R.QueuedRedeemRequest_Archive with actor = carol

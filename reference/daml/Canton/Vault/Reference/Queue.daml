@@ -1,4 +1,4 @@
--- | What the queued vaults share: pinned factories, records of requests, and the vault's own allocations.
+-- | What the queued vaults share: pinned factories, allocation checks, and the vault's own allocations.
 module Canton.Vault.Reference.Queue where
 
 import DA.TextMap qualified as TextMap
@@ -15,9 +15,6 @@ data Factories = Factories with
     allocationFactory : ContractId V2.AllocationFactory
     settlementFactory : ContractId V2.SettlementFactory
   deriving (Show, Eq, Serializable)
-
-data RequestStage = Requested | Fulfilled
-  deriving (Eq, Show, Serializable)
 
 -- | Refuses an allocation that is not committed for at least the vault's window from now.
 requireCommittedFor : Text -> RelTime -> V2.AllocationSpecification -> Update ()
