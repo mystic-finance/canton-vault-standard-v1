@@ -161,7 +161,6 @@ template ReferenceQueuedRedeemVault
         require "fulfils at least one request" (requestCids /= [])
         requests <- forA requestCids $ \cid -> do
           request <- fetch cid
-          require' ("request.vaultId", request.vaultId) isEqualR ("vaultId", vaultId)
           archive cid
           pure request
         assets' <- currentAssets (instantOf' this)

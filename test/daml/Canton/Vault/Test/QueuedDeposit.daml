@@ -848,7 +848,7 @@ anotherVault env vaultId = do
     createCmd vault with vaultId; shareInstrument = vault.shareInstrument with id = vaultId
   pure env with vaultCid; vaultId
 
--- | Executors shared between vaults cannot fulfil one vault's request through another.
+-- | Executors shared between vaults cannot fulfil one vault's request through another, as each vault settles under its own id.
 requestOfAnotherVaultIsRefused : Script ()
 requestOfAnotherVaultIsRefused = script do
   env <- setup
