@@ -203,3 +203,17 @@ repinToAnotherAdminsFactoryIsRefused = script do
   submitMustFail (actAs f.registrar <> discloseMany [otherD]) do
     exerciseCmd f.vaultTemplateCid ReferenceVault_SetTransferFactory with
       factory = toInterfaceContractId other
+
+-- | A close can be undone: the vault comes back as it was, and its flows still count at the next roll.
+reopenRestoresTheVault : Script ()
+reopenRestoresTheVault = script do
+  f <- setupVault
+  bob <- allocateParty "bob"
+  first <- deposit f f.vaultTemplateCid f.alice 100.0
+  closed <- closePeriod f f.vaultTemplateCid
+  reopened <- submit f.registrar do
+    exerciseCmd closed ClosedPeriod_Reopen
+  second <- deposit f reopened bob 100.0
+  rolled <- rollPeriod f reopened
+  Some vault <- queryContractId f.registrar rolled
+  vault.totalShares === first.shares + second.shares

@@ -97,6 +97,11 @@ template ClosedPeriod
           rateValidFrom = now
           rateValidUntil = validUntil
 
+    choice ClosedPeriod_Reopen : ContractId ReferenceVault
+      -- ^ Undo the close when the next period cannot be opened, restoring the vault as it was.
+      controller vault.vaultRegistrar
+      do create vault
+
 template ReferenceVault
   with
     vaultId : Text
@@ -423,13 +428,17 @@ pullUnderlying vault extraArgs from amount = do
   _ <- transferUnderlying vault extraArgs (regularAccountParties from) from (basicAccount vault.custodian) amount inputHoldingCids
   pure ()
 
--- The receiver authorizes receipt only if they are acting in this choice.
+-- A payout the registry leaves pending is accepted by the receiver, if they are acting in this choice.
 pushUnderlying : ReferenceVault -> ExtraArgs -> [Party] -> Party -> Decimal -> Update [ContractId V2.Holding]
 pushUnderlying vault extraArgs callerActors to amount = do
-  let actors = vault.custodian :: [to | to `elem` callerActors, to /= vault.custodian]
   named <- getUnderlyingHoldings extraArgs.context
   inputHoldingCids <- coveringHoldings amount named
-  transferUnderlying vault extraArgs actors (basicAccount vault.custodian) (basicAccount to) amount inputHoldingCids
+  output <- transferOutput vault extraArgs [vault.custodian] (basicAccount vault.custodian) (basicAccount to) amount inputHoldingCids
+  case output of
+    V2.TransferInstructionResult_Pending with transferInstructionCid | to `elem` callerActors -> do
+      accepted <- exercise transferInstructionCid V2.TransferInstruction_Accept with actors = [to]; extraArgs
+      completed accepted.output
+    _ -> completed output
 
 -- | The leading holdings that cover the payout, so one payout cannot consume the whole pool.
 coveringHoldings : Decimal -> [ContractId V2.Holding] -> Update [ContractId V2.Holding]
@@ -442,7 +451,16 @@ coveringHoldings remaining (cid :: rest) =
       (cid ::) <$> coveringHoldings (remaining - holding.amount) rest
 
 transferUnderlying : ReferenceVault -> ExtraArgs -> [Party] -> V2.Account -> V2.Account -> Decimal -> [ContractId V2.Holding] -> Update [ContractId V2.Holding]
-transferUnderlying vault extraArgs actors sender receiver amount inputHoldingCids = do
+transferUnderlying vault extraArgs actors sender receiver amount inputHoldingCids =
+  transferOutput vault extraArgs actors sender receiver amount inputHoldingCids >>= completed
+
+completed : V2.TransferInstructionResult_Output -> Update [ContractId V2.Holding]
+completed output = case output of
+  V2.TransferInstructionResult_Completed with receiverHoldingCids -> pure receiverHoldingCids
+  _ -> fail "the registry left the underlying transfer pending, so nothing was minted or burned"
+
+transferOutput : ReferenceVault -> ExtraArgs -> [Party] -> V2.Account -> V2.Account -> Decimal -> [ContractId V2.Holding] -> Update V2.TransferInstructionResult_Output
+transferOutput vault extraArgs actors sender receiver amount inputHoldingCids = do
   now <- getTime
   result <- exercise vault.underlyingTransferFactory V2.TransferFactory_Transfer with
     transfer = V2.Transfer with
@@ -456,9 +474,7 @@ transferUnderlying vault extraArgs actors sender receiver amount inputHoldingCid
       meta = emptyMetadata
     actors
     extraArgs
-  case result.output of
-    V2.TransferInstructionResult_Completed with receiverHoldingCids -> pure receiverHoldingCids
-    _ -> fail "the registry left the underlying transfer pending, so nothing was minted or burned"
+  pure result.output
 
 burnFrom : ReferenceVault -> ExtraArgs -> Party -> Decimal -> Update ()
 burnFrom vault extraArgs owner amount = do
