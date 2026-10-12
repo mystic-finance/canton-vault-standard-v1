@@ -63,9 +63,14 @@ deductFeeBps : Int -> Decimal -> Decimal
 deductFeeBps feeBps amount =
   amount - mulDivUp amount (intToDecimal feeBps) 10000.0
 
-addFeeBps : Int -> Decimal -> Decimal
-addFeeBps feeBps amount =
-  amount + mulDivUp amount (intToDecimal feeBps) 10000.0
+-- | The least gross amount that still nets `amount` once the fee is deducted. The fee must be below 10000.
+grossUpFeeBps : Int -> Decimal -> Decimal
+grossUpFeeBps feeBps amount = netsAtLeast feeBps amount (mulDivUp amount 10000.0 (intToDecimal (10000 - feeBps)))
+
+netsAtLeast : Int -> Decimal -> Decimal -> Decimal
+netsAtLeast feeBps amount gross
+  | deductFeeBps feeBps gross >= amount = gross
+  | otherwise = netsAtLeast feeBps amount (gross + ulp)
 
 -- | Stands in for "no limit"; `Decimal` tops out just under 10^28.
 uncapped : Decimal

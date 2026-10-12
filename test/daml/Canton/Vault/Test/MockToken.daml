@@ -245,6 +245,16 @@ template MaxRedeemProbe
         vault <- fetch vaultCid
         maxMint vault party extraArgs
 
+    choice Probe_MaxWithdraw : Decimal
+      with
+        vaultCid : ContractId Vault
+        party : Party
+        extraArgs : ExtraArgs
+      controller caller
+      do
+        vault <- fetch vaultCid
+        maxWithdraw vault party extraArgs
+
     choice Probe_ConvertToAssets : Decimal
       with
         vaultCid : ContractId Vault
