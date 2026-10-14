@@ -74,16 +74,14 @@ rollRejectsFlowsFromAnotherVault = script do
       poolHoldingCids = map (toInterfaceContractId . fst) pool
       validUntil = addRelTime now (hours 2)
 
--- | Flows left open by a roll cannot be replayed in the next period.
-rollRejectsFlowsFromAnEarlierPeriod : Script ()
-rollRejectsFlowsFromAnEarlierPeriod = script do
+-- | A flow a roll left out is still uncounted, so the next roll folds it in.
+aFlowLeftOutOfARollCountsInTheNext : Script ()
+aFlowLeftOutOfARollCountsInTheNext = script do
   f <- setupVault
   _ <- deposit f f.vaultTemplateCid f.alice 100.0
   stale <- query @PeriodFlow f.registrar
-
   pool <- query @MockHolding f.custodian
   ds <- poolDisclosures f
-  -- The next period must start later than the flows above, or they still match.
   passTime (seconds 1)
   now <- getTime
   closed4 <- closePeriod f f.vaultTemplateCid
@@ -92,13 +90,17 @@ rollRejectsFlowsFromAnEarlierPeriod = script do
       flowCids = []
       poolHoldingCids = map (toInterfaceContractId . fst) pool
       validUntil = addRelTime now (hours 2)
+  Some missed <- queryContractId f.registrar rolled
+  missed.totalShares === 0.0
 
   closed5 <- closePeriod f rolled
-  submitMustFail (actAs f.registrar <> discloseMany ds) do
+  caught <- submit (actAs f.registrar <> discloseMany ds) do
     exerciseCmd closed5 ClosedPeriod_Open with
       flowCids = map fst stale
       poolHoldingCids = map (toInterfaceContractId . fst) pool
       validUntil = addRelTime now (hours 3)
+  Some vault <- queryContractId f.registrar caught
+  vault.totalShares === 100.0
 
 -- | A period must end in the future, or the vault opens already closed.
 rollRejectsAPeriodEndingInThePast : Script ()
@@ -672,3 +674,50 @@ callerNamedFactoryCannotDrainThePool = script do
       extraArgs = withFactory (toInterfaceContractId forged) (redeemArgs f poolCids malloryShares)
   left <- map ((.holding.amount) . snd) <$> query @MockHolding f.custodian
   sum left === 10000.5
+
+
+-- Merging flows
+-----------------
+
+-- | Merged flows roll to the same totals as the flows they replace.
+mergedFlowsRollTheSame : Script ()
+mergedFlowsRollTheSame = script do
+  f <- setupVault
+  forA_ [100.0, 50.0, 25.0] $ \amount -> deposit f f.vaultTemplateCid f.alice amount
+  first :: rest <- map fst <$> query @PeriodFlow f.registrar
+  _ <- submit f.registrar (exerciseCmd first PeriodFlow_Merge with flowCids = rest)
+  merged <- map snd <$> query @PeriodFlow f.registrar
+  map (\flow -> (flow.assetsDelta, flow.sharesDelta)) merged === [(175.0, 175.0)]
+  rolled <- rollPeriod f f.vaultTemplateCid
+  Some vault <- queryContractId f.registrar rolled
+  (vault.totalShares, vault.totalAssets) === (175.0, 175.0)
+
+-- | A sibling vault's flow, readable under a shared registrar, is not merged into this vault's.
+mergeRefusesAnotherVaultsFlow : Script ()
+mergeRefusesAnotherVaultsFlow = script do
+  f <- setupVault
+  now <- getTime
+  sibling <- submitMulti [f.registrar, f.custodian] [] do
+    createCmd ReferenceVault with
+      vaultId = "reference-2"
+      vaultRegistrar = f.registrar
+      custodian = f.custodian
+      underlyingInstrument = f.underlying
+      shareInstrument = f.shares with id = "reference-2"
+      totalShares = 0.0
+      totalAssets = 0.0
+      accrual = None
+      depositFeeBps = 0
+      redeemFeeBps = 0
+      rateValidFrom = now
+      rateValidUntil = addRelTime now (hours 1)
+      depositCap = None
+      paused = False
+      underlyingTransferFactory = f.registryCid
+  _ <- deposit f f.vaultTemplateCid f.alice 100.0
+  _ <- deposit f sibling f.alice 500.0
+  flows <- query @PeriodFlow f.registrar
+  [ours] <- pure [cid | (cid, flow) <- flows, flow.vaultId == "reference-1"]
+  let theirs = [cid | (cid, flow) <- flows, flow.vaultId == "reference-2"]
+  submitMustFail f.registrar do
+    exerciseCmd ours PeriodFlow_Merge with flowCids = theirs
