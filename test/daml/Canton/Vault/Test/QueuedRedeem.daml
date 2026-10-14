@@ -1367,6 +1367,7 @@ aQueuedRollBeyondTheLimitsNeedsTheCustodian = script do
             flowCids = map fst flows; poolHoldingCids = map (toInterfaceContractId . fst) pool
             validUntil = addRelTime now (hours 1)
   failsWith "the price rises within the vault's limit" =<< open False [env.registrar]
+  failsWith "requires authorizers" =<< open True [env.registrar]
   Right opened <- open True [env.registrar, env.custodian]
   Some vault <- queryContractId env.registrar opened
   (vault.epoch, vault.totalAssets) === (1, 110.0)
