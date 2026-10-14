@@ -19,8 +19,8 @@ import Splice.Api.Token.AllocationV2 qualified as V2
 import Splice.Api.Token.TransferInstructionV2 qualified as V2
 import Splice.TokenStandard.Utils
 
-shareAllocationsKey : Text
-shareAllocationsKey = "cantonVaultV1/shareAllocations"
+redeemRequestsKey : Text
+redeemRequestsKey = "cantonVaultV1/redeemRequests"
 
 template ReferenceQueuedRedeemVault
   with
@@ -38,6 +38,8 @@ template ReferenceQueuedRedeemVault
     redeemFeeBps : Int
     rateValidFrom : Time
     rateValidUntil : Time
+    epoch : Int
+      -- ^ The current period's number, counting rolls; a request made in it carries it as its id.
     depositCap : Optional Decimal
       -- ^ The most one deposit may bring in; `None` for no limit.
     executors : [Party]
@@ -96,19 +98,15 @@ template ReferenceQueuedRedeemVault
         settlementDeadlineWindow
         meta = emptyMetadata
 
-      -- Every request has id 0, so a party's pending shares are all their escrows together.
+      -- A request's id is the period it was made in.
       pendingRedeemRequest requestId party extraArgs = do
-        allocationCids <- dedup <$> getAllocations shareAllocationsKey extraArgs.context
-        amounts <- forA allocationCids $ \cid -> do
-          allocation <- fetch cid
-          let escrow = view allocation
-          pure $ if requestId == 0 && signedBy vaultRegistrar allocation
-                      && escrow.settlement == settlementFor this
-                      && escrow.allocation.authorizer.owner == Some party
-            then sum [ leg.amount | leg <- escrow.allocation.transferLegSides
-                     , leg.side == V2.SenderSide, leg.otherside == burnAccount
-                     , leg.instrumentId == shareInstrument.id ]
-            else 0.0
+        now <- getTime
+        requestCids : [ContractId QueuedRedeemRequest] <- dedup <$> getContractIds redeemRequestsKey extraArgs.context
+        amounts <- forA requestCids $ \cid -> do
+          r <- fetch cid
+          pure $ if r.vaultRegistrar == vaultRegistrar && r.vaultId == vaultId && r.owner == party
+                      && r.epoch == requestId && now < r.expiresAt
+            then r.shares else 0.0
         pure (sum amounts)
 
       vault_requestRedeemExtraObservers _arg = []
@@ -152,14 +150,19 @@ template ReferenceQueuedRedeemVault
           shareAllocation = arg.shareAllocation
           underlyingAllocation = arg.underlyingAllocation
           expiresAt = escrowDeadline
-        pure 0
+          epoch
+          minAssetsOut = arg.minAssetsOut
+        pure epoch
 
     nonconsuming choice ReferenceQueuedRedeemVault_Fulfil : ()
-      -- ^ Fulfil requests at the current rate, in one transaction; one that fails fails them all.
+      -- ^ Fulfil requests made in earlier periods, in one transaction; one that fails fails them all. Each
+      -- pays at the price struck when the period after its own opened, or the current one if less.
       with
         requestCids : [ContractId QueuedRedeemRequest]
           -- ^ The requests to fulfil, each binding its escrow to its receiver's authorization. Each
           -- adds a leg to each registry's batch; every registry accepts batches of up to 25 legs.
+        priceCids : [ContractId PeriodPrice]
+          -- ^ The prices struck in periods before the current one, for requests filled late.
         poolHoldingCids : [ContractId V2.Holding]
           -- ^ The custodian's holdings to pay from; only those the payout needs are used.
         underlyingExtraArgs : ExtraArgs
@@ -177,15 +180,24 @@ template ReferenceQueuedRedeemVault
           pure request
         requireDistinct [(r.owner, r.label) | r <- requests]
           (concat [[r.shareAllocation, r.underlyingAllocation] | r <- requests])
-        assets' <- currentAssets (instantOf' this)
+        forA_ requests $ \r -> require "a request is filled after the period it was made in" (r.epoch < epoch)
+        prices <- forA priceCids $ \cid -> do
+          price <- fetch cid
+          require' ("price.vaultRegistrar", price.vaultRegistrar) isEqualR ("vaultRegistrar", vaultRegistrar)
+          require' ("price.vaultId", price.vaultId) isEqualR ("vaultId", vaultId)
+          pure price
         -- Each leg uses the account its allocation names, which may have a provider.
-        accounts <- forA requests $ \r -> do
+        priced <- forA requests $ \r -> do
           escrowed <- view <$> fetch r.shareAllocation
           receiving <- view <$> fetch r.underlyingAllocation
-          pure (escrowed.allocation.authorizer, receiving.allocation.authorizer)
+          (struckShares, struckAssets) <- struckFor r.epoch epoch (totalShares, totalAssets) prices
+          let paid = min (sharesToAssets struckShares struckAssets r.shares) (sharesToAssets totalShares totalAssets r.shares)
+              assets = deductFeeBps redeemFeeBps paid
+          case r.minAssetsOut of
+            Some limit | assets < limit -> fail (vaultSlippageExceeded <> ": request " <> r.label)
+            _ -> pure ()
+          pure (r, escrowed.allocation.authorizer, receiving.allocation.authorizer, assets)
         let settlement = settlementFor this
-            priced = [ (r, from, to, deductFeeBps redeemFeeBps (sharesToAssets totalShares assets' r.shares))
-                     | (r, (from, to)) <- zip requests accounts ]
             shareLeg (r, from, _, _) = V2.TransferLeg with
               transferLegId = requestLegId r.owner r.label "shares"
               sender = from
@@ -225,8 +237,7 @@ template ReferenceQueuedRedeemVault
           extraArgs = underlyingExtraArgs
 
         recordFlow (instantOf' this) (negate payout) (negate (sum (map (.shares) requests)))
-        forA_ priced $ \(r, _, _, a) ->
-          recordFulfilment this r.owner r.receiver r.label r.shares a
+        reportQueued vaultRegistrar [ eventOf r (Fulfilled with received = a) | (r, _, _, a) <- priced ]
 
     nonconsuming choice ReferenceQueuedRedeemVault_Reject : ()
       -- ^ End requests that cannot settle, returning each escrow and recording why. A request that
@@ -239,17 +250,13 @@ template ReferenceQueuedRedeemVault
           -- ^ The share registry's context for cancelling the escrows.
       controller executors
       do
-        forA_ requestCids $ \cid -> do
+        events <- forA requestCids $ \cid -> do
           request <- fetch cid
           require' ("request.vaultRegistrar", request.vaultRegistrar) isEqualR ("vaultRegistrar", vaultRegistrar)
           archive cid
           _ <- exercise request.shareAllocation V2.Allocation_Cancel with actors = executors; extraArgs = shareExtraArgs
-          create QueuedRedeemRejection with
-            vaultId; vaultRegistrar; reason
-            owner = request.owner
-            receiver = request.receiver
-            label = request.label
-            shares = request.shares
+          pure (eventOf request (Rejected with reason))
+        reportQueued vaultRegistrar events
 
     choice ReferenceQueuedRedeemVault_SetPriceLimits : ContractId ReferenceQueuedRedeemVault
       -- ^ Change the price limits, which the custodian must agree to.
@@ -305,11 +312,7 @@ template ClosedQueuedRedeemPeriod
       do
         (shares, assets, now) <- rollTotals (instantOf' vault) flowCids poolHoldingCids validUntil
         requirePriceWithinLimits vault.priceLimits (instantOf' vault) shares assets
-        create vault with
-          totalShares = shares
-          totalAssets = assets
-          rateValidFrom = now
-          rateValidUntil = validUntil
+        openNext vault shares assets now validUntil
 
     choice ClosedQueuedRedeemPeriod_OpenBeyondLimits : ContractId ReferenceQueuedRedeemVault
       -- ^ Open the next period at a price outside the vault's limits, on the custodian's word as well.
@@ -320,11 +323,7 @@ template ClosedQueuedRedeemPeriod
       controller vault.vaultRegistrar, vault.custodian
       do
         (shares, assets, now) <- rollTotals (instantOf' vault) flowCids poolHoldingCids validUntil
-        create vault with
-          totalShares = shares
-          totalAssets = assets
-          rateValidFrom = now
-          rateValidUntil = validUntil
+        openNext vault shares assets now validUntil
 
     choice ClosedQueuedRedeemPeriod_Reopen : ContractId ReferenceQueuedRedeemVault
       -- ^ Undo the close when the next period cannot be opened, restoring the vault as it was.
@@ -347,6 +346,10 @@ template QueuedRedeemRequest
       -- ^ The receiver's authorization to be paid.
     expiresAt : Time
       -- ^ The escrow's deadline, after which it cannot be fulfilled.
+    epoch : Int
+      -- ^ The period the request was made in, which is its id.
+    minAssetsOut : Optional Decimal
+      -- ^ The least underlying the receiver accepts; fulfilment below it fails.
   where
     signatory vaultRegistrar
     observer owner, receiver, executors
@@ -360,51 +363,6 @@ template QueuedRedeemRequest
         now <- getTime
         require "the owner or an executor drops a request, or the registrar once it has expired"
           (actor `elem` (owner :: executors) || actor == vaultRegistrar && now >= expiresAt)
-
--- | A record of one fulfilled redemption, kept for its owner and receiver.
-template QueuedRedeemEvent
-  with
-    vaultId : Text
-    vaultRegistrar : Party
-    owner : Party
-    receiver : Party
-    label : Text
-    shares : Decimal
-    assets : Decimal
-      -- ^ The underlying paid out.
-    periodStart : Time
-  where
-    signatory vaultRegistrar
-    observer owner, receiver
-
-    choice QueuedRedeemEvent_Archive : ()
-      -- ^ Drop the record, by a party it is kept for or by the registrar.
-      with
-        actor : Party
-      controller actor
-      do require' ("actor", actor) isMemberR ("record keepers", [vaultRegistrar, owner, receiver])
-
--- | A record of a redemption request the executors rejected, kept for its owner and receiver.
-template QueuedRedeemRejection
-  with
-    vaultId : Text
-    vaultRegistrar : Party
-    owner : Party
-    receiver : Party
-    label : Text
-    shares : Decimal
-    reason : Text
-      -- ^ Why the request could not settle.
-  where
-    signatory vaultRegistrar
-    observer owner, receiver
-
-    choice QueuedRedeemRejection_Archive : ()
-      -- ^ Drop the record, by a party it is kept for or by the registrar.
-      with
-        actor : Party
-      controller actor
-      do require' ("actor", actor) isMemberR ("record keepers", [vaultRegistrar, owner, receiver])
 
 -- | The same vault as an instant one, for everything but redemptions.
 instantOf' : ReferenceQueuedRedeemVault -> ReferenceVault
@@ -436,15 +394,30 @@ settlementFor v = V2.SettlementInfo with
   cid = None
   meta = emptyMetadata
 
-recordFulfilment : ReferenceQueuedRedeemVault -> Party -> Party -> Text -> Decimal -> Decimal -> Update ()
-recordFulfilment v owner receiver label shares assets = do
-  _ <- create QueuedRedeemEvent with
+-- | Opens the next period at the totals measured, keeping the price it strikes.
+openNext : ReferenceQueuedRedeemVault -> Decimal -> Decimal -> Time -> Time -> Update (ContractId ReferenceQueuedRedeemVault)
+openNext v shares assets now validUntil = do
+  let next = v.epoch + 1
+  _ <- create PeriodPrice with
     vaultId = v.vaultId
     vaultRegistrar = v.vaultRegistrar
-    owner
-    receiver
-    label
-    shares
-    assets
-    periodStart = v.rateValidFrom
-  pure ()
+    executors = v.executors
+    epoch = next
+    totalShares = shares
+    totalAssets = assets
+  create v with
+    totalShares = shares
+    totalAssets = assets
+    rateValidFrom = now
+    rateValidUntil = validUntil
+    epoch = next
+
+eventOf : QueuedRedeemRequest -> Outcome -> QueuedEvent
+eventOf r outcome = QueuedEvent with
+  vaultId = r.vaultId
+  requester = r.owner
+  receiver = r.receiver
+  label = r.label
+  requestId = r.epoch
+  requested = r.shares
+  outcome

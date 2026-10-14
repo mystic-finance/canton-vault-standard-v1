@@ -18,27 +18,24 @@ import Canton.Vault.V1
 -- least the vault's `settlementDeadlineWindow` and carry the settlement id
 -- `requestSettlementId`; the escrow's leg carries the leg id `requestLegId`, and
 -- the authorization has no legs. Each is issued by its instrument's registry,
--- signed by the registry's admin. The executors fulfil a request at any time
--- before its deadline, at the rate when they strike it, settling both legs; how
--- they do so is the vault's own.
+-- signed by the registry's admin. The executors fulfil a request before its
+-- deadline, settling both legs, at the rate its `RequestId` says; how they do so
+-- is the vault's own.
 interface VaultAsyncRedeem requires Vault where
   viewtype AsyncView
 
-  -- | Shares the party has escrowed for the vault's requests under the request
-  -- id, in the allocations named in `extraArgs` that the share registry issued.
-  -- A vault cannot look allocations up, so one not named does not count, and one
-  -- named twice counts once. An escrow counts until it is settled, cancelled or
-  -- withdrawn; naming one that is gone fails.
+  -- | Shares the party has queued for redemption under the request id, as the
+  -- contracts named in `extraArgs` show. A vault cannot look them up, so one not
+  -- named does not count, and one named twice counts once; naming one that is
+  -- gone fails. A request counts until it is fulfilled, rejected or expires.
   pendingRedeemRequest : RequestId -> Party -> ExtraArgs -> Update Decimal
 
   vault_requestRedeemImpl : ContractId VaultAsyncRedeem -> Vault_RequestRedeem -> Update RequestId
   vault_requestRedeemExtraObservers : Vault_RequestRedeem -> [Party]
 
   nonconsuming choice Vault_RequestRedeem : RequestId
-    -- ^ Queue a redemption of `shares`, paying `receiver` the underlying at the
-    -- rate the executors strike when they fulfil the request.
-    --
-    -- Takes no slippage limit: the rate is not known until fulfilment.
+    -- ^ Queue a redemption of `shares`, paying `receiver` the underlying at a
+    -- rate struck after the request is made, so not known when it is.
     with
       label : Text
         -- ^ The holder's label for the request, in its leg ids. Requests that
@@ -47,6 +44,9 @@ interface VaultAsyncRedeem requires Vault where
         -- ^ Shares to redeem.
       receiver : Party
         -- ^ The party to be paid the underlying.
+      minAssetsOut : Optional Decimal
+        -- ^ The least underlying the receiver accepts; a fulfilment that would
+        -- pay less fails rather than fill.
       shareAllocation : ContractId Allocation
         -- ^ The funded escrow, sending `shares` to the burn account. Committed
         -- until a deadline at least the vault's window away.
