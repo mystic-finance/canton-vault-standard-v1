@@ -1,0 +1,16 @@
+{-# LANGUAGE AllowAmbiguousTypes #-}
+
+-- | What a transaction reported, read from its tree, since reports leave nothing on the ledger.
+module Canton.Vault.Test.Reports where
+
+import DA.Optional (optionalToList)
+import Daml.Script
+
+-- | The arguments of every exercise of the choice in the tree.
+exercisesOf : forall t c r. (Template t, Choice t c r) => TransactionTree -> [c]
+exercisesOf tree = concatMap (exercisesIn @t @c @r) tree.rootEvents
+
+exercisesIn : forall t c r. (Template t, Choice t c r) => TreeEvent -> [c]
+exercisesIn (CreatedEvent _) = []
+exercisesIn (ExercisedEvent e) =
+  optionalToList (fromAnyChoice @t @c e.argument) <> concatMap (exercisesIn @t @c @r) e.childEvents

@@ -43,8 +43,15 @@ setupVaultWith feeBps vaultAccrual = setupVaultFull feeBps vaultAccrual None
 setupVaultFull : Int -> Optional Accrual -> Optional Decimal -> Script Fixture
 setupVaultFull feeBps = setupVaultFees feeBps feeBps
 
+-- | Limits wide enough that no test roll meets them, for tests about something else.
+wideLimits : PriceLimits
+wideLimits = PriceLimits with maxIncreaseBpsPerYear = 1000000000000000000; maxDecreaseBps = 10000
+
 setupVaultFees : Int -> Int -> Optional Accrual -> Optional Decimal -> Script Fixture
-setupVaultFees depositFeeBps redeemFeeBps vaultAccrual cap = do
+setupVaultFees = setupVaultLimited wideLimits
+
+setupVaultLimited : PriceLimits -> Int -> Int -> Optional Accrual -> Optional Decimal -> Script Fixture
+setupVaultLimited limits depositFeeBps redeemFeeBps vaultAccrual cap = do
   registrar <- allocateParty "registrar"
   custodian <- allocateParty "custodian"
   underlyingAdmin <- allocateParty "underlyingAdmin"
@@ -74,6 +81,7 @@ setupVaultFees depositFeeBps redeemFeeBps vaultAccrual cap = do
       depositCap = cap
       paused = False
       underlyingTransferFactory = toInterfaceContractId registryTemplateCid
+      priceLimits = limits
 
   pure Fixture with
     registrar; custodian; underlyingAdmin; alice

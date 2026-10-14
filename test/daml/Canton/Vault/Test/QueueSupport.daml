@@ -6,6 +6,8 @@ import DA.Text qualified as T
 import DA.TextMap qualified as TextMap
 import Daml.Script
 
+import Canton.Vault.Reference.V1 (PriceLimits(..))
+
 import Splice.Api.Token.MetadataV1
 import Splice.Api.Token.AllocationV2 qualified as V2
 
@@ -57,3 +59,7 @@ fakeAllocation owner settlement allocation = do
         availableActions = Map.empty
         meta = emptyMetadata
   pure (toInterfaceContractId cid)
+
+-- | Limits wide enough that no test roll meets them, for tests about something else.
+generousLimits : PriceLimits
+generousLimits = PriceLimits with maxIncreaseBpsPerYear = 1000000000000000000; maxDecreaseBps = 10000
