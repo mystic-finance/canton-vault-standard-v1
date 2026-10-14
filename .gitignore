@@ -28,11 +28,10 @@ node_modules/
 .env
 .env.*
 
-# Internal working notes
-docs/plan.md
+# Internal working notes; the README is the only published doc
+docs/
 
 # Dev tooling, not part of the reference
 scripts/guard_coverage.py
-docs/design.md
 service/
 scripts/localnet/
