@@ -255,7 +255,7 @@ template ClosedQueuedPeriod
     signatory vault.vaultRegistrar, vault.custodian
 
     choice ClosedQueuedPeriod_Open : ContractId ReferenceQueuedDepositVault
-      -- ^ Open the next period, folding in the closed one's flows and measuring the pool.
+      -- ^ Open the next period, folding in the flows not yet counted and measuring the pool.
       with
         flowCids : [ContractId PeriodFlow]
         poolHoldingCids : [ContractId V2.Holding]
