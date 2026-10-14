@@ -28,6 +28,26 @@ The choices are nonconsuming, so concurrent deposits do not contend on the vault
 contract. Each action records what it moved, and the registrar folds those in
 when it opens the next rate period.
 
+## Trust and limits
+
+- The registrar is trusted. It strikes the price at each roll from the pool it
+  measures, pauses the vault and re-pins its factories, and as admin of the
+  share instrument it can issue itself shares and drain the pool. Holders rely
+  on it as they rely on a fund's administrator.
+- Each vault has its own custodian. Every unlocked holding of the underlying the
+  custodian owns counts as the vault's pool, so two vaults sharing one would
+  count each other's assets. The ledger cannot check this; the registrar must
+  not reuse a custodian.
+- Prices are fixed for a rate period. Value that enters or leaves the pool
+  outside vault actions, such as yield or a loss, shows only at the next roll:
+  roll promptly after one, and use accrual for steady yield. On Canton Coin a
+  period is at most 90 days, the longest a transfer may live.
+- A redemption names the pool holdings it pays from, and two redemptions naming
+  the same holding collide: one fails. Clients pick holdings at random and retry.
+  Keeping the pool in several holdings lets redemptions run side by side; merging
+  them now and then keeps a roll's read small (a Canton Coin transfer takes at
+  most 100 inputs).
+
 ## Packages
 
 | | |
