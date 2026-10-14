@@ -12,6 +12,7 @@ import Canton.Vault.Reference.Share
 import Canton.Vault.Test.Deposit
 import Canton.Vault.Test.MockToken
 import Canton.Vault.Test.Periods
+import Canton.Vault.Test.Reports
 
 import Splice.Api.Token.MetadataV1
 
@@ -124,29 +125,32 @@ poolTotalIsTheCustodiansHoldings = script do
       poolHoldingCids = map (toInterfaceContractId . fst) pool
   total === 105.0
 
--- | Each action leaves a record for its actors and receiver, and the roll leaves it in place.
-actionsLeaveRecordsThatOutliveTheRoll : Script ()
-actionsLeaveRecordsThatOutliveTheRoll = script do
+-- | Each action reports an event to its actors and receiver in its own transaction, and leaves nothing on the ledger.
+actionsReportEventsToTheirParties : Script ()
+actionsReportEventsToTheirParties = script do
   f <- setupVault
   bob <- allocateParty "bob"
   _ <- deposit f f.vaultTemplateCid f.alice 100.0
   rolled <- rollPeriod f f.vaultTemplateCid
   ds <- disclosuresFor f rolled
   let vaultCid : ContractId Vault = toInterfaceContractId rolled
+      reported tree = [ (r.event.action, r.event.receiver, r.event.assets, r.event.shares, r.observers)
+                      | r <- exercisesOf @VaultLog @VaultLog_Report tree ]
 
   funds <- fund f f.alice 100.0
-  _ <- submitWithDisclosures f.alice ds do
+  minted <- submitTree (actAs f.alice <> discloseMany ds) do
     exerciseCmd vaultCid Vault_Mint with
       shares = 10.0
       receiver = f.alice
       maxAssetsIn = None
       actors = [f.alice]
       extraArgs = depositArgs f [funds]
+  reported minted === [(Minted, f.alice, 10.0, 10.0, [f.alice])]
 
   pool <- query @MockHolding f.custodian
   poolDs <- poolDisclosures f
   aliceShares <- map fst <$> query @ShareHolding f.alice
-  _ <- submitWithDisclosures f.alice (ds <> poolDs) do
+  withdrew <- submitTree (actAs f.alice <> discloseMany (ds <> poolDs)) do
     exerciseCmd vaultCid Vault_Withdraw with
       assets = 5.0
       owner = f.alice
@@ -154,11 +158,12 @@ actionsLeaveRecordsThatOutliveTheRoll = script do
       maxSharesIn = None
       actors = [f.alice]
       extraArgs = redeemArgs f (map (toInterfaceContractId . fst) pool) aliceShares
+  reported withdrew === [(Withdrew, f.alice, 5.0, 5.0, [f.alice])]
 
   pool' <- query @MockHolding f.custodian
   poolDs' <- poolDisclosures f
   aliceShares' <- map fst <$> query @ShareHolding f.alice
-  _ <- submitWithDisclosures f.alice (ds <> poolDs') do
+  redeemed <- submitTree (actAs f.alice <> discloseMany (ds <> poolDs')) do
     exerciseCmd vaultCid Vault_Redeem with
       shares = 5.0
       owner = f.alice
@@ -166,12 +171,9 @@ actionsLeaveRecordsThatOutliveTheRoll = script do
       minAssetsOut = None
       actors = [f.alice]
       extraArgs = redeemArgs f (map (toInterfaceContractId . fst) pool') aliceShares'
+  reported redeemed === [(Redeemed, bob, 5.0, 5.0, [bob, f.alice])]
 
-  aliceSees <- map ((.action) . snd) <$> query @VaultEvent f.alice
-  length aliceSees === 4
-  forA_ [Deposited, Minted, Withdrew, Redeemed] $ \a -> assertMsg (show a <> " is recorded") (a `elem` aliceSees)
-  bobSees <- map ((.action) . snd) <$> query @VaultEvent bob
-  bobSees === [Redeemed]
+  query @VaultLog f.registrar >>= (=== []) . map snd
 
 -- | Re-pinning moves the vault's transfers to the new factory.
 repinnedFactoryCarriesTheTransfers : Script ()
@@ -217,26 +219,3 @@ reopenRestoresTheVault = script do
   rolled <- rollPeriod f reopened
   Some vault <- queryContractId f.registrar rolled
   vault.totalShares === first.shares + second.shares
-
-
--- | A record goes when a party it is kept for, or the registrar, drops it.
-recordKeepersDropRecords : Script ()
-recordKeepersDropRecords = script do
-  f <- setupVault
-  _ <- deposit f f.vaultTemplateCid f.alice 100.0
-  _ <- deposit f f.vaultTemplateCid f.alice 50.0
-  [mine, theirs] <- map fst <$> query @VaultEvent f.alice
-  submit f.alice (exerciseCmd mine VaultEvent_Archive with actor = f.alice)
-  submit f.registrar (exerciseCmd theirs VaultEvent_Archive with actor = f.registrar)
-  query @VaultEvent f.alice >>= (=== []) . map snd
-
--- | A party shown a record cannot drop it.
-strangerCannotDropARecord : Script ()
-strangerCannotDropARecord = script do
-  f <- setupVault
-  _ <- deposit f f.vaultTemplateCid f.alice 100.0
-  [record] <- map fst <$> query @VaultEvent f.alice
-  carol <- allocateParty "carol"
-  Some shown <- queryDisclosure f.registrar record
-  submitMustFail (actAs carol <> discloseMany [shown]) do
-    exerciseCmd record VaultEvent_Archive with actor = carol

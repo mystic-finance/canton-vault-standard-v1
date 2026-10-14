@@ -62,27 +62,33 @@ template PeriodFlow
           assetsDelta = assetsDelta + sum (map (.assetsDelta) flows)
           sharesDelta = sharesDelta + sum (map (.sharesDelta) flows)
 
--- | A record of one action, kept for the parties who took it.
-template VaultEvent
-  with
+-- | One action, as reported to the parties who took it and the receiver.
+data VaultEvent = VaultEvent with
     vaultId : Text
-    vaultRegistrar : Party
     action : VaultAction
     actors : [Party]
     receiver : Party
     assets : Decimal
     shares : Decimal
     periodStart : Time
+  deriving (Eq, Show, Serializable)
+
+-- | Reports events in the transaction they happen in, as the token standard's `EventLog` does. Created and
+-- archived within that transaction, so nothing stays on the ledger.
+template VaultLog
+  with
+    vaultRegistrar : Party
   where
     signatory vaultRegistrar
-    observer actors, receiver
 
-    choice VaultEvent_Archive : ()
-      -- ^ Drop the record, by a party it is kept for or by the registrar.
+    nonconsuming choice VaultLog_Report : ()
+      -- ^ Show the event to its observers.
       with
-        actor : Party
-      controller actor
-      do require' ("actor", actor) isMemberR ("record keepers", vaultRegistrar :: receiver :: actors)
+        event : VaultEvent
+        observers : [Party]
+      observer observers
+      controller vaultRegistrar
+      do pure ()
 
 data VaultAction = Deposited | Minted | Withdrew | Redeemed
   deriving (Eq, Show, Serializable)
@@ -102,16 +108,23 @@ template ClosedPeriod
         validUntil : Time
       controller vault.vaultRegistrar
       do
-        now <- getTime
-        require "period ends in the future" (validUntil > now)
-        flows <- forA flowCids $ \cid -> do
-          flow <- fetch cid
-          require' ("flow.vaultId", flow.vaultId) isEqualR ("vaultId", vault.vaultId)
-          archive cid
-          pure flow
-        assets <- sumPool vault poolHoldingCids
-        let shares = vault.totalShares + sum (map (.sharesDelta) flows)
-        require "shares stay non-negative" (shares >= 0.0)
+        (shares, assets, now) <- rollTotals vault flowCids poolHoldingCids validUntil
+        requirePriceWithinLimits vault.priceLimits vault shares assets
+        create vault with
+          totalShares = shares
+          totalAssets = assets
+          rateValidFrom = now
+          rateValidUntil = validUntil
+
+    choice ClosedPeriod_OpenBeyondLimits : ContractId ReferenceVault
+      -- ^ Open the next period at a price outside the vault's limits, on the custodian's word as well.
+      with
+        flowCids : [ContractId PeriodFlow]
+        poolHoldingCids : [ContractId V2.Holding]
+        validUntil : Time
+      controller vault.vaultRegistrar, vault.custodian
+      do
+        (shares, assets, now) <- rollTotals vault flowCids poolHoldingCids validUntil
         create vault with
           totalShares = shares
           totalAssets = assets
@@ -153,6 +166,8 @@ template ReferenceVault
       -- ^ Whether deposits and mints are refused; withdrawals and redemptions still run.
     underlyingTransferFactory : ContractId V2.TransferFactory
       -- ^ The registry's transfer factory, the only one the vault transfers through.
+    priceLimits : PriceLimits
+      -- ^ How far a roll may move the price on the registrar's word alone.
   where
     signatory vaultRegistrar, custodian
 
@@ -162,6 +177,7 @@ template ReferenceVault
         && shareInstrument == V2.InstrumentId with admin = vaultRegistrar; id = vaultId
         && depositFeeBps >= 0 && depositFeeBps <= 10000
         && redeemFeeBps >= 0 && redeemFeeBps <= 10000
+        && validPriceLimits priceLimits
 
     interface instance Vault for ReferenceVault where
       view = VaultView with
@@ -333,6 +349,13 @@ template ReferenceVault
           isEqualR ("underlying instrument admin", underlyingInstrument.admin)
         create this with underlyingTransferFactory = factory
 
+    choice ReferenceVault_SetPriceLimits : ContractId ReferenceVault
+      -- ^ Change the price limits, which the custodian must agree to.
+      with
+        limits : PriceLimits
+      controller vaultRegistrar, custodian
+      do create this with priceLimits = limits
+
     choice ReferenceVault_SetPaused : ContractId ReferenceVault
       -- ^ Pause or resume deposits and mints.
       with
@@ -360,16 +383,56 @@ template ReferenceVault
 
 recordEvent : ReferenceVault -> VaultAction -> [Party] -> Party -> Decimal -> Decimal -> Update ()
 recordEvent vault action actors receiver assets shares = do
-  _ <- create VaultEvent with
-    vaultId = vault.vaultId
-    vaultRegistrar = vault.vaultRegistrar
-    action
-    actors
-    receiver
-    assets
-    shares
-    periodStart = vault.rateValidFrom
-  pure ()
+  log <- create VaultLog with vaultRegistrar = vault.vaultRegistrar
+  exercise log VaultLog_Report with
+    event = VaultEvent with
+      vaultId = vault.vaultId
+      action
+      actors
+      receiver
+      assets
+      shares
+      periodStart = vault.rateValidFrom
+    observers = dedup (receiver :: actors)
+  archive log
+
+-- | The totals for the next period: this one's flows folded in, the pool measured.
+rollTotals : ReferenceVault -> [ContractId PeriodFlow] -> [ContractId V2.Holding] -> Time -> Update (Decimal, Decimal, Time)
+rollTotals vault flowCids poolHoldingCids validUntil = do
+  now <- getTime
+  require "period ends in the future" (validUntil > now)
+  flows <- forA flowCids $ \cid -> do
+    flow <- fetch cid
+    require' ("flow.vaultId", flow.vaultId) isEqualR ("vaultId", vault.vaultId)
+    archive cid
+    pure flow
+  assets <- sumPool vault poolHoldingCids
+  let shares = vault.totalShares + sum (map (.sharesDelta) flows)
+  require "shares stay non-negative" (shares >= 0.0)
+  pure (shares, assets, now)
+
+-- | How far one roll may move the price per share before the custodian must agree.
+data PriceLimits = PriceLimits with
+    maxIncreaseBpsPerYear : Int
+      -- ^ The most the price may rise, in basis points a year, pro rata for the closing period's length.
+    maxDecreaseBps : Int
+      -- ^ The most the price may fall in one roll, in basis points.
+  deriving (Eq, Show, Serializable)
+
+validPriceLimits : PriceLimits -> Bool
+validPriceLimits limits =
+  limits.maxIncreaseBpsPerYear >= 0 && limits.maxDecreaseBps >= 0 && limits.maxDecreaseBps <= 10000
+
+-- | Refuses a roll whose price per share leaves the limits, measured against the closing period's opening price.
+requirePriceWithinLimits : PriceLimits -> ReferenceVault -> Decimal -> Decimal -> Update ()
+requirePriceWithinLimits limits vault shares assets = do
+  let before = pricePerShare vault.totalShares vault.totalAssets
+      after = pricePerShare shares assets
+      years = elapsedSeconds vault.rateValidFrom vault.rateValidUntil / 31536000.0
+      rise = intToDecimal limits.maxIncreaseBpsPerYear / 10000.0 * years
+      fall = intToDecimal limits.maxDecreaseBps / 10000.0
+  require "the price rises within the vault's limit" (after <= before * (1.0 + rise))
+  require "the price falls within the vault's limit" (after >= before * (1.0 - fall))
 
 recordFlow : ReferenceVault -> Decimal -> Decimal -> Update ()
 recordFlow vault assetsDelta sharesDelta = do

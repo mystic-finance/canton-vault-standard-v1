@@ -42,6 +42,10 @@ accrue accrual assets asOf now =
 virtualOffset : Decimal
 virtualOffset = 1.0
 
+-- | The price of one share, with the virtual offset.
+pricePerShare : Decimal -> Decimal -> Decimal
+pricePerShare totalShares totalAssets = (totalAssets + virtualOffset) / (totalShares + virtualOffset)
+
 assetsToShares : Decimal -> Decimal -> Decimal -> Decimal
 assetsToShares totalShares totalAssets assets =
   mulDivDown assets (totalShares + virtualOffset) (totalAssets + virtualOffset)

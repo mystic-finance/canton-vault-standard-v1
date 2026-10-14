@@ -60,6 +60,7 @@ rollRejectsFlowsFromAnotherVault = script do
       depositCap = None
       paused = False
       underlyingTransferFactory = f.registryCid
+      priceLimits = wideLimits
 
   _ <- deposit f f.vaultTemplateCid f.alice 100.0
   _ <- deposit f sibling f.alice 500.0
@@ -714,6 +715,7 @@ mergeRefusesAnotherVaultsFlow = script do
       depositCap = None
       paused = False
       underlyingTransferFactory = f.registryCid
+      priceLimits = wideLimits
   _ <- deposit f f.vaultTemplateCid f.alice 100.0
   _ <- deposit f sibling f.alice 500.0
   flows <- query @PeriodFlow f.registrar
