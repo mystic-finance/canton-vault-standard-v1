@@ -36,7 +36,7 @@ getHoldingCids key context =
     None -> pure []
     v -> fail $ "Failed to decode context value for '" <> key <> "': " <> show v
 
--- | What one action moved, folded in by the registrar at the period roll.
+-- | What one action moved, folded in by the registrar at a period roll.
 template PeriodFlow
   with
     vaultId : Text
@@ -46,6 +46,21 @@ template PeriodFlow
     sharesDelta : Decimal
   where
     signatory vaultRegistrar
+
+    choice PeriodFlow_Merge : ContractId PeriodFlow
+      -- ^ Fold other flows of the vault into this one, so a roll takes few however busy the period.
+      with
+        flowCids : [ContractId PeriodFlow]
+      controller vaultRegistrar
+      do
+        flows <- forA flowCids $ \cid -> do
+          flow <- fetch cid
+          require' ("flow.vaultId", flow.vaultId) isEqualR ("vaultId", vaultId)
+          archive cid
+          pure flow
+        create this with
+          assetsDelta = assetsDelta + sum (map (.assetsDelta) flows)
+          sharesDelta = sharesDelta + sum (map (.sharesDelta) flows)
 
 -- | A record of one action, kept for the parties who took it.
 template VaultEvent
@@ -62,6 +77,13 @@ template VaultEvent
     signatory vaultRegistrar
     observer actors, receiver
 
+    choice VaultEvent_Archive : ()
+      -- ^ Drop the record, by a party it is kept for or by the registrar.
+      with
+        actor : Party
+      controller actor
+      do require' ("actor", actor) isMemberR ("record keepers", vaultRegistrar :: receiver :: actors)
+
 data VaultAction = Deposited | Minted | Withdrew | Redeemed
   deriving (Eq, Show, Serializable)
 
@@ -73,7 +95,7 @@ template ClosedPeriod
     signatory vault.vaultRegistrar, vault.custodian
 
     choice ClosedPeriod_Open : ContractId ReferenceVault
-      -- ^ Open the next period, folding in the closed one's flows and measuring the pool.
+      -- ^ Open the next period, folding in the flows not yet counted and measuring the pool.
       with
         flowCids : [ContractId PeriodFlow]
         poolHoldingCids : [ContractId V2.Holding]
@@ -85,7 +107,6 @@ template ClosedPeriod
         flows <- forA flowCids $ \cid -> do
           flow <- fetch cid
           require' ("flow.vaultId", flow.vaultId) isEqualR ("vaultId", vault.vaultId)
-          require' ("flow.periodStart", flow.periodStart) isEqualR ("rateValidFrom", vault.rateValidFrom)
           archive cid
           pure flow
         assets <- sumPool vault poolHoldingCids

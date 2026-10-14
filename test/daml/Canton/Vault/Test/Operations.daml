@@ -217,3 +217,26 @@ reopenRestoresTheVault = script do
   rolled <- rollPeriod f reopened
   Some vault <- queryContractId f.registrar rolled
   vault.totalShares === first.shares + second.shares
+
+
+-- | A record goes when a party it is kept for, or the registrar, drops it.
+recordKeepersDropRecords : Script ()
+recordKeepersDropRecords = script do
+  f <- setupVault
+  _ <- deposit f f.vaultTemplateCid f.alice 100.0
+  _ <- deposit f f.vaultTemplateCid f.alice 50.0
+  [mine, theirs] <- map fst <$> query @VaultEvent f.alice
+  submit f.alice (exerciseCmd mine VaultEvent_Archive with actor = f.alice)
+  submit f.registrar (exerciseCmd theirs VaultEvent_Archive with actor = f.registrar)
+  query @VaultEvent f.alice >>= (=== []) . map snd
+
+-- | A party shown a record cannot drop it.
+strangerCannotDropARecord : Script ()
+strangerCannotDropARecord = script do
+  f <- setupVault
+  _ <- deposit f f.vaultTemplateCid f.alice 100.0
+  [record] <- map fst <$> query @VaultEvent f.alice
+  carol <- allocateParty "carol"
+  Some shown <- queryDisclosure f.registrar record
+  submitMustFail (actAs carol <> discloseMany [shown]) do
+    exerciseCmd record VaultEvent_Archive with actor = carol
