@@ -1,7 +1,8 @@
--- | What the queued vaults share: pinned factories, allocation checks, and the vault's own allocations.
+-- | What the queued vaults share: pinned factories, allocation checks, struck prices and reports.
 module Canton.Vault.Reference.Queue where
 
-import DA.List (unique)
+import DA.Foldable (forA_)
+import DA.List (dedup, unique)
 import DA.TextMap qualified as TextMap
 import DA.Time (RelTime, addRelTime)
 
@@ -87,10 +88,79 @@ allocateSides factories extraArgs settlement admin authorizer actors inputHoldin
     V2.AllocationInstructionResult_Completed with allocationCid -> pure allocationCid
     _ -> fail "the vault's own allocation did not complete"
 
-getAllocations : Text -> ChoiceContext -> Update [ContractId V2.Allocation]
-getAllocations key context = case TextMap.lookup key context.values of
+-- | The contract ids listed under the key in a choice context.
+getContractIds : Text -> ChoiceContext -> Update [ContractId t]
+getContractIds key context = case TextMap.lookup key context.values of
   Some (AV_List cids) -> forA cids $ \v -> case v of
     AV_ContractId cid -> pure (fromAnyContractId cid)
-    _ -> fail $ "Failed to decode an allocation id under '" <> key <> "': " <> show v
+    _ -> fail $ "Failed to decode a contract id under '" <> key <> "': " <> show v
   None -> pure []
   v -> fail $ "Failed to decode context value for '" <> key <> "': " <> show v
+
+-- | The price struck when a period opened, kept so requests from the period before can still be filled at it.
+template PeriodPrice
+  with
+    vaultId : Text
+    vaultRegistrar : Party
+    executors : [Party]
+    epoch : Int
+      -- ^ The period this price opened.
+    totalShares : Decimal
+    totalAssets : Decimal
+  where
+    signatory vaultRegistrar
+    observer executors
+
+-- | One queued request's outcome, as reported to its requester and receiver.
+data QueuedEvent = QueuedEvent with
+    vaultId : Text
+    requester : Party
+    receiver : Party
+    label : Text
+    requestId : Int
+      -- ^ The period the request was made in.
+    requested : Decimal
+      -- ^ The underlying deposited, or the shares redeemed.
+    outcome : Outcome
+  deriving (Eq, Show, Serializable)
+
+data Outcome
+  = Fulfilled with
+      received : Decimal
+        -- ^ The shares issued, or the underlying paid.
+  | Rejected with
+      reason : Text
+        -- ^ Why the request could not settle.
+  deriving (Eq, Show, Serializable)
+
+-- | Reports queued requests' outcomes in the transaction they happen in, as the token standard's `EventLog` does.
+-- Created and archived within that transaction, so nothing stays on the ledger.
+template QueueLog
+  with
+    vaultRegistrar : Party
+  where
+    signatory vaultRegistrar
+
+    nonconsuming choice QueueLog_Report : ()
+      -- ^ Show the event to its observers.
+      with
+        event : QueuedEvent
+        observers : [Party]
+      observer observers
+      controller vaultRegistrar
+      do pure ()
+
+reportQueued : Party -> [QueuedEvent] -> Update ()
+reportQueued registrar events = do
+  log <- create QueueLog with vaultRegistrar = registrar
+  forA_ events $ \event -> exercise log QueueLog_Report with event; observers = dedup [event.requester, event.receiver]
+  archive log
+
+-- | Opening totals of the period after a request's: those stored for an earlier one, or the current ones.
+struckFor : Int -> Int -> (Decimal, Decimal) -> [PeriodPrice] -> Update (Decimal, Decimal)
+struckFor requestEpoch currentEpoch current prices
+  | requestEpoch + 1 == currentEpoch = pure current
+  | otherwise = case [p | p <- prices, p.epoch == requestEpoch + 1] of
+      p :: _ -> pure (p.totalShares, p.totalAssets)
+      [] -> fail ("no price struck for period " <> show (requestEpoch + 1))
+

@@ -18,27 +18,24 @@ import Canton.Vault.V1
 -- least the vault's `settlementDeadlineWindow` and carry the settlement id
 -- `requestSettlementId`; the escrow's leg carries the leg id `requestLegId`, and
 -- the authorization has no legs. Each is issued by its instrument's registry,
--- signed by the registry's admin. The executors fulfil a request at any time
--- before its deadline, at the rate when they strike it, settling both legs; how
--- they do so is the vault's own.
+-- signed by the registry's admin. The executors fulfil a request before its
+-- deadline, settling both legs, at the rate its `RequestId` says; how they do so
+-- is the vault's own.
 interface VaultAsyncDeposit requires Vault where
   viewtype AsyncView
 
-  -- | Units of the underlying the party has escrowed for the vault's requests
-  -- under the request id, in the allocations named in `extraArgs` that the
-  -- underlying's registry issued. A vault cannot look allocations up, so one not
-  -- named does not count, and one named twice counts once. An escrow counts until
-  -- it is settled, cancelled or withdrawn; naming one that is gone fails.
+  -- | Units of the underlying the party has queued under the request id, as the
+  -- contracts named in `extraArgs` show. A vault cannot look them up, so one not
+  -- named does not count, and one named twice counts once; naming one that is
+  -- gone fails. A request counts until it is fulfilled, rejected or expires.
   pendingDepositRequest : RequestId -> Party -> ExtraArgs -> Update Decimal
 
   vault_requestDepositImpl : ContractId VaultAsyncDeposit -> Vault_RequestDeposit -> Update RequestId
   vault_requestDepositExtraObservers : Vault_RequestDeposit -> [Party]
 
   nonconsuming choice Vault_RequestDeposit : RequestId
-    -- ^ Queue a deposit of `assets`, for shares issued to `receiver` at the rate
-    -- the executors strike when they fulfil the request.
-    --
-    -- Takes no slippage limit: the rate is not known until fulfilment.
+    -- ^ Queue a deposit of `assets`, for shares issued to `receiver` at a rate
+    -- struck after the request is made, so not known when it is.
     with
       label : Text
         -- ^ The requester's label for the request, in its leg ids. Requests that
@@ -47,6 +44,9 @@ interface VaultAsyncDeposit requires Vault where
         -- ^ Units of the underlying to deposit.
       receiver : Party
         -- ^ The party to be issued the shares.
+      minSharesOut : Optional Decimal
+        -- ^ The fewest shares the requester accepts; a fulfilment that would
+        -- issue fewer fails rather than fill.
       underlyingAllocation : ContractId Allocation
         -- ^ The funded escrow, sending `assets` of the underlying to the
         -- custodian. Committed until a deadline at least the vault's window away.

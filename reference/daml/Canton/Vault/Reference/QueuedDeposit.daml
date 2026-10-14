@@ -20,8 +20,8 @@ import Splice.Api.Token.AllocationInstructionV2 qualified as V2
 import Splice.Api.Token.TransferInstructionV2 qualified as V2
 import Splice.TokenStandard.Utils
 
-underlyingAllocationsKey : Text
-underlyingAllocationsKey = "cantonVaultV1/underlyingAllocations"
+depositRequestsKey : Text
+depositRequestsKey = "cantonVaultV1/depositRequests"
 
 template ReferenceQueuedDepositVault
   with
@@ -39,6 +39,8 @@ template ReferenceQueuedDepositVault
     redeemFeeBps : Int
     rateValidFrom : Time
     rateValidUntil : Time
+    epoch : Int
+      -- ^ The current period's number, counting rolls; a request made in it carries it as its id.
     executors : [Party]
       -- ^ The parties who fulfil deposit requests together; any one of them may drop a request.
     settlementDeadlineWindow : RelTime
@@ -95,19 +97,15 @@ template ReferenceQueuedDepositVault
         settlementDeadlineWindow
         meta = emptyMetadata
 
-      -- Every request has id 0, so a party's pending amount is all their escrows together.
+      -- A request's id is the period it was made in.
       pendingDepositRequest requestId party extraArgs = do
-        allocationCids <- dedup <$> getAllocations underlyingAllocationsKey extraArgs.context
-        amounts <- forA allocationCids $ \cid -> do
-          allocation <- fetch cid
-          let escrow = view allocation
-          pure $ if requestId == 0 && signedBy underlyingInstrument.admin allocation
-                      && escrow.settlement == settlementFor this
-                      && escrow.allocation.authorizer.owner == Some party
-            then sum [ leg.amount | leg <- escrow.allocation.transferLegSides
-                     , leg.side == V2.SenderSide, leg.otherside == basicAccount custodian
-                     , leg.instrumentId == underlyingInstrument.id ]
-            else 0.0
+        now <- getTime
+        requestCids : [ContractId QueuedDepositRequest] <- dedup <$> getContractIds depositRequestsKey extraArgs.context
+        amounts <- forA requestCids $ \cid -> do
+          r <- fetch cid
+          pure $ if r.vaultRegistrar == vaultRegistrar && r.vaultId == vaultId && r.requester == party
+                      && r.epoch == requestId && now < r.expiresAt
+            then r.assets else 0.0
         pure (sum amounts)
 
       vault_requestDepositExtraObservers _arg = []
@@ -152,14 +150,19 @@ template ReferenceQueuedDepositVault
           underlyingAllocation = arg.underlyingAllocation
           shareAllocation = arg.shareAllocation
           expiresAt = escrowDeadline
-        pure 0
+          epoch
+          minSharesOut = arg.minSharesOut
+        pure epoch
 
     nonconsuming choice ReferenceQueuedDepositVault_Fulfil : ()
-      -- ^ Fulfil requests at the current rate, in one transaction; one that fails fails them all.
+      -- ^ Fulfil requests made in earlier periods, in one transaction; one that fails fails them all. Each
+      -- fills at the price struck when the period after its own opened, or the current one if fewer shares.
       with
         requestCids : [ContractId QueuedDepositRequest]
           -- ^ The requests to fulfil, each binding its escrow to its receiver's authorization. Each
           -- adds a leg to each registry's batch; every registry accepts batches of up to 25 legs.
+        priceCids : [ContractId PeriodPrice]
+          -- ^ The prices struck in periods before the current one, for requests filled late.
         underlyingExtraArgs : ExtraArgs
           -- ^ The underlying registry's context for allocating and settling.
         shareExtraArgs : ExtraArgs
@@ -176,15 +179,24 @@ template ReferenceQueuedDepositVault
           pure request
         requireDistinct [(r.requester, r.label) | r <- requests]
           (concat [[r.underlyingAllocation, r.shareAllocation] | r <- requests])
-        assets' <- currentAssets (instantOf' this)
+        forA_ requests $ \r -> require "a request is filled after the period it was made in" (r.epoch < epoch)
+        prices <- forA priceCids $ \cid -> do
+          price <- fetch cid
+          require' ("price.vaultRegistrar", price.vaultRegistrar) isEqualR ("vaultRegistrar", vaultRegistrar)
+          require' ("price.vaultId", price.vaultId) isEqualR ("vaultId", vaultId)
+          pure price
         -- Each leg uses the account its allocation names, which may have a provider.
-        accounts <- forA requests $ \r -> do
+        priced <- forA requests $ \r -> do
           funded <- view <$> fetch r.underlyingAllocation
           receiving <- view <$> fetch r.shareAllocation
-          pure (funded.allocation.authorizer, receiving.allocation.authorizer)
+          (struckShares, struckAssets) <- struckFor r.epoch epoch (totalShares, totalAssets) prices
+          let net = deductFeeBps depositFeeBps r.assets
+              shares = min (assetsToShares struckShares struckAssets net) (assetsToShares totalShares totalAssets net)
+          case r.minSharesOut of
+            Some limit | shares < limit -> fail (vaultSlippageExceeded <> ": request " <> r.label)
+            _ -> pure ()
+          pure (r, funded.allocation.authorizer, receiving.allocation.authorizer, shares)
         let settlement = settlementFor this
-            priced = [ (r, from, to, assetsToShares totalShares assets' (deductFeeBps depositFeeBps r.assets))
-                     | (r, (from, to)) <- zip requests accounts ]
             underlyingLeg (r, from, _, _) = V2.TransferLeg with
               transferLegId = requestLegId r.requester r.label "underlying"
               sender = from
@@ -222,8 +234,7 @@ template ReferenceQueuedDepositVault
           extraArgs = shareExtraArgs
 
         recordFlow (instantOf' this) (sum (map (.assets) requests)) (sum [s | (_, _, _, s) <- priced])
-        forA_ priced $ \(r, _, _, s) ->
-          recordFulfilment this r.requester r.receiver r.label r.assets s
+        reportQueued vaultRegistrar [ eventOf r (Fulfilled with received = s) | (r, _, _, s) <- priced ]
 
     nonconsuming choice ReferenceQueuedDepositVault_Reject : ()
       -- ^ End requests that cannot settle, returning each escrow and recording why. A request that
@@ -236,17 +247,13 @@ template ReferenceQueuedDepositVault
           -- ^ The underlying registry's context for cancelling the escrows.
       controller executors
       do
-        forA_ requestCids $ \cid -> do
+        events <- forA requestCids $ \cid -> do
           request <- fetch cid
           require' ("request.vaultRegistrar", request.vaultRegistrar) isEqualR ("vaultRegistrar", vaultRegistrar)
           archive cid
           _ <- exercise request.underlyingAllocation V2.Allocation_Cancel with actors = executors; extraArgs = underlyingExtraArgs
-          create QueuedDepositRejection with
-            vaultId; vaultRegistrar; reason
-            requester = request.requester
-            receiver = request.receiver
-            label = request.label
-            assets = request.assets
+          pure (eventOf request (Rejected with reason))
+        reportQueued vaultRegistrar events
 
     choice ReferenceQueuedDepositVault_SetPriceLimits : ContractId ReferenceQueuedDepositVault
       -- ^ Change the price limits, which the custodian must agree to.
@@ -302,11 +309,7 @@ template ClosedQueuedPeriod
       do
         (shares, assets, now) <- rollTotals (instantOf' vault) flowCids poolHoldingCids validUntil
         requirePriceWithinLimits vault.priceLimits (instantOf' vault) shares assets
-        create vault with
-          totalShares = shares
-          totalAssets = assets
-          rateValidFrom = now
-          rateValidUntil = validUntil
+        openNext vault shares assets now validUntil
 
     choice ClosedQueuedPeriod_OpenBeyondLimits : ContractId ReferenceQueuedDepositVault
       -- ^ Open the next period at a price outside the vault's limits, on the custodian's word as well.
@@ -317,11 +320,7 @@ template ClosedQueuedPeriod
       controller vault.vaultRegistrar, vault.custodian
       do
         (shares, assets, now) <- rollTotals (instantOf' vault) flowCids poolHoldingCids validUntil
-        create vault with
-          totalShares = shares
-          totalAssets = assets
-          rateValidFrom = now
-          rateValidUntil = validUntil
+        openNext vault shares assets now validUntil
 
     choice ClosedQueuedPeriod_Reopen : ContractId ReferenceQueuedDepositVault
       -- ^ Undo the close when the next period cannot be opened, restoring the vault as it was.
@@ -344,6 +343,10 @@ template QueuedDepositRequest
       -- ^ The receiver's authorization to be issued shares.
     expiresAt : Time
       -- ^ The escrow's deadline, after which it cannot be fulfilled.
+    epoch : Int
+      -- ^ The period the request was made in, which is its id.
+    minSharesOut : Optional Decimal
+      -- ^ The fewest shares the requester accepts; fulfilment below it fails.
   where
     signatory vaultRegistrar
     observer requester, receiver, executors
@@ -357,51 +360,6 @@ template QueuedDepositRequest
         now <- getTime
         require "the requester or an executor drops a request, or the registrar once it has expired"
           (actor `elem` (requester :: executors) || actor == vaultRegistrar && now >= expiresAt)
-
--- | A record of one fulfilled deposit, kept for its requester and receiver.
-template QueuedDepositEvent
-  with
-    vaultId : Text
-    vaultRegistrar : Party
-    requester : Party
-    receiver : Party
-    label : Text
-    assets : Decimal
-    shares : Decimal
-      -- ^ The shares issued.
-    periodStart : Time
-  where
-    signatory vaultRegistrar
-    observer requester, receiver
-
-    choice QueuedDepositEvent_Archive : ()
-      -- ^ Drop the record, by a party it is kept for or by the registrar.
-      with
-        actor : Party
-      controller actor
-      do require' ("actor", actor) isMemberR ("record keepers", [vaultRegistrar, requester, receiver])
-
--- | A record of a deposit request the executors rejected, kept for its requester and receiver.
-template QueuedDepositRejection
-  with
-    vaultId : Text
-    vaultRegistrar : Party
-    requester : Party
-    receiver : Party
-    label : Text
-    assets : Decimal
-    reason : Text
-      -- ^ Why the request could not settle.
-  where
-    signatory vaultRegistrar
-    observer requester, receiver
-
-    choice QueuedDepositRejection_Archive : ()
-      -- ^ Drop the record, by a party it is kept for or by the registrar.
-      with
-        actor : Party
-      controller actor
-      do require' ("actor", actor) isMemberR ("record keepers", [vaultRegistrar, requester, receiver])
 
 -- | The same vault as an instant one, for everything but deposits.
 instantOf' : ReferenceQueuedDepositVault -> ReferenceVault
@@ -433,15 +391,30 @@ settlementFor v = V2.SettlementInfo with
   cid = None
   meta = emptyMetadata
 
-recordFulfilment : ReferenceQueuedDepositVault -> Party -> Party -> Text -> Decimal -> Decimal -> Update ()
-recordFulfilment v requester receiver label assets shares = do
-  _ <- create QueuedDepositEvent with
+-- | Opens the next period at the totals measured, keeping the price it strikes.
+openNext : ReferenceQueuedDepositVault -> Decimal -> Decimal -> Time -> Time -> Update (ContractId ReferenceQueuedDepositVault)
+openNext v shares assets now validUntil = do
+  let next = v.epoch + 1
+  _ <- create PeriodPrice with
     vaultId = v.vaultId
     vaultRegistrar = v.vaultRegistrar
-    requester
-    receiver
-    label
-    assets
-    shares
-    periodStart = v.rateValidFrom
-  pure ()
+    executors = v.executors
+    epoch = next
+    totalShares = shares
+    totalAssets = assets
+  create v with
+    totalShares = shares
+    totalAssets = assets
+    rateValidFrom = now
+    rateValidUntil = validUntil
+    epoch = next
+
+eventOf : QueuedDepositRequest -> Outcome -> QueuedEvent
+eventOf r outcome = QueuedEvent with
+  vaultId = r.vaultId
+  requester = r.requester
+  receiver = r.receiver
+  label = r.label
+  requestId = r.epoch
+  requested = r.assets
+  outcome

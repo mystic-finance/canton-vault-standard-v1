@@ -112,7 +112,8 @@ vaultSlippageExceeded = "VAULT_SLIPPAGE_EXCEEDED"
 --
 -- The vault chooses its ids. `0` means requests are told apart only by their
 -- requester, each fulfilled at the rate when it is struck. Requests sharing any
--- other id are fulfilled together, at one rate.
+-- other id are priced together: at one rate struck after the last of them was
+-- made, or a worse rate current when one is filled late.
 type RequestId = Int
 
 -- | What a wallet needs to decide whether to queue a request with a vault.
