@@ -138,6 +138,7 @@ template ReferenceQueuedDepositVault
         requireCommittedFor "share authorization" settlementDeadlineWindow receiving.allocation
         escrowDeadline <- deadlineOf funded.allocation
         authorizationDeadline <- deadlineOf receiving.allocation
+        require "the share authorization lasts as long as the escrow" (authorizationDeadline >= escrowDeadline)
 
         _ <- create QueuedDepositRequest with
           vaultId; vaultRegistrar; executors
@@ -147,11 +148,11 @@ template ReferenceQueuedDepositVault
           assets = arg.assets
           underlyingAllocation = arg.underlyingAllocation
           shareAllocation = arg.shareAllocation
-          expiresAt = min escrowDeadline authorizationDeadline
+          expiresAt = escrowDeadline
         pure 0
 
     nonconsuming choice ReferenceQueuedDepositVault_Fulfil : ()
-      -- ^ Fulfil requests at the current rate, in one transaction.
+      -- ^ Fulfil requests at the current rate, in one transaction; one that fails fails them all.
       with
         requestCids : [ContractId QueuedDepositRequest]
           -- ^ The requests to fulfil, each binding its escrow to its receiver's authorization. Each
@@ -220,6 +221,29 @@ template ReferenceQueuedDepositVault
         recordFlow (instantOf' this) (sum (map (.assets) requests)) (sum [s | (_, _, _, s) <- priced])
         forA_ priced $ \(r, _, _, s) ->
           recordFulfilment this r.requester r.receiver r.label r.assets s
+
+    nonconsuming choice ReferenceQueuedDepositVault_Reject : ()
+      -- ^ End requests that cannot settle, returning each escrow and recording why. A request that
+      -- fails fails its whole batch, so executors dry-run a batch, settle the rest and reject it.
+      with
+        requestCids : [ContractId QueuedDepositRequest]
+        reason : Text
+          -- ^ Why the requests cannot settle, kept on each rejection record.
+        underlyingExtraArgs : ExtraArgs
+          -- ^ The underlying registry's context for cancelling the escrows.
+      controller executors
+      do
+        forA_ requestCids $ \cid -> do
+          request <- fetch cid
+          require' ("request.vaultRegistrar", request.vaultRegistrar) isEqualR ("vaultRegistrar", vaultRegistrar)
+          archive cid
+          _ <- exercise request.underlyingAllocation V2.Allocation_Cancel with actors = executors; extraArgs = underlyingExtraArgs
+          create QueuedDepositRejection with
+            vaultId; vaultRegistrar; reason
+            requester = request.requester
+            receiver = request.receiver
+            label = request.label
+            assets = request.assets
 
     choice ReferenceQueuedDepositVault_SetPaused : ContractId ReferenceQueuedDepositVault
       -- ^ Pause or resume requests and fulfilments.
@@ -293,7 +317,7 @@ template QueuedDepositRequest
     shareAllocation : ContractId V2.Allocation
       -- ^ The receiver's authorization to be issued shares.
     expiresAt : Time
-      -- ^ The earlier of its allocations' deadlines, after which it cannot be fulfilled.
+      -- ^ The escrow's deadline, after which it cannot be fulfilled.
   where
     signatory vaultRegistrar
     observer requester, receiver, executors
@@ -325,6 +349,28 @@ template QueuedDepositEvent
     observer requester, receiver
 
     choice QueuedDepositEvent_Archive : ()
+      -- ^ Drop the record, by a party it is kept for or by the registrar.
+      with
+        actor : Party
+      controller actor
+      do require' ("actor", actor) isMemberR ("record keepers", [vaultRegistrar, requester, receiver])
+
+-- | A record of a deposit request the executors rejected, kept for its requester and receiver.
+template QueuedDepositRejection
+  with
+    vaultId : Text
+    vaultRegistrar : Party
+    requester : Party
+    receiver : Party
+    label : Text
+    assets : Decimal
+    reason : Text
+      -- ^ Why the request could not settle.
+  where
+    signatory vaultRegistrar
+    observer requester, receiver
+
+    choice QueuedDepositRejection_Archive : ()
       -- ^ Drop the record, by a party it is kept for or by the registrar.
       with
         actor : Party

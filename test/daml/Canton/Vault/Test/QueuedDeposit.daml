@@ -353,14 +353,15 @@ fulfilmentByAnotherPartyIsRefused = script do
 fulfilmentIsAtomic : Script ()
 fulfilmentIsAtomic = script do
   env <- setup
-  funded <- fund env env.alice "r1" ((standardEscrow env 100.0) with deadline = Some (days 3))
-  receiving <- authorize env env.alice (settlementOf env)
-  vd <- vaultDisclosure env
-  _ <- submit (actAs env.alice <> discloseMany [vd]) (requestCmd env env.alice "r1" 100.0 funded receiving)
-  req <- requestOf env env.alice "r1"
-  passTime (window + hours 2)
-  next <- closeQueued env >>= openQueued env
-  failsWith "deadline" =<< fulfilAs next env.venue [req]
+  (_, req) <- request env env.alice "r1" 100.0
+  doomed <- submit env.registrar (createCmd TokenRules with admin = env.registrar)
+  vaultCid <- submit (actAs env.registrar <> discloseMany [env.usd.disclosure, env.shares.disclosure]) do
+    exerciseCmd env.vaultCid Q.ReferenceQueuedDepositVault_SetFactories with
+      transferFactory = toInterfaceContractId env.usd.rulesCid
+      underlying = factoriesOf env.usd
+      shares = (factoriesOf env.shares) with settlementFactory = toInterfaceContractId doomed
+  submit env.registrar (archiveCmd doomed)
+  failsWith "NotActive" =<< fulfilAs (env with vaultCid) env.venue [req]
   tokens env (usdId env) env.custodian >>= (=== 0.0)
   tokens env (sharesId env) env.alice >>= (=== 0.0)
 
@@ -1092,14 +1093,115 @@ strangerCannotDropAFulfilmentRecord = script do
   submitMustFail (actAs carol <> discloseMany [shown]) do
     exerciseCmd record Q.QueuedDepositEvent_Archive with actor = carol
 
--- | A request expires when the first of its allocations lapses, here the authorization.
-requestExpiresWithItsFirstAllocation : Script ()
-requestExpiresWithItsFirstAllocation = script do
+-- | A request expires with its escrow, though its authorization lasts longer.
+requestExpiresWithItsEscrow : Script ()
+requestExpiresWithItsEscrow = script do
   env <- setup
-  funded <- fund env env.alice "r1" ((standardEscrow env 10.0) with deadline = Some (days 3))
-  receiving <- authorize env env.alice (settlementOf env)
+  now <- getTime
+  funded <- fund env env.alice "r1" (standardEscrow env 10.0)
+  receiving <- authorizeWith env env.alice (settlementOf env) (\spec -> spec with
+    settlementDeadline = Some (addRelTime now (days 3)))
   vd <- vaultDisclosure env
   _ <- submit (actAs env.alice <> discloseMany [vd]) (requestCmd env env.alice "r1" 10.0 funded receiving)
   req <- requestOf env env.alice "r1"
   passTime (window + hours 2)
   submit env.registrar (exerciseCmd req.requestCid Q.QueuedDepositRequest_Archive with actor = env.registrar)
+
+-- | An authorization that lapses before the escrow would leave the request stuck, so it is refused.
+shareAuthorizationShorterThanTheEscrowIsRefused : Script ()
+shareAuthorizationShorterThanTheEscrowIsRefused = script do
+  env <- setup
+  funded <- fund env env.alice "r1" ((standardEscrow env 10.0) with deadline = Some (days 3))
+  receiving <- authorize env env.alice (settlementOf env)
+  vd <- vaultDisclosure env
+  failsWith "the share authorization lasts as long as the escrow" =<<
+    trySubmit (actAs env.alice <> discloseMany [vd]) (requestCmd env env.alice "r1" 10.0 funded receiving)
+
+-- Rejecting
+-------------
+
+rejectAs : Env -> Party -> [Req] -> Text -> Script (Either SubmitError ())
+rejectAs env party requests reason = do
+  vd <- vaultDisclosure env
+  locked <- lockedTokens env.usd (map (.underlyingAllocation) requests)
+  trySubmit (actAs party <> discloseMany ([vd, env.usd.disclosure] <> locked)) do
+    exerciseCmd env.vaultCid Q.ReferenceQueuedDepositVault_Reject with
+      requestCids = map (.requestCid) requests
+      reason
+      underlyingExtraArgs = tokenArgs env.usd
+
+unlockedUsd : Env -> Party -> Script Decimal
+unlockedUsd env party = do
+  held <- query @Token party
+  pure (sum [h.holding.amount | (_, h) <- held, h.holding.instrumentId == usdId env, h.holding.lock == None])
+
+-- | A rejected request returns its escrow and leaves a record of why.
+rejectReturnsTheEscrow : Script ()
+rejectReturnsTheEscrow = script do
+  env <- setup
+  (_, req) <- request env env.alice "r1" 100.0
+  Right () <- rejectAs env env.venue [req] "receiver blocked"
+  unlockedUsd env env.alice >>= (=== 100.0)
+  query @Q.QueuedDepositRequest env.alice >>= (=== []) . map snd
+  rejections <- map snd <$> query @Q.QueuedDepositRejection env.alice
+  map (\r -> (r.label, r.assets, r.reason)) rejections === [("r1", 100.0, "receiver blocked")]
+
+rejectionByAnotherPartyIsRefused : Script ()
+rejectionByAnotherPartyIsRefused = script do
+  env <- setup
+  (_, req) <- request env env.alice "r1" 100.0
+  failsWith "requires authorizers" =<< rejectAs env env.alice [req] "changed my mind"
+
+-- | Only the registrar's request records are rejected, so an executor cannot sign a rejection in its name.
+rejectRefusesARecordTheRegistrarDidNotSign : Script ()
+rejectRefusesARecordTheRegistrarDidNotSign = script do
+  env <- setup
+  (_, req) <- request env env.alice "r1" 100.0
+  forgedAt <- getTime
+  forged <- submit env.venue do
+    createCmd Q.QueuedDepositRequest with
+      vaultId = env.vaultId; vaultRegistrar = env.venue; executors = [env.venue]
+      requester = env.alice; receiver = env.alice; label = "r1"; assets = 100.0
+      underlyingAllocation = req.underlyingAllocation; shareAllocation = req.shareAllocation
+      expiresAt = forgedAt
+  failsWith "request.vaultRegistrar" =<< rejectAs env env.venue [req with requestCid = forged] "forged"
+  unlockedUsd env env.alice >>= (=== 0.0)
+
+-- | One request that cannot settle fails its batch; the executors settle the rest and reject it.
+aPoisonedRequestIsSplitOffAndRejected : Script ()
+aPoisonedRequestIsSplitOffAndRejected = script do
+  env <- setup
+  (_, a) <- request env env.alice "a" 10.0
+  (_, b) <- request env env.alice "b" 20.0
+  (_, c) <- request env env.alice "c" 30.0
+  _ <- submit (actAs env.venue <> discloseMany [env.shares.disclosure]) do
+    exerciseCmd b.shareAllocation V2.Allocation_Cancel with actors = [env.venue]; extraArgs = tokenArgs env.shares
+  Left _ <- fulfilAs env env.venue [a, b, c]
+  Right () <- fulfilAs env env.venue [a, c]
+  Right () <- rejectAs env env.venue [b] "share authorization withdrawn"
+  tokens env (sharesId env) env.alice >>= (=== 40.0)
+  unlockedUsd env env.alice >>= (=== 20.0)
+
+-- | A rejection record goes when a party it is kept for, or the registrar, drops it.
+rejectionRecordsCanBeDropped : Script ()
+rejectionRecordsCanBeDropped = script do
+  env <- setup
+  (_, a) <- request env env.alice "r1" 10.0
+  (_, b) <- request env env.alice "r2" 20.0
+  Right () <- rejectAs env env.venue [a, b] "blocked"
+  [mine, theirs] <- map fst <$> query @Q.QueuedDepositRejection env.alice
+  submit env.alice (exerciseCmd mine Q.QueuedDepositRejection_Archive with actor = env.alice)
+  submit env.registrar (exerciseCmd theirs Q.QueuedDepositRejection_Archive with actor = env.registrar)
+  query @Q.QueuedDepositRejection env.alice >>= (=== []) . map snd
+
+-- | A party shown a rejection record cannot drop it.
+strangerCannotDropARejectionRecord : Script ()
+strangerCannotDropARejectionRecord = script do
+  env <- setup
+  (_, a) <- request env env.alice "r1" 10.0
+  Right () <- rejectAs env env.venue [a] "blocked"
+  [record] <- map fst <$> query @Q.QueuedDepositRejection env.alice
+  carol <- allocateParty "carol"
+  Some shown <- queryDisclosure env.registrar record
+  submitMustFail (actAs carol <> discloseMany [shown]) do
+    exerciseCmd record Q.QueuedDepositRejection_Archive with actor = carol
