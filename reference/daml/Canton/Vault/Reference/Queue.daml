@@ -43,6 +43,12 @@ requireDistinct labels allocations = do
   require "each request in the batch has its own label" (unique labels)
   require "each request in the batch has its own allocations" (unique allocations)
 
+-- | The allocation's settlement deadline, which `requireCommittedFor` has checked it names.
+deadlineOf : V2.AllocationSpecification -> Update Time
+deadlineOf allocation = case allocation.settlementDeadline of
+  Some deadline -> pure deadline
+  None -> fail "allocation needs a settlement deadline"
+
 requireFactoriesOf : Party -> Party -> Factories -> Update ()
 requireFactoriesOf actor admin factories = do
   allocationView <- exercise factories.allocationFactory V2.AllocationFactory_PublicFetch with actors = [actor]
