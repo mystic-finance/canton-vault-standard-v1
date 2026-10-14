@@ -28,6 +28,25 @@ The choices are nonconsuming, so concurrent deposits do not contend on the vault
 contract. Each action records what it moved, and the registrar folds those in
 when it opens the next rate period.
 
+## Queued requests
+
+A queued-deposit vault takes a request instead of settling at once. The
+requester escrows the underlying as a committed allocation, and the receiver
+authorizes being issued shares, both under the vault's settlement id
+(`requestSettlementId`). The vault records the pair as a registrar-signed
+request. Executors later fulfil requests in batches, at the rate then current,
+settling both registries' legs in one transaction.
+
+A batch settles whole or not at all, so one request that cannot settle, such as
+a receiver its registry has blocked, fails the rest. Executors dry-run a batch,
+settle the requests that pass, and `Reject` the one that fails, which returns
+its escrow and records why. Every registry accepts batches of up to 25 legs, one
+per request per registry; Canton Coin accepts 100.
+
+Requests expire with their escrow. The registrar folds period flows together as
+they accumulate (`PeriodFlow_Merge`), and drops expired requests and old records,
+so neither the roll nor the ledger grows with activity.
+
 ## Trust and limits
 
 - The registrar is trusted. It strikes the price at each roll from the pool it
@@ -53,7 +72,8 @@ when it opens the next rate period.
 | | |
 | --- | --- |
 | `api/canton-vault-v1/` | `canton-vault-v1` — the `Vault` interface and its types, which every vault implements |
-| `reference/` | `canton-vault-reference-v1` — a vault implementing it |
+| `api/canton-vault-async-deposit-v1/` | `canton-vault-async-deposit-v1` — `VaultAsyncDeposit`, for vaults that queue deposits |
+| `reference/` | `canton-vault-reference-v1` — the instant vault, and a queued-deposit vault |
 | `test/` | `canton-vault-standard-test` — Daml Script tests and a mock underlying registry |
 | `dependencies/` | Vendored Splice DARs; see `dependencies/VERSIONS.md` |
 
