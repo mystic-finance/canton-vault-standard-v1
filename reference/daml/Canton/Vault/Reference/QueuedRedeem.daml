@@ -52,6 +52,8 @@ template ReferenceQueuedRedeemVault
       -- ^ The underlying registry's factories, the only ones fulfilment uses for it.
     shareFactories : Factories
       -- ^ The share registry's factories, the only ones fulfilment uses for it.
+    priceLimits : PriceLimits
+      -- ^ How far a roll may move the price on the registrar's word alone.
   where
     signatory vaultRegistrar, custodian
     observer executors
@@ -62,6 +64,7 @@ template ReferenceQueuedRedeemVault
         && depositFeeBps >= 0 && depositFeeBps <= 10000
         && redeemFeeBps >= 0 && redeemFeeBps <= 10000
         && executors /= []
+        && validPriceLimits priceLimits
 
     -- Pricing, deposits and the period accounting are the instant vault's.
     interface instance Vault for ReferenceQueuedRedeemVault where
@@ -248,6 +251,13 @@ template ReferenceQueuedRedeemVault
             label = request.label
             shares = request.shares
 
+    choice ReferenceQueuedRedeemVault_SetPriceLimits : ContractId ReferenceQueuedRedeemVault
+      -- ^ Change the price limits, which the custodian must agree to.
+      with
+        limits : PriceLimits
+      controller vaultRegistrar, custodian
+      do create this with priceLimits = limits
+
     choice ReferenceQueuedRedeemVault_SetPaused : ContractId ReferenceQueuedRedeemVault
       -- ^ Pause or resume deposits and mints.
       with
@@ -292,6 +302,22 @@ template ClosedQueuedRedeemPeriod
         poolHoldingCids : [ContractId V2.Holding]
         validUntil : Time
       controller vault.vaultRegistrar
+      do
+        (shares, assets, now) <- rollTotals (instantOf' vault) flowCids poolHoldingCids validUntil
+        requirePriceWithinLimits vault.priceLimits (instantOf' vault) shares assets
+        create vault with
+          totalShares = shares
+          totalAssets = assets
+          rateValidFrom = now
+          rateValidUntil = validUntil
+
+    choice ClosedQueuedRedeemPeriod_OpenBeyondLimits : ContractId ReferenceQueuedRedeemVault
+      -- ^ Open the next period at a price outside the vault's limits, on the custodian's word as well.
+      with
+        flowCids : [ContractId PeriodFlow]
+        poolHoldingCids : [ContractId V2.Holding]
+        validUntil : Time
+      controller vault.vaultRegistrar, vault.custodian
       do
         (shares, assets, now) <- rollTotals (instantOf' vault) flowCids poolHoldingCids validUntil
         create vault with
@@ -398,6 +424,7 @@ instantOf' v = ReferenceVault with
   depositCap = v.depositCap
   paused = v.paused
   underlyingTransferFactory = v.underlyingTransferFactory
+  priceLimits = v.priceLimits
 
 instantOf : ReferenceQueuedRedeemVault -> Vault
 instantOf = toInterface . instantOf'

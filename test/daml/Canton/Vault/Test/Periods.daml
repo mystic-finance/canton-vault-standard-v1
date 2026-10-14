@@ -326,6 +326,7 @@ feesOutsideRangeAreRejected = script do
         depositCap = None
         paused = False
         underlyingTransferFactory = f.registryCid
+        priceLimits = wideLimits
   _ <- submitMulti [f.registrar, f.custodian] [] (mk 100)
   submitMultiMustFail [f.registrar, f.custodian] [] (mk (-100))
   submitMultiMustFail [f.registrar, f.custodian] [] (mk 10001)
@@ -352,6 +353,7 @@ shareInstrumentIsTheVaults = script do
         depositCap = None
         paused = False
         underlyingTransferFactory = f.registryCid
+        priceLimits = wideLimits
   _ <- submitMulti [f.registrar, f.custodian] [] (mk (f.shares with id = "second"))
   -- Another vault's shares.
   submitMultiMustFail [f.registrar, f.custodian] [] (mk f.shares)

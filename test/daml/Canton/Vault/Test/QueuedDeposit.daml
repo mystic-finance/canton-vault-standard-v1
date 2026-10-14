@@ -75,6 +75,7 @@ setup = do
       underlyingTransferFactory = toInterfaceContractId usd.rulesCid
       underlyingFactories = factoriesOf usd
       shareFactories = factoriesOf shares
+      priceLimits = generousLimits
   pure Env with usd; shares; registrar; custodian; venue; alice; vaultCid; vaultId
 
 usdOf : Env -> Party -> Decimal -> Script (ContractId V2.Holding)

@@ -85,6 +85,7 @@ setupWithFee redeemFeeBps = do
       underlyingTransferFactory = toInterfaceContractId usd.rulesCid
       underlyingFactories = factoriesOf usd
       shareFactories = factoriesOf shares
+      priceLimits = generousLimits
   let env = Env with usd; shares; registrar; custodian; venue; alice; vaultCid; vaultId
   _ <- holdingOf custodian usd.admin (usdId env) 60.0
   _ <- holdingOf custodian usd.admin (usdId env) 40.0
