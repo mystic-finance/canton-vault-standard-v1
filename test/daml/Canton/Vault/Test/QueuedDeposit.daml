@@ -847,11 +847,13 @@ executorCannotForgeARequest = script do
   (_, req) <- request env env.alice "r1" 100.0
   bob <- allocateParty "bob"
   bobs <- authorize env bob (settlementOf env)
+  forgedAt <- getTime
   submitMustFail env.venue do
     createCmd Q.QueuedDepositRequest with
       vaultId = env.vaultId; vaultRegistrar = env.registrar; executors = [env.venue]
       requester = env.alice; receiver = bob; label = "r1"; assets = 100.0
       underlyingAllocation = req.underlyingAllocation; shareAllocation = bobs
+      expiresAt = forgedAt
 
 -- | A copy of the vault under another id and its own custodian, with the same registrar and executors.
 anotherVault : Env -> Text -> Script Env
@@ -897,11 +899,13 @@ executorCannotSignARequestAsRegistrar = script do
   env <- setup
   (_, req) <- request env env.alice "r1" 100.0
   venues <- authorize env env.venue (settlementOf env)
+  forgedAt <- getTime
   forged <- submit env.venue do
     createCmd Q.QueuedDepositRequest with
       vaultId = env.vaultId; vaultRegistrar = env.venue; executors = [env.venue]
       requester = env.alice; receiver = env.venue; label = "r1"; assets = 100.0
       underlyingAllocation = req.underlyingAllocation; shareAllocation = venues
+      expiresAt = forgedAt
   failsWith "request.vaultRegistrar" =<<
     fulfilAs env env.venue [req with requestCid = forged; shareAllocation = venues]
   tokens env (sharesId env) env.venue >>= (=== 0.0)
@@ -1045,3 +1049,57 @@ pendingCountsEachEscrowOnce = script do
   pending env 0 env.alice [req.underlyingAllocation, req.underlyingAllocation, bobs, elsewhere, otherRegistrys, eur]
     >>= (=== 100.0)
 
+-- Cleanup
+-----------
+
+-- | Once a request's allocations have lapsed it can never be fulfilled, so the registrar may drop it.
+registrarDropsAnExpiredRequest : Script ()
+registrarDropsAnExpiredRequest = script do
+  env <- setup
+  (_, req) <- request env env.alice "r1" 10.0
+  passTime (window + hours 2)
+  submit env.registrar (exerciseCmd req.requestCid Q.QueuedDepositRequest_Archive with actor = env.registrar)
+  query @Q.QueuedDepositRequest env.alice >>= (=== []) . map snd
+
+-- | Until then the request is live, and the registrar cannot drop it.
+registrarCannotDropALiveRequest : Script ()
+registrarCannotDropALiveRequest = script do
+  env <- setup
+  (_, req) <- request env env.alice "r1" 10.0
+  submitMustFail env.registrar (exerciseCmd req.requestCid Q.QueuedDepositRequest_Archive with actor = env.registrar)
+
+-- | A fulfilment record goes when a party it is kept for, or the registrar, drops it.
+fulfilmentRecordsCanBeDropped : Script ()
+fulfilmentRecordsCanBeDropped = script do
+  env <- setup
+  (_, a) <- request env env.alice "r1" 10.0
+  (_, b) <- request env env.alice "r2" 20.0
+  Right () <- fulfilAs env env.venue [a, b]
+  [mine, theirs] <- map fst <$> query @Q.QueuedDepositEvent env.alice
+  submit env.alice (exerciseCmd mine Q.QueuedDepositEvent_Archive with actor = env.alice)
+  submit env.registrar (exerciseCmd theirs Q.QueuedDepositEvent_Archive with actor = env.registrar)
+  query @Q.QueuedDepositEvent env.alice >>= (=== []) . map snd
+
+-- | A party shown a fulfilment record cannot drop it.
+strangerCannotDropAFulfilmentRecord : Script ()
+strangerCannotDropAFulfilmentRecord = script do
+  env <- setup
+  (_, a) <- request env env.alice "r1" 10.0
+  Right () <- fulfilAs env env.venue [a]
+  [record] <- map fst <$> query @Q.QueuedDepositEvent env.alice
+  carol <- allocateParty "carol"
+  Some shown <- queryDisclosure env.registrar record
+  submitMustFail (actAs carol <> discloseMany [shown]) do
+    exerciseCmd record Q.QueuedDepositEvent_Archive with actor = carol
+
+-- | A request expires when the first of its allocations lapses, here the authorization.
+requestExpiresWithItsFirstAllocation : Script ()
+requestExpiresWithItsFirstAllocation = script do
+  env <- setup
+  funded <- fund env env.alice "r1" ((standardEscrow env 10.0) with deadline = Some (days 3))
+  receiving <- authorize env env.alice (settlementOf env)
+  vd <- vaultDisclosure env
+  _ <- submit (actAs env.alice <> discloseMany [vd]) (requestCmd env env.alice "r1" 10.0 funded receiving)
+  req <- requestOf env env.alice "r1"
+  passTime (window + hours 2)
+  submit env.registrar (exerciseCmd req.requestCid Q.QueuedDepositRequest_Archive with actor = env.registrar)

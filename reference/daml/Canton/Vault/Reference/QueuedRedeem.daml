@@ -136,6 +136,8 @@ template ReferenceQueuedRedeemVault
         require "receipt authorization allows the executors to add a leg"
           (receiving.allocation.nextIterationFunding == Some TextMap.empty)
         requireCommittedFor "receipt authorization" settlementDeadlineWindow receiving.allocation
+        escrowDeadline <- deadlineOf escrowed.allocation
+        authorizationDeadline <- deadlineOf receiving.allocation
 
         _ <- create QueuedRedeemRequest with
           vaultId; vaultRegistrar; executors
@@ -145,13 +147,15 @@ template ReferenceQueuedRedeemVault
           shares = arg.shares
           shareAllocation = arg.shareAllocation
           underlyingAllocation = arg.underlyingAllocation
+          expiresAt = min escrowDeadline authorizationDeadline
         pure 0
 
     nonconsuming choice ReferenceQueuedRedeemVault_Fulfil : ()
       -- ^ Fulfil requests at the current rate, in one transaction.
       with
         requestCids : [ContractId QueuedRedeemRequest]
-          -- ^ The requests to fulfil, each binding its escrow to its receiver's authorization.
+          -- ^ The requests to fulfil, each binding its escrow to its receiver's authorization. Each
+          -- adds a leg to each registry's batch; every registry accepts batches of up to 25 legs.
         poolHoldingCids : [ContractId V2.Holding]
           -- ^ The custodian's holdings to pay from; only those the payout needs are used.
         underlyingExtraArgs : ExtraArgs
@@ -291,16 +295,21 @@ template QueuedRedeemRequest
       -- ^ The owner's escrowed shares.
     underlyingAllocation : ContractId V2.Allocation
       -- ^ The receiver's authorization to be paid.
+    expiresAt : Time
+      -- ^ The earlier of its allocations' deadlines, after which it cannot be fulfilled.
   where
     signatory vaultRegistrar
     observer owner, receiver, executors
 
     choice QueuedRedeemRequest_Archive : ()
-      -- ^ Drop a request whose escrow was cancelled or withdrawn, or that the owner gives up.
+      -- ^ Drop a request: the owner or an executor at any time, the registrar once it has expired.
       with
         actor : Party
       controller actor
-      do require' ("actor", actor) isMemberR ("executors and owner", owner :: executors)
+      do
+        now <- getTime
+        require "the owner or an executor drops a request, or the registrar once it has expired"
+          (actor `elem` (owner :: executors) || actor == vaultRegistrar && now >= expiresAt)
 
 -- | A record of one fulfilled redemption, kept for its owner and receiver.
 template QueuedRedeemEvent
@@ -317,6 +326,13 @@ template QueuedRedeemEvent
   where
     signatory vaultRegistrar
     observer owner, receiver
+
+    choice QueuedRedeemEvent_Archive : ()
+      -- ^ Drop the record, by a party it is kept for or by the registrar.
+      with
+        actor : Party
+      controller actor
+      do require' ("actor", actor) isMemberR ("record keepers", [vaultRegistrar, owner, receiver])
 
 -- | The same vault as an instant one, for everything but redemptions.
 instantOf' : ReferenceQueuedRedeemVault -> ReferenceVault
