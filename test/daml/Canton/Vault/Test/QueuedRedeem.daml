@@ -580,16 +580,16 @@ fulfilmentAfterThePeriodEndsIsRefused = script do
 fulfilmentIsAtomic : Script ()
 fulfilmentIsAtomic = script do
   env <- setup
-  now <- getTime
-  escrowed <- escrowWith env env.alice "r1" 40.0 (settlementOf env) (\spec -> spec with
-    settlementDeadline = Some (addRelTime now (days 3)))
-  receiving <- receipt env env.alice
-  vd <- vaultDisclosure env
-  _ <- submit (actAs env.alice <> discloseMany [vd]) (requestCmd env env.alice "r1" 40.0 escrowed receiving)
-  req <- requestOf env env.alice "r1"
-  passTime (window + hours 2)
-  next <- closeQueued env >>= openQueued env
-  failsWith "deadline" =<< fulfilAs next env.venue [req]
+  (_, req) <- request env env.alice "r1" 40.0
+  doomed <- submit env.usd.admin (createCmd TokenRules with admin = env.usd.admin)
+  Some doomedD <- queryDisclosure env.usd.admin doomed
+  vaultCid <- submit (actAs env.registrar <> discloseMany [env.usd.disclosure, env.shares.disclosure, doomedD]) do
+    exerciseCmd env.vaultCid R.ReferenceQueuedRedeemVault_SetFactories with
+      transferFactory = toInterfaceContractId env.usd.rulesCid
+      underlying = (factoriesOf env.usd) with settlementFactory = toInterfaceContractId doomed
+      shares = factoriesOf env.shares
+  submit env.usd.admin (archiveCmd doomed)
+  failsWith "NotActive" =<< fulfilAs (env with vaultCid) env.venue [req]
   supply env >>= (=== 100.0)
   unlocked env (usdId env) env.custodian >>= (=== 100.0)
 
@@ -1092,16 +1092,112 @@ strangerCannotDropAFulfilmentRecord = script do
   submitMustFail (actAs carol <> discloseMany [shown]) do
     exerciseCmd record R.QueuedRedeemEvent_Archive with actor = carol
 
--- | A request expires when the first of its allocations lapses, here the receipt.
-requestExpiresWithItsFirstAllocation : Script ()
-requestExpiresWithItsFirstAllocation = script do
+-- | A request expires with its escrow, though its receipt lasts longer.
+requestExpiresWithItsEscrow : Script ()
+requestExpiresWithItsEscrow = script do
+  env <- setup
+  now <- getTime
+  escrowed <- escrow env env.alice "r1" 10.0
+  receiving <- receiptWith env env.alice (settlementOf env) (\spec -> spec with
+    settlementDeadline = Some (addRelTime now (days 3)))
+  vd <- vaultDisclosure env
+  _ <- submit (actAs env.alice <> discloseMany [vd]) (requestCmd env env.alice "r1" 10.0 escrowed receiving)
+  req <- requestOf env env.alice "r1"
+  passTime (window + hours 2)
+  submit env.registrar (exerciseCmd req.requestCid R.QueuedRedeemRequest_Archive with actor = env.registrar)
+
+-- | A receipt that lapses before the escrow would leave the request stuck, so it is refused.
+receiptShorterThanTheEscrowIsRefused : Script ()
+receiptShorterThanTheEscrowIsRefused = script do
   env <- setup
   now <- getTime
   escrowed <- escrowWith env env.alice "r1" 10.0 (settlementOf env) (\spec -> spec with
     settlementDeadline = Some (addRelTime now (days 3)))
   receiving <- receipt env env.alice
   vd <- vaultDisclosure env
-  _ <- submit (actAs env.alice <> discloseMany [vd]) (requestCmd env env.alice "r1" 10.0 escrowed receiving)
-  req <- requestOf env env.alice "r1"
-  passTime (window + hours 2)
-  submit env.registrar (exerciseCmd req.requestCid R.QueuedRedeemRequest_Archive with actor = env.registrar)
+  failsWith "the receipt authorization lasts as long as the escrow" =<<
+    trySubmit (actAs env.alice <> discloseMany [vd]) (requestCmd env env.alice "r1" 10.0 escrowed receiving)
+
+-- Rejecting
+-------------
+
+rejectAs : Env -> Party -> [Req] -> Text -> Script (Either SubmitError ())
+rejectAs env party requests reason = do
+  vd <- vaultDisclosure env
+  locked <- lockedTokens env.shares (map (.shareAllocation) requests)
+  trySubmit (actAs party <> discloseMany ([vd, env.shares.disclosure] <> locked)) do
+    exerciseCmd env.vaultCid R.ReferenceQueuedRedeemVault_Reject with
+      requestCids = map (.requestCid) requests
+      reason
+      shareExtraArgs = tokenArgs env.shares
+
+-- | A rejected request returns its escrowed shares and leaves a record of why.
+rejectReturnsTheEscrow : Script ()
+rejectReturnsTheEscrow = script do
+  env <- setup
+  (_, req) <- request env env.alice "r1" 40.0
+  Right () <- rejectAs env env.venue [req] "receiver blocked"
+  unlocked env (sharesId env) env.alice >>= (=== 100.0)
+  query @R.QueuedRedeemRequest env.alice >>= (=== []) . map snd
+  rejections <- map snd <$> query @R.QueuedRedeemRejection env.alice
+  map (\r -> (r.label, r.shares, r.reason)) rejections === [("r1", 40.0, "receiver blocked")]
+
+rejectionByAnotherPartyIsRefused : Script ()
+rejectionByAnotherPartyIsRefused = script do
+  env <- setup
+  (_, req) <- request env env.alice "r1" 40.0
+  failsWith "requires authorizers" =<< rejectAs env env.alice [req] "changed my mind"
+
+-- | Only the registrar's request records are rejected, so an executor cannot sign a rejection in its name.
+rejectRefusesARecordTheRegistrarDidNotSign : Script ()
+rejectRefusesARecordTheRegistrarDidNotSign = script do
+  env <- setup
+  (_, req) <- request env env.alice "r1" 40.0
+  forgedAt <- getTime
+  forged <- submit env.venue do
+    createCmd R.QueuedRedeemRequest with
+      vaultId = env.vaultId; vaultRegistrar = env.venue; executors = [env.venue]
+      owner = env.alice; receiver = env.alice; label = "r1"; shares = 40.0
+      shareAllocation = req.shareAllocation; underlyingAllocation = req.underlyingAllocation
+      expiresAt = forgedAt
+  failsWith "request.vaultRegistrar" =<< rejectAs env env.venue [req with requestCid = forged] "forged"
+  unlocked env (sharesId env) env.alice >>= (=== 60.0)
+
+-- | One request that cannot settle fails its batch; the executors settle the rest and reject it.
+aPoisonedRequestIsSplitOffAndRejected : Script ()
+aPoisonedRequestIsSplitOffAndRejected = script do
+  env <- setup
+  (_, a) <- request env env.alice "a" 10.0
+  (_, b) <- request env env.alice "b" 20.0
+  (_, c) <- request env env.alice "c" 30.0
+  _ <- submit (actAs env.venue <> discloseMany [env.usd.disclosure]) do
+    exerciseCmd b.underlyingAllocation V2.Allocation_Cancel with actors = [env.venue]; extraArgs = tokenArgs env.usd
+  Left _ <- fulfilAs env env.venue [a, b, c]
+  Right () <- fulfilAs env env.venue [a, c]
+  Right () <- rejectAs env env.venue [b] "receipt withdrawn"
+  unlocked env (usdId env) env.alice >>= (=== 40.0)
+  unlocked env (sharesId env) env.alice >>= (=== 60.0)
+
+-- | A rejection record goes when a party it is kept for, or the registrar, drops it.
+rejectionRecordsCanBeDropped : Script ()
+rejectionRecordsCanBeDropped = script do
+  env <- setup
+  (_, a) <- request env env.alice "r1" 10.0
+  (_, b) <- request env env.alice "r2" 20.0
+  Right () <- rejectAs env env.venue [a, b] "blocked"
+  [mine, theirs] <- map fst <$> query @R.QueuedRedeemRejection env.alice
+  submit env.alice (exerciseCmd mine R.QueuedRedeemRejection_Archive with actor = env.alice)
+  submit env.registrar (exerciseCmd theirs R.QueuedRedeemRejection_Archive with actor = env.registrar)
+  query @R.QueuedRedeemRejection env.alice >>= (=== []) . map snd
+
+-- | A party shown a rejection record cannot drop it.
+strangerCannotDropARejectionRecord : Script ()
+strangerCannotDropARejectionRecord = script do
+  env <- setup
+  (_, a) <- request env env.alice "r1" 10.0
+  Right () <- rejectAs env env.venue [a] "blocked"
+  [record] <- map fst <$> query @R.QueuedRedeemRejection env.alice
+  carol <- allocateParty "carol"
+  Some shown <- queryDisclosure env.registrar record
+  submitMustFail (actAs carol <> discloseMany [shown]) do
+    exerciseCmd record R.QueuedRedeemRejection_Archive with actor = carol

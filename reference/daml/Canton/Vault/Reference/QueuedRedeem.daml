@@ -138,6 +138,7 @@ template ReferenceQueuedRedeemVault
         requireCommittedFor "receipt authorization" settlementDeadlineWindow receiving.allocation
         escrowDeadline <- deadlineOf escrowed.allocation
         authorizationDeadline <- deadlineOf receiving.allocation
+        require "the receipt authorization lasts as long as the escrow" (authorizationDeadline >= escrowDeadline)
 
         _ <- create QueuedRedeemRequest with
           vaultId; vaultRegistrar; executors
@@ -147,11 +148,11 @@ template ReferenceQueuedRedeemVault
           shares = arg.shares
           shareAllocation = arg.shareAllocation
           underlyingAllocation = arg.underlyingAllocation
-          expiresAt = min escrowDeadline authorizationDeadline
+          expiresAt = escrowDeadline
         pure 0
 
     nonconsuming choice ReferenceQueuedRedeemVault_Fulfil : ()
-      -- ^ Fulfil requests at the current rate, in one transaction.
+      -- ^ Fulfil requests at the current rate, in one transaction; one that fails fails them all.
       with
         requestCids : [ContractId QueuedRedeemRequest]
           -- ^ The requests to fulfil, each binding its escrow to its receiver's authorization. Each
@@ -223,6 +224,29 @@ template ReferenceQueuedRedeemVault
         recordFlow (instantOf' this) (negate payout) (negate (sum (map (.shares) requests)))
         forA_ priced $ \(r, _, _, a) ->
           recordFulfilment this r.owner r.receiver r.label r.shares a
+
+    nonconsuming choice ReferenceQueuedRedeemVault_Reject : ()
+      -- ^ End requests that cannot settle, returning each escrow and recording why. A request that
+      -- fails fails its whole batch, so executors dry-run a batch, settle the rest and reject it.
+      with
+        requestCids : [ContractId QueuedRedeemRequest]
+        reason : Text
+          -- ^ Why the requests cannot settle, kept on each rejection record.
+        shareExtraArgs : ExtraArgs
+          -- ^ The share registry's context for cancelling the escrows.
+      controller executors
+      do
+        forA_ requestCids $ \cid -> do
+          request <- fetch cid
+          require' ("request.vaultRegistrar", request.vaultRegistrar) isEqualR ("vaultRegistrar", vaultRegistrar)
+          archive cid
+          _ <- exercise request.shareAllocation V2.Allocation_Cancel with actors = executors; extraArgs = shareExtraArgs
+          create QueuedRedeemRejection with
+            vaultId; vaultRegistrar; reason
+            owner = request.owner
+            receiver = request.receiver
+            label = request.label
+            shares = request.shares
 
     choice ReferenceQueuedRedeemVault_SetPaused : ContractId ReferenceQueuedRedeemVault
       -- ^ Pause or resume deposits and mints.
@@ -296,7 +320,7 @@ template QueuedRedeemRequest
     underlyingAllocation : ContractId V2.Allocation
       -- ^ The receiver's authorization to be paid.
     expiresAt : Time
-      -- ^ The earlier of its allocations' deadlines, after which it cannot be fulfilled.
+      -- ^ The escrow's deadline, after which it cannot be fulfilled.
   where
     signatory vaultRegistrar
     observer owner, receiver, executors
@@ -328,6 +352,28 @@ template QueuedRedeemEvent
     observer owner, receiver
 
     choice QueuedRedeemEvent_Archive : ()
+      -- ^ Drop the record, by a party it is kept for or by the registrar.
+      with
+        actor : Party
+      controller actor
+      do require' ("actor", actor) isMemberR ("record keepers", [vaultRegistrar, owner, receiver])
+
+-- | A record of a redemption request the executors rejected, kept for its owner and receiver.
+template QueuedRedeemRejection
+  with
+    vaultId : Text
+    vaultRegistrar : Party
+    owner : Party
+    receiver : Party
+    label : Text
+    shares : Decimal
+    reason : Text
+      -- ^ Why the request could not settle.
+  where
+    signatory vaultRegistrar
+    observer owner, receiver
+
+    choice QueuedRedeemRejection_Archive : ()
       -- ^ Drop the record, by a party it is kept for or by the registrar.
       with
         actor : Party
