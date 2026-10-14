@@ -38,18 +38,28 @@ A queued-deposit vault takes a request instead of settling at once. The
 requester escrows the underlying as a committed allocation, and the receiver
 authorizes being issued shares, both under the vault's settlement id
 (`requestSettlementId`). The vault records the pair as a registrar-signed
-request. Executors later fulfil requests in batches, at the rate then current,
-settling both registries' legs in one transaction.
+request, whose id is the rate period it was made in.
+
+Once that period closes, executors fulfil requests in batches, settling both
+registries' legs in one transaction, at the price struck when the next period
+opened: everyone who requested in a period gets one price, which nobody knew
+when they requested. A request filled later than that gets the current price if
+it is worse for the requester, so a late fill never beats the market. A
+requester may set a minimum number of shares, below which the request is not
+filled.
 
 A batch settles whole or not at all, so one request that cannot settle, such as
 a receiver its registry has blocked, fails the rest. Executors dry-run a batch,
 settle the requests that pass, and `Reject` the one that fails, which returns
-its escrow and records why. Every registry accepts batches of up to 25 legs, one
+its escrow and reports why. Every registry accepts batches of up to 25 legs, one
 per request per registry; Canton Coin accepts 100.
 
-Requests expire with their escrow. The registrar folds period flows together as
-they accumulate (`PeriodFlow_Merge`), and drops expired requests and old records,
-so neither the roll nor the ledger grows with activity.
+Fulfilments and rejections are reported to the requester and receiver through a
+log created and archived in the same transaction, as the token standard's event
+log does, so they leave nothing on the ledger. Requests expire with their escrow.
+The registrar folds period flows together as they accumulate
+(`PeriodFlow_Merge`) and drops expired requests and old struck prices, so neither
+the roll nor the ledger grows with activity.
 
 ## Trust and limits
 
