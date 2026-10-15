@@ -1,6 +1,7 @@
 -- | A reference vault whose deposits are instant and redemptions queued.
 module Canton.Vault.Reference.QueuedRedeem where
 
+import DA.Action (void, when)
 import DA.Foldable (forA_)
 import DA.List (dedup)
 import DA.Optional (isNone)
@@ -128,18 +129,10 @@ template ReferenceQueuedRedeemVault
                              , V2.SenderSide, burnAccount, arg.shares, shareInstrument.id ) ])
         requireCommittedFor "escrow" settlementDeadlineWindow escrowed.allocation
 
-        receiving <- fetchSigned "receipt authorization" underlyingInstrument.admin arg.underlyingAllocation
-        require' ("receipt authorization.settlement", receiving.settlement) isEqualR ("settlement", settlement)
-        require' ("receipt authorization.authorizer.owner", receiving.allocation.authorizer.owner) isEqualR
-          ("receiver", Some arg.receiver)
-        -- The payout is set at fulfilment, which adds the receiving leg.
-        require "receipt authorization names no legs" (receiving.allocation.transferLegSides == [])
-        require "receipt authorization allows the executors to add a leg"
-          (receiving.allocation.nextIterationFunding == Some TextMap.empty)
-        requireCommittedFor "receipt authorization" settlementDeadlineWindow receiving.allocation
         escrowDeadline <- deadlineOf escrowed.allocation
-        authorizationDeadline <- deadlineOf receiving.allocation
-        require "the receipt authorization lasts as long as the escrow" (authorizationDeadline >= escrowDeadline)
+        -- Only the owner's receipt can be read here; fulfilment checks every receipt again.
+        when (arg.receiver == regularAccountOwner owner) $
+          void (checkReceipt this arg.receiver escrowDeadline arg.underlyingAllocation)
 
         _ <- create QueuedRedeemRequest with
           vaultId; vaultRegistrar; executors
@@ -189,14 +182,14 @@ template ReferenceQueuedRedeemVault
         -- Each leg uses the account its allocation names, which may have a provider.
         priced <- forA requests $ \r -> do
           escrowed <- view <$> fetch r.shareAllocation
-          receiving <- view <$> fetch r.underlyingAllocation
+          receivingAccount <- checkReceipt this r.receiver r.expiresAt r.underlyingAllocation
           (struckShares, struckAssets) <- struckFor r.epoch epoch (totalShares, totalAssets) prices
           let paid = min (sharesToAssets struckShares struckAssets r.shares) (sharesToAssets totalShares totalAssets r.shares)
               assets = deductFeeBps redeemFeeBps paid
           case r.minAssetsOut of
             Some limit | assets < limit -> fail (vaultSlippageExceeded <> ": request " <> r.label)
             _ -> pure ()
-          pure (r, escrowed.allocation.authorizer, receiving.allocation.authorizer, assets)
+          pure (r, escrowed.allocation.authorizer, receivingAccount, assets)
         let settlement = settlementFor this
             shareLeg (r, from, _, _) = V2.TransferLeg with
               transferLegId = requestLegId r.owner r.label "shares"
@@ -393,6 +386,23 @@ settlementFor v = V2.SettlementInfo with
   id = requestSettlementId v.vaultId
   cid = None
   meta = emptyMetadata
+
+-- | Refuses a receipt authorization that is not the receiver's committed, leg-less one for the vault's settlement,
+-- lasting as long as the escrow, which covered the vault's window when requested. Returns the account it pays.
+checkReceipt : ReferenceQueuedRedeemVault -> Party -> Time -> ContractId V2.Allocation -> Update V2.Account
+checkReceipt v receiver escrowDeadline cid = do
+  receiving <- fetchSigned "receipt authorization" v.underlyingInstrument.admin cid
+  require' ("receipt authorization.settlement", receiving.settlement) isEqualR ("settlement", settlementFor v)
+  require' ("receipt authorization.authorizer.owner", receiving.allocation.authorizer.owner) isEqualR
+    ("receiver", Some receiver)
+  -- The payout is set at fulfilment, which adds the receiving leg.
+  require "receipt authorization names no legs" (receiving.allocation.transferLegSides == [])
+  require "receipt authorization allows the executors to add a leg"
+    (receiving.allocation.nextIterationFunding == Some TextMap.empty)
+  require "receipt authorization is committed" receiving.allocation.committed
+  authorizationDeadline <- deadlineOf receiving.allocation
+  require "the receipt authorization lasts as long as the escrow" (authorizationDeadline >= escrowDeadline)
+  pure receiving.allocation.authorizer
 
 -- | Opens the next period at the totals measured, keeping the price it strikes.
 openNext : ReferenceQueuedRedeemVault -> Decimal -> Decimal -> Time -> Time -> Update (ContractId ReferenceQueuedRedeemVault)

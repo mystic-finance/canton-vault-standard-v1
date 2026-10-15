@@ -1373,3 +1373,52 @@ aQueuedRollBeyondTheLimitsNeedsTheCustodian = script do
   (vault.epoch, vault.totalAssets) === (1, 110.0)
   prices <- map snd <$> query @R.PeriodPrice env.registrar
   map (\p -> (p.epoch, p.totalAssets)) prices === [(1, 110.0)]
+
+-- Paying another receiver
+---------------------------
+
+-- | A redemption the owner asks to be paid to another receiver, whose receipt only the executors can read.
+requestFor : Env -> Party -> Text -> Decimal -> ContractId V2.Allocation -> ContractId V2.Allocation -> Script ()
+requestFor env receiver label shares escrowed receiving = do
+  vd <- vaultDisclosure env
+  void $ submit (actAs env.alice <> discloseMany [vd]) do
+    exerciseCmd (toInterfaceContractId env.vaultCid : ContractId VaultAsyncRedeem) Vault_RequestRedeem with
+      label; shares; receiver; minAssetsOut = None
+      shareAllocation = escrowed; underlyingAllocation = receiving
+      actors = [env.alice]; extraArgs = ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata
+
+-- | Alice redeems for Bob: his receipt is read at fulfilment, he is paid, and both see the report.
+aThirdPartyReceiverIsPaid : Script ()
+aThirdPartyReceiverIsPaid = script do
+  env <- setup
+  bob <- allocateParty "bob"
+  escrowed <- escrow env env.alice "r1" 40.0
+  receiving <- receipt env bob
+  requestFor env bob "r1" 40.0 escrowed receiving
+  req <- requestOf env env.alice "r1"
+  next <- nextPeriod env
+  Right tree <- fulfilNowTree next env.venue [req]
+  map (.observers) (exercisesOf @R.QueueLog @R.QueueLog_Report tree) === [[env.alice, bob]]
+  unlocked env (usdId env) bob >>= (=== 40.0)
+
+-- | A receipt that is not the receiver's, or not the registry's, fails at fulfilment, and the executors reject it.
+aBadThirdPartyReceiptIsRefusedAtFulfilment : Script ()
+aBadThirdPartyReceiptIsRefusedAtFulfilment = script do
+  env <- setup
+  bob <- allocateParty "bob"
+  carol <- allocateParty "carol"
+  now <- getTime
+  escrowed <- escrow env env.alice "r1" 40.0
+  carols <- receipt env carol
+  requestFor env bob "r1" 40.0 escrowed carols
+  escrowed' <- escrow env env.alice "r2" 20.0
+  fake <- fakeAllocation bob (settlementOf env) (receiptSpec env bob now)
+  requestFor env bob "r2" 20.0 escrowed' fake
+  notBobs <- requestOf env env.alice "r1"
+  faked <- requestOf env env.alice "r2"
+  next <- nextPeriod env
+  failsWith "receipt authorization.authorizer.owner" =<< fulfilNow next env.venue [notBobs]
+  failsWith "receipt authorization is signed by its registry" =<< fulfilNow next env.venue [faked]
+  Right () <- rejectAs next env.venue [notBobs, faked] "receipt is not the receiver's"
+  unlocked env (sharesId env) env.alice >>= (=== 100.0)
+
