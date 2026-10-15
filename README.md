@@ -22,7 +22,10 @@ Redemption is the reverse. The caller names the holdings funding each leg, in
 
 Pricing is a computed rate with optional linear or continuous accrual, fixed for
 a rate period published on the vault's view. Every quantity rounds in the
-vault's favour, and a deposit that would mint zero shares is rejected.
+vault's favour, and a deposit that would mint zero shares is rejected. Without
+accrual no action reads the clock: the period's end and any expiry are checked
+as ledger-time bounds, as the token standard checks its deadlines, so an action
+prepared for external signing stays valid until its period ends.
 
 The choices are nonconsuming, so concurrent deposits do not contend on the vault
 contract. Each action records what it moved, and the registrar folds those in
