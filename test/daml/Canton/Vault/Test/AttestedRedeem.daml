@@ -138,6 +138,17 @@ dustPartIsNotFilled = script do
   Right env <- rollAt env oracle 1.0 [(0, 0.5)]
   failsWith "each request fills a positive number of shares" =<< fillTree env [req]
 
+-- | The held rest waits on the vault, not on anyone's timing, so it takes the price of the period that fills it,
+-- after a rise as after a fall.
+theRestTakesThePriceOfThePeriodThatFillsIt : Script ()
+theRestTakesThePriceOfThePeriodThatFillsIt = script do
+  forA_ [(1.1, 66.0), (0.9, 54.0)] $ \(price, paid) -> do
+    (env, oracle, rest) <- partlyFilled
+    _ <- holdingOf env.custodian env.usd.admin (usdId env) 10.0
+    Right env <- rollAt env oracle price [(0, 1.0)]
+    Right tree <- fillTree env [rest]
+    map (.outcome) (reported tree) === [R.Fulfilled with received = paid]
+
 -- | A vault priced from its pool can always pay, so it takes no allotments.
 poolPricedVaultTakesNoAllotments : Script ()
 poolPricedVaultTakesNoAllotments = script do

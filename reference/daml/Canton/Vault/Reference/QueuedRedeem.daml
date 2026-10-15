@@ -158,7 +158,8 @@ template ReferenceQueuedRedeemVault
 
     nonconsuming choice ReferenceQueuedRedeemVault_Fulfil : ()
       -- ^ Fill requests made in earlier periods, in one transaction; one that fails fails them all. Each fills its
-      -- allotment at the price struck when the period after its own opened, or the current one if less.
+      -- allotment at the price struck when the period after its own opened, or the current one if less; the held rest
+      -- of a request filled in part takes the current one.
       with
         requestCids : [ContractId QueuedRedeemRequest]
           -- ^ The requests to fill; each adds a leg to each registry's batch, and every registry accepts 25.
@@ -199,9 +200,12 @@ template ReferenceQueuedRedeemVault
           fraction <- fillFraction this r.epoch
           let filled = if fraction == 1.0 then r.shares else mulDivDown r.shares fraction 1.0
           require "each request fills a positive number of shares" (filled > 0.0)
-          (struckShares, struckAssets) <- struckFor r.epoch epoch (totalShares, totalAssets) prices
-          let paid = min (sharesToAssets struckShares struckAssets filled) (sharesToAssets totalShares totalAssets filled)
-              assets = deductFeeBps redeemFeeBps paid
+          let now = sharesToAssets totalShares totalAssets filled
+          -- The rest of a request filled in part waits on the vault, so it takes the price of the period that fills it.
+          paid <- if isSome r.filledIn then pure now else do
+            (struckShares, struckAssets) <- struckFor r.epoch epoch (totalShares, totalAssets) prices
+            pure (min (sharesToAssets struckShares struckAssets filled) now)
+          let assets = deductFeeBps redeemFeeBps paid
           case r.minAssetsOut of
             Some limit | assets < mulDivUp limit filled r.shares -> fail (vaultSlippageExceeded <> ": request " <> r.label)
             _ -> pure ()
