@@ -410,6 +410,7 @@ openNext v shares assets pricing now validUntil = do
     epoch = next
     totalShares = shares
     totalAssets = assets
+    allotments = []
   create v with
     totalShares = shares
     totalAssets = assets

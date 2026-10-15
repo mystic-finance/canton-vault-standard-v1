@@ -149,6 +149,26 @@ theRestTakesThePriceOfThePeriodThatFillsIt = script do
     Right tree <- fillTree env [rest]
     map (.outcome) (reported tree) === [R.Fulfilled with received = paid]
 
+-- | A period with nothing allotted is the vault's wait, so a first fill is priced from the first period that allotted
+-- the request's period; a fill the executors put off after that still takes the worse price.
+aFirstFillIsPricedFromTheFirstAllottingPeriod : Script ()
+aFirstFillIsPricedFromTheFirstAllottingPeriod = script do
+  (env, oracle) <- setupOracle
+  _ <- holdingOf env.custodian env.usd.admin (usdId env) 10.0
+  (_, req) <- request env env.alice "r1" 100.0
+  Right env <- rollAt env oracle 1.0 []
+  Right env <- rollAt env oracle 1.1 [(0, 1.0)]
+  Right tree <- fillTree env [req]
+  map (.outcome) (reported tree) === [R.Fulfilled with received = 110.0]
+
+  (env, oracle) <- setupOracle
+  _ <- holdingOf env.custodian env.usd.admin (usdId env) 10.0
+  (_, req) <- request env env.alice "r1" 100.0
+  Right env <- rollAt env oracle 1.0 [(0, 1.0)]
+  Right env <- rollAt env oracle 1.1 [(0, 1.0)]
+  Right tree <- fillTree env [req]
+  map (.outcome) (reported tree) === [R.Fulfilled with received = 100.0]
+
 -- | A vault priced from its pool can always pay, so it takes no allotments.
 poolPricedVaultTakesNoAllotments : Script ()
 poolPricedVaultTakesNoAllotments = script do

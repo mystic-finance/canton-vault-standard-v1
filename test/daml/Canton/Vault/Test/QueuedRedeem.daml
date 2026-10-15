@@ -1316,7 +1316,7 @@ aLateFillNeedsItsOwnStruckPrice = script do
   forged <- submit env.venue do
     createCmd R.PeriodPrice with
       vaultId = env.vaultId; vaultRegistrar = env.venue; executors = [env.venue]
-      epoch = 1; totalShares = 1.0; totalAssets = 100.0
+      epoch = 1; totalShares = 1.0; totalAssets = 100.0; allotments = []
   failsWith "price.vaultRegistrar" =<< fulfilAtTree late env.venue [r1] [forged]
   other <- anotherVault env "queued-redeem-2"
   _ <- nextPeriod other

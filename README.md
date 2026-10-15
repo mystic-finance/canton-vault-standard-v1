@@ -64,7 +64,8 @@ of that period's unfilled requests, the oldest first, and every request of the
 period fills that share. A redemption escrow pays the registrar's
 `redemptionAccount`, which burns what is filled and holds the rest until a later
 period fills it, at that period's price since the wait is the vault's, or the
-owner reclaims it. Executors can settle the escrow only
+owner reclaims it. For the same reason a request's first fill is measured from
+the first period that allotted its period a share, not the one right after it. Executors can settle the escrow only
 into that account, so they cannot move a holder's shares anywhere else. Instant
 redemptions are paid while the pool lasts.
 
