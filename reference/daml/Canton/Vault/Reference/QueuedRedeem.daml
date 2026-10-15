@@ -3,8 +3,8 @@ module Canton.Vault.Reference.QueuedRedeem where
 
 import DA.Action (unless, void, when)
 import DA.Foldable (forA_)
-import DA.List (dedup)
-import DA.Optional (isNone)
+import DA.List (dedup, unique)
+import DA.Optional (fromOptional, isNone, isSome)
 import DA.TextMap qualified as TextMap
 import DA.Time (RelTime, isLedgerTimeGE, isLedgerTimeLT)
 
@@ -59,6 +59,8 @@ template ReferenceQueuedRedeemVault
       -- ^ The share registry's factories, the only ones fulfilment uses for it.
     priceLimits : PriceLimits
       -- ^ How far a roll may move the price on the registrar's word alone.
+    allotments : [(Int, Decimal)]
+      -- ^ The share of each earlier period's unfilled requests this period fills, for a vault priced by its oracle.
   where
     signatory vaultRegistrar, custodian
     observer executors
@@ -71,6 +73,7 @@ template ReferenceQueuedRedeemVault
         && executors /= []
         && validPriceLimits priceLimits
         && validPricing vaultRegistrar pricing
+        && validAllotments pricing epoch allotments
 
     -- Pricing, deposits and the period accounting are the instant vault's.
     interface instance Vault for ReferenceQueuedRedeemVault where
@@ -107,7 +110,7 @@ template ReferenceQueuedRedeemVault
         requestCids : [ContractId QueuedRedeemRequest] <- dedup <$> getContractIds redeemRequestsKey extraArgs.context
         amounts <- forA requestCids $ \cid -> do
           r <- fetch cid
-          live <- isLedgerTimeLT r.expiresAt
+          live <- if isSome r.filledIn then pure True else isLedgerTimeLT r.expiresAt
           pure $ if r.vaultRegistrar == vaultRegistrar && r.vaultId == vaultId && r.owner == party
                       && r.epoch == requestId && live
             then r.shares else 0.0
@@ -129,7 +132,7 @@ template ReferenceQueuedRedeemVault
         require "escrow is not iterated" (isNone escrowed.allocation.nextIterationFunding)
         require' ("escrow legs", map legKey escrowed.allocation.transferLegSides) isEqualR
           ("request legs", [ ( requestLegId (regularAccountOwner owner) arg.label "shares"
-                             , V2.SenderSide, burnAccount, arg.shares, shareInstrument.id ) ])
+                             , V2.SenderSide, redemptionAccount vaultRegistrar, arg.shares, shareInstrument.id ) ])
         requireCommittedFor "escrow" settlementDeadlineWindow escrowed.allocation
 
         escrowDeadline <- deadlineOf escrowed.allocation
@@ -148,19 +151,21 @@ template ReferenceQueuedRedeemVault
           expiresAt = escrowDeadline
           epoch
           minAssetsOut = arg.minAssetsOut
+          filledIn = None
         pure epoch
 
     nonconsuming choice ReferenceQueuedRedeemVault_Fulfil : ()
-      -- ^ Fulfil requests made in earlier periods, in one transaction; one that fails fails them all. Each
-      -- pays at the price struck when the period after its own opened, or the current one if less.
+      -- ^ Fill requests made in earlier periods, in one transaction; one that fails fails them all. Each fills its
+      -- allotment at the price struck when the period after its own opened, or the current one if less.
       with
         requestCids : [ContractId QueuedRedeemRequest]
-          -- ^ The requests to fulfil, each binding its escrow to its receiver's authorization. Each
-          -- adds a leg to each registry's batch; every registry accepts batches of up to 25 legs.
+          -- ^ The requests to fill; each adds a leg to each registry's batch, and every registry accepts 25.
         priceCids : [ContractId PeriodPrice]
           -- ^ The prices struck in periods before the current one, for requests filled late.
         poolHoldingCids : [ContractId V2.Holding]
           -- ^ The custodian's holdings to pay from; only those the payout needs are used.
+        heldHoldingCids : [ContractId V2.Holding]
+          -- ^ The redemption account's holdings, for requests filled in part before; only those needed are used.
         underlyingExtraArgs : ExtraArgs
           -- ^ The underlying registry's context for allocating and settling.
         shareExtraArgs : ExtraArgs
@@ -175,65 +180,108 @@ template ReferenceQueuedRedeemVault
           archive cid
           pure request
         requireDistinct [(r.owner, r.label) | r <- requests]
-          (concat [[r.shareAllocation, r.underlyingAllocation] | r <- requests])
-        forA_ requests $ \r -> require "a request is filled after the period it was made in" (r.epoch < epoch)
+          ([r.shareAllocation | r <- requests, isNone r.filledIn] <> map (.underlyingAllocation) requests)
+        forA_ requests $ \r -> do
+          require "a request is filled after the period it was made in" (r.epoch < epoch)
+          require "a request is filled at most once a period" (r.filledIn /= Some epoch)
         prices <- forA priceCids $ \cid -> do
           price <- fetch cid
           require' ("price.vaultRegistrar", price.vaultRegistrar) isEqualR ("vaultRegistrar", vaultRegistrar)
           require' ("price.vaultId", price.vaultId) isEqualR ("vaultId", vaultId)
           pure price
+        let held = redemptionAccount vaultRegistrar
         -- Each leg uses the account its allocation names, which may have a provider.
-        priced <- forA requests $ \r -> do
-          escrowed <- view <$> fetch r.shareAllocation
-          receivingAccount <- checkReceipt this r.receiver r.expiresAt r.underlyingAllocation
+        fills <- forA requests $ \r -> do
+          sender <- if isNone r.filledIn then (.allocation.authorizer) . view <$> fetch r.shareAllocation else pure held
+          receiving <- checkReceipt this r.receiver r.expiresAt r.underlyingAllocation
+          fraction <- fillFraction this r.epoch
+          let filled = if fraction == 1.0 then r.shares else mulDivDown r.shares fraction 1.0
+          require "each request fills a positive number of shares" (filled > 0.0)
           (struckShares, struckAssets) <- struckFor r.epoch epoch (totalShares, totalAssets) prices
-          let paid = min (sharesToAssets struckShares struckAssets r.shares) (sharesToAssets totalShares totalAssets r.shares)
+          let paid = min (sharesToAssets struckShares struckAssets filled) (sharesToAssets totalShares totalAssets filled)
               assets = deductFeeBps redeemFeeBps paid
           case r.minAssetsOut of
-            Some limit | assets < limit -> fail (vaultSlippageExceeded <> ": request " <> r.label)
+            Some limit | assets < mulDivUp limit filled r.shares -> fail (vaultSlippageExceeded <> ": request " <> r.label)
             _ -> pure ()
-          pure (r, escrowed.allocation.authorizer, receivingAccount, assets)
+          pure Fill with request = r; sender; receiving; filled; assets
         let settlement = settlementFor this
-            shareLeg (r, from, _, _) = V2.TransferLeg with
-              transferLegId = requestLegId r.owner r.label "shares"
-              sender = from
-              receiver = burnAccount
-              amount = r.shares
+            escrowLeg f = V2.TransferLeg with
+              transferLegId = requestLegId f.request.owner f.request.label "shares"
+              sender = f.sender
+              receiver = held
+              amount = f.request.shares
               instrumentId = shareInstrument.id
               meta = emptyMetadata
-            payoutLeg (r, _, to, a) = V2.TransferLeg with
-              transferLegId = requestLegId r.owner r.label "underlying"
+            burnLeg f = V2.TransferLeg with
+              transferLegId = requestLegId f.request.owner f.request.label ("burn/" <> show epoch)
+              sender = held
+              receiver = burnAccount
+              amount = f.filled
+              instrumentId = shareInstrument.id
+              meta = emptyMetadata
+            payoutLeg f = V2.TransferLeg with
+              transferLegId = requestLegId f.request.owner f.request.label "underlying"
               sender = basicAccount custodian
-              receiver = to
-              amount = a
+              receiver = f.receiving
+              amount = f.assets
               instrumentId = underlyingInstrument.id
               meta = emptyMetadata
-            payout = sum [a | (_, _, _, a) <- priced]
-        forA_ priced $ \(_, _, _, a) -> require "each request pays out a positive amount" (a > 0.0)
+            fresh = [f | f <- fills, isNone f.request.filledIn]
+            payout = sum (map (.assets) fills)
+            burned = sum (map (.filled) fills)
+            partial f = f.filled < f.request.shares
+        forA_ fills $ \f -> require "each request pays out a positive amount" (f.assets > 0.0)
         pool <- coveringHoldings payout poolHoldingCids
 
-        -- The vault's own sides: the burn account receives the shares, the custodian pays out.
+        received <- if null fresh then pure [] else do
+          heldSide <- allocateSides shareFactories shareExtraArgs settlement rateValidFrom vaultRegistrar
+            held [vaultRegistrar] [] [receiverSide (escrowLeg f) | f <- fresh]
+          result <- exercise shareFactories.settlementFactory V2.SettlementFactory_SettleBatch with
+            settlement
+            transferLegs = map escrowLeg fresh
+            allocations = finalized heldSide [] :: [finalized f.request.shareAllocation [] | f <- fresh]
+            actors = executors
+            extraArgs = shareExtraArgs
+          pure (receivedHoldings shareInstrument.id result)
+        burnInputs <- coveringHoldings burned (received <> heldHoldingCids)
         burnSide <- allocateSides shareFactories shareExtraArgs settlement rateValidFrom vaultRegistrar
-          burnAccount [vaultRegistrar] [] [receiverSide (shareLeg p) | p <- priced]
-        custodianSide <- allocateSides underlyingFactories underlyingExtraArgs settlement rateValidFrom underlyingInstrument.admin
-          (basicAccount custodian) [custodian] pool [senderSide (payoutLeg p) | p <- priced]
-
+          held [vaultRegistrar] burnInputs [senderSide (burnLeg f) | f <- fills]
+        burnedSide <- allocateSides shareFactories shareExtraArgs settlement rateValidFrom vaultRegistrar
+          burnAccount [vaultRegistrar] [] [receiverSide (burnLeg f) | f <- fills]
         _ <- exercise shareFactories.settlementFactory V2.SettlementFactory_SettleBatch with
           settlement
-          transferLegs = map shareLeg priced
-          allocations = finalized burnSide [] :: [finalized r.shareAllocation [] | (r, _, _, _) <- priced]
+          transferLegs = map burnLeg fills
+          allocations = [finalized burnSide [], finalized burnedSide []]
           actors = executors
           extraArgs = shareExtraArgs
-        _ <- exercise underlyingFactories.settlementFactory V2.SettlementFactory_SettleBatch with
+
+        custodianSide <- allocateSides underlyingFactories underlyingExtraArgs settlement rateValidFrom underlyingInstrument.admin
+          (basicAccount custodian) [custodian] pool [senderSide (payoutLeg f) | f <- fills]
+        settled <- exercise underlyingFactories.settlementFactory V2.SettlementFactory_SettleBatch with
           settlement
-          transferLegs = map payoutLeg priced
+          transferLegs = map payoutLeg fills
+          -- A receipt stays open for the rest of a request filled in part.
           allocations = finalized custodianSide []
-            :: [finalized r.underlyingAllocation [receiverSide (payoutLeg p)] | p@(r, _, _, _) <- priced]
+            :: [ (finalized f.request.underlyingAllocation [receiverSide (payoutLeg f)])
+                   with nextIterationFunding = if partial f then Some TextMap.empty else None
+               | f <- fills ]
           actors = executors
           extraArgs = underlyingExtraArgs
 
-        recordFlow (instantOf' this) (negate payout) (negate (sum (map (.shares) requests)))
-        reportQueued vaultRegistrar [ eventOf r (Fulfilled with received = a) | (r, _, _, a) <- priced ]
+        forA_ (zip fills (drop 1 settled.allocationSettleResults)) $ \(f, result) -> when (partial f) do
+          next <- case result.output of
+            V2.AllocationResult_Settled {nextIterationAllocationCid = Some cid} -> pure cid
+            _ -> fail "the receipt authorization stays open for the rest of the request"
+          void $ create f.request with
+            shares = f.request.shares - f.filled
+            underlyingAllocation = next
+            minAssetsOut = fmap (\m -> mulDivDown m (f.request.shares - f.filled) f.request.shares) f.request.minAssetsOut
+            filledIn = Some epoch
+        recordFlow (instantOf' this) (negate payout) (negate burned)
+        reportQueued vaultRegistrar
+          [ eventOf f.request (if partial f then PartlyFilled with received = f.assets; filled = f.filled
+                               else Fulfilled with received = f.assets)
+          | f <- fills ]
 
     nonconsuming choice ReferenceQueuedRedeemVault_Reject : ()
       -- ^ End requests that cannot settle, returning each escrow and recording why. A request that
@@ -249,6 +297,7 @@ template ReferenceQueuedRedeemVault
         events <- forA requestCids $ \cid -> do
           request <- fetch cid
           require' ("request.vaultRegistrar", request.vaultRegistrar) isEqualR ("vaultRegistrar", vaultRegistrar)
+          require "a request filled in part is returned by its owner's reclaim" (isNone request.filledIn)
           archive cid
           _ <- exercise request.shareAllocation V2.Allocation_Cancel with actors = executors; extraArgs = shareExtraArgs
           pure (eventOf request (Rejected with reason))
@@ -304,11 +353,13 @@ template ClosedQueuedRedeemPeriod
         flowCids : [ContractId PeriodFlow]
         evidence : PriceEvidence
         validUntil : Time
+        allotments : [(Int, Decimal)]
+          -- ^ The share of each earlier period's unfilled requests the new period fills, the oldest first.
       controller vault.vaultRegistrar
       do
         (shares, assets, pricing, now) <- rollTotals (instantOf' vault) flowCids evidence validUntil
         requirePriceWithinLimits vault.priceLimits (instantOf' vault) shares assets
-        openNext vault shares assets pricing now validUntil
+        openNext vault shares assets pricing allotments now validUntil
 
     choice ClosedQueuedRedeemPeriod_OpenBeyondLimits : ContractId ReferenceQueuedRedeemVault
       -- ^ Open the next period at a price outside the vault's limits, on the custodian's word as well.
@@ -316,10 +367,11 @@ template ClosedQueuedRedeemPeriod
         flowCids : [ContractId PeriodFlow]
         evidence : PriceEvidence
         validUntil : Time
+        allotments : [(Int, Decimal)]
       controller vault.vaultRegistrar, vault.custodian
       do
         (shares, assets, pricing, now) <- rollTotals (instantOf' vault) flowCids evidence validUntil
-        openNext vault shares assets pricing now validUntil
+        openNext vault shares assets pricing allotments now validUntil
 
     choice ClosedQueuedRedeemPeriod_Reopen : ContractId ReferenceQueuedRedeemVault
       -- ^ Undo the close when the next period cannot be opened, restoring the vault as it was.
@@ -346,6 +398,8 @@ template QueuedRedeemRequest
       -- ^ The period the request was made in, which is its id.
     minAssetsOut : Optional Decimal
       -- ^ The least underlying the receiver accepts; fulfilment below it fails.
+    filledIn : Optional Int
+      -- ^ The period the request was last filled in part, after which the redemption account holds the rest.
   where
     signatory vaultRegistrar
     observer owner, receiver, executors
@@ -356,10 +410,48 @@ template QueuedRedeemRequest
         actor : Party
       controller actor
       do
+        require "a request filled in part is closed by fulfilment or its owner's reclaim" (isNone filledIn)
         unless (actor `elem` (owner :: executors)) do
           expired <- isLedgerTimeGE expiresAt
           require "the owner or an executor drops a request, or the registrar once it has expired"
             (actor == vaultRegistrar && expired)
+
+    choice QueuedRedeemRequest_Reclaim : ()
+      -- ^ Return the shares not yet filled of a request filled in part to its owner, ending the request.
+      with
+        vaultCid : ContractId ReferenceQueuedRedeemVault
+        heldHoldingCids : [ContractId V2.Holding]
+          -- ^ The redemption account's holdings to return from; only those needed are used.
+        shareExtraArgs : ExtraArgs
+          -- ^ The share registry's context for allocating and settling.
+      controller owner
+      do
+        require "only a request filled in part is reclaimed" (isSome filledIn)
+        vault <- fetch vaultCid
+        require' ("vault.vaultId", vault.vaultId) isEqualR ("vaultId", vaultId)
+        require' ("vault.vaultRegistrar", vault.vaultRegistrar) isEqualR ("vaultRegistrar", vaultRegistrar)
+        let held = redemptionAccount vaultRegistrar
+            settlement = V2.SettlementInfo with
+              executors = [vaultRegistrar]; id = vaultId <> "/returns"; cid = None; meta = emptyMetadata
+            leg = V2.TransferLeg with
+              transferLegId = requestLegId owner label "return"
+              sender = held
+              receiver = basicAccount owner
+              amount = shares
+              instrumentId = vault.shareInstrument.id
+              meta = emptyMetadata
+        inputs <- coveringHoldings shares heldHoldingCids
+        from <- allocateSides vault.shareFactories shareExtraArgs settlement vault.rateValidFrom vaultRegistrar
+          held [vaultRegistrar] inputs [senderSide leg]
+        to <- allocateSides vault.shareFactories shareExtraArgs settlement vault.rateValidFrom vaultRegistrar
+          (basicAccount owner) [owner] [] [receiverSide leg]
+        _ <- exercise vault.shareFactories.settlementFactory V2.SettlementFactory_SettleBatch with
+          settlement
+          transferLegs = [leg]
+          allocations = [finalized from [], finalized to []]
+          actors = [vaultRegistrar]
+          extraArgs = shareExtraArgs
+        reportQueued vaultRegistrar [eventOf this Reclaimed]
 
 -- | The same vault as an instant one, for everything but redemptions.
 instantOf' : ReferenceQueuedRedeemVault -> ReferenceVault
@@ -410,8 +502,8 @@ checkReceipt v receiver escrowDeadline cid = do
   pure receiving.allocation.authorizer
 
 -- | Opens the next period at the totals measured, keeping the price it strikes.
-openNext : ReferenceQueuedRedeemVault -> Decimal -> Decimal -> Pricing -> Time -> Time -> Update (ContractId ReferenceQueuedRedeemVault)
-openNext v shares assets pricing now validUntil = do
+openNext : ReferenceQueuedRedeemVault -> Decimal -> Decimal -> Pricing -> [(Int, Decimal)] -> Time -> Time -> Update (ContractId ReferenceQueuedRedeemVault)
+openNext v shares assets pricing allotments now validUntil = do
   let next = v.epoch + 1
   _ <- create PeriodPrice with
     vaultId = v.vaultId
@@ -424,9 +516,42 @@ openNext v shares assets pricing now validUntil = do
     totalShares = shares
     totalAssets = assets
     pricing
+    allotments
     rateValidFrom = now
     rateValidUntil = validUntil
     epoch = next
+
+-- | One request's part of a fulfilment.
+data Fill = Fill with
+    request : QueuedRedeemRequest
+    sender : V2.Account
+      -- ^ The account the escrow sends from, or the redemption account once it holds the shares.
+    receiving : V2.Account
+    filled : Decimal
+      -- ^ The shares filled now.
+    assets : Decimal
+      -- ^ The underlying paid for them.
+
+-- | The share of a period's requests the current period fills; a vault priced from its pool fills them whole.
+fillFraction : ReferenceQueuedRedeemVault -> Int -> Update Decimal
+fillFraction v requestEpoch = case v.pricing of
+  PoolPricing -> pure 1.0
+  OraclePricing {} -> case lookup requestEpoch v.allotments of
+    Some fraction -> pure fraction
+    None -> fail ("no allotment this period for requests of period " <> show requestEpoch)
+
+-- | Allotments name earlier periods once each, with a share above nothing and at most all.
+validAllotments : Pricing -> Int -> [(Int, Decimal)] -> Bool
+validAllotments pricing epoch allotments = case pricing of
+  PoolPricing -> null allotments
+  OraclePricing {} -> unique (map fst allotments)
+    && all (\(e, fraction) -> e < epoch && fraction > 0.0 && fraction <= 1.0) allotments
+
+-- | The holdings of the instrument the first allocation's authorizer received in a settlement.
+receivedHoldings : Text -> V2.SettlementFactory_SettleBatchResult -> [ContractId V2.Holding]
+receivedHoldings instrumentId result = case result.allocationSettleResults of
+  first :: _ -> fromOptional [] (TextMap.lookup instrumentId first.authorizerHoldingCids)
+  [] -> []
 
 eventOf : QueuedRedeemRequest -> Outcome -> QueuedEvent
 eventOf r outcome = QueuedEvent with

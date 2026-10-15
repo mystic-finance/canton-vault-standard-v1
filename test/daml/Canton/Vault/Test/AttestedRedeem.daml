@@ -1,0 +1,285 @@
+-- | Queued redemptions from a vault priced by its oracle: filled in parts, the rest held, returned on reclaim.
+module Canton.Vault.Test.AttestedRedeem where
+
+import DA.Assert ((===))
+import DA.Optional (fromSome, optionalToList)
+import DA.Foldable (forA_)
+import DA.Time (addRelTime, days, hours, seconds)
+import Daml.Script
+
+import Canton.Vault.V1
+import Canton.Vault.Reference.QueuedRedeem qualified as R
+import Canton.Vault.Reference.Queue qualified as R
+import Canton.Vault.Reference.V1 (PeriodFlow(..), PriceEvidence(..), Pricing(..), RateAttestation(..))
+import Canton.Vault.Test.CrossAdminSettlement (Registry(..), tokenArgs, lockedTokens)
+import Canton.Vault.Test.QueueSupport
+import Canton.Vault.Test.QueuedRedeem
+import Canton.Vault.Test.Reports
+
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.HoldingV2 qualified as V2
+import Splice.Api.Token.AllocationV2 qualified as V2
+import Splice.TokenStandard.Utils
+import Splice.Testing.Tokens.TestTokenV2.Holding (Token(..))
+
+-- | The queued-redemption vault, re-created to be priced by a new oracle party.
+setupOracle : Script (Env, Party)
+setupOracle = do
+  env <- setup
+  oracle <- allocateParty "oracle"
+  Some vault <- queryContractId env.registrar env.vaultCid
+  vaultCid <- submitMulti [env.registrar, env.custodian] [] $
+    archiveCmd env.vaultCid *> createCmd vault with pricing = OraclePricing with oracle; latest = None
+  let env' = env with vaultCid
+  pure (env', oracle)
+
+-- | Rolls the vault on the oracle's price, filling the given share of each earlier period's requests.
+rollAt : Env -> Party -> Decimal -> [(Int, Decimal)] -> Script (Either SubmitError Env)
+rollAt env oracle price allotments = do
+  passTime (seconds 1)
+  now <- current env
+  closed <- closeQueued now
+  flows <- query @PeriodFlow env.registrar
+  at <- getTime
+  Some vault <- fmap (.vault) <$> queryContractId env.registrar closed
+  a <- submit oracle do
+    createCmd RateAttestation with
+      oracle; vaultRegistrar = env.registrar; vaultId = env.vaultId
+      pricePerShare = price; effectiveAt = at; attestationId = "nav-" <> show vault.epoch
+  r <- trySubmit env.registrar do
+    exerciseCmd closed R.ClosedQueuedRedeemPeriod_Open with
+      flowCids = [cid | (cid, flow) <- flows, flow.vaultId == env.vaultId]
+      evidence = Attestation a
+      validUntil = addRelTime at (hours 1)
+      allotments
+  pure (fmap (\cid -> env with vaultCid = cid) r)
+
+-- | The registrar's redemption account's holdings of the vault's shares.
+heldShares : Env -> Script [(ContractId Token, Decimal)]
+heldShares env = do
+  held <- query @Token env.registrar
+  pure [ (cid, h.holding.amount) | (cid, h) <- held, h.holding.instrumentId == sharesId env
+       , h.holding.account == redemptionAccount env.registrar ]
+
+-- | Fills the requests in the period now open, naming the redemption account's holdings for those filled before.
+fillTree : Env -> [Req] -> Script (Either SubmitError TransactionTree)
+fillTree env requests = do
+  now <- current env
+  pool <- map fst <$> heldBy env (usdId env) env.custodian
+  held <- map fst <$> heldShares env
+  locked <- lockedTokens env.shares (map (.shareAllocation) requests)
+  poolDs <- forA pool $ \cid -> fromSome <$> queryDisclosure env.custodian cid
+  heldDs <- forA held $ \cid -> fromSome <$> queryDisclosure env.registrar cid
+  vd <- queryDisclosure env.registrar now.vaultCid
+  prices <- pricesOf env
+  trySubmitTree (actAs env.venue <> discloseMany (optionalToList vd <> [env.usd.disclosure, env.shares.disclosure] <> locked <> poolDs <> heldDs)) do
+    exerciseCmd now.vaultCid R.ReferenceQueuedRedeemVault_Fulfil with
+      requestCids = map (.requestCid) requests
+      priceCids = prices
+      poolHoldingCids = map toInterfaceContractId pool
+      heldHoldingCids = map toInterfaceContractId held
+      underlyingExtraArgs = tokenArgs env.usd
+      shareExtraArgs = tokenArgs env.shares
+
+-- | The request as it stands, found by its label since a part fill replaces it.
+requestNow : Env -> Text -> Script Req
+requestNow env = requestOf env env.alice
+
+reclaimAs : Env -> Party -> Req -> Script (Either SubmitError ())
+reclaimAs env party req = do
+  now <- current env
+  held <- map fst <$> heldShares env
+  heldDs <- forA held $ \cid -> fromSome <$> queryDisclosure env.registrar cid
+  vd <- queryDisclosure env.registrar now.vaultCid
+  trySubmit (actAs party <> discloseMany (optionalToList vd <> [env.shares.disclosure] <> heldDs)) do
+    exerciseCmd req.requestCid R.QueuedRedeemRequest_Reclaim with
+      vaultCid = now.vaultCid
+      heldHoldingCids = map toInterfaceContractId held
+      shareExtraArgs = tokenArgs env.shares
+
+-- | A request filled in part: 40 of Alice's 100 shares paid, the other 60 held in the redemption account.
+partlyFilled : Script (Env, Party, Req)
+partlyFilled = do
+  (env, oracle) <- setupOracle
+  (_, req) <- request env env.alice "r1" 100.0
+  Right env <- rollAt env oracle 1.0 [(0, 0.4)]
+  Right _ <- fillTree env [req]
+  rest <- requestNow env "r1"
+  pure (env, oracle, rest)
+
+-- | A partial fill pays its share, holds the rest, and a later period fills the rest from the held shares.
+partFillHoldsTheRestAndFillsItLater : Script ()
+partFillHoldsTheRestAndFillsItLater = script do
+  (env, oracle) <- setupOracle
+  (_, req) <- request env env.alice "r1" 100.0
+  Right env <- rollAt env oracle 1.0 [(0, 0.4)]
+  Right tree <- fillTree env [req]
+  map (.outcome) (reported tree) === [R.PartlyFilled with received = 40.0; filled = 40.0]
+  unlocked env (usdId env) env.alice >>= (=== 40.0)
+  map snd <$> heldShares env >>= (=== [60.0])
+  rest <- requestNow env "r1"
+  Some r <- queryContractId env.alice rest.requestCid
+  (r.shares, r.filledIn) === (60.0, Some 1)
+
+  Right env <- rollAt env oracle 1.0 [(0, 1.0)]
+  Some vault <- queryContractId env.registrar env.vaultCid
+  vault.totalShares === 60.0
+  Right tree <- fillTree env [rest]
+  map (.outcome) (reported tree) === [R.Fulfilled with received = 60.0]
+  unlocked env (usdId env) env.alice >>= (=== 100.0)
+  heldShares env >>= (=== []) . map snd
+  query @R.QueuedRedeemRequest env.alice >>= (=== []) . map snd
+
+-- | A part too small to be a whole unit of shares is not filled.
+dustPartIsNotFilled : Script ()
+dustPartIsNotFilled = script do
+  (env, oracle) <- setupOracle
+  (_, req) <- request env env.alice "r1" 0.0000000001
+  Right env <- rollAt env oracle 1.0 [(0, 0.5)]
+  failsWith "each request fills a positive number of shares" =<< fillTree env [req]
+
+-- | A vault priced from its pool can always pay, so it takes no allotments.
+poolPricedVaultTakesNoAllotments : Script ()
+poolPricedVaultTakesNoAllotments = script do
+  env <- setup
+  (_, _) <- request env env.alice "r1" 100.0
+  closed <- closeQueued env
+  flows <- query @PeriodFlow env.registrar
+  pool <- query @Token env.custodian
+  now <- getTime
+  failsWith "Template precondition violated" =<< trySubmit (actAs env.registrar <> readAs env.custodian) do
+    exerciseCmd closed R.ClosedQueuedRedeemPeriod_Open with
+      flowCids = map fst flows
+      evidence = PoolHoldings [toInterfaceContractId cid | (cid, t) <- pool, t.holding.instrumentId == usdId env]
+      validUntil = addRelTime now (hours 1)
+      allotments = [(0, 0.5)]
+
+-- | Allotments name earlier periods once each, with a share above nothing and at most all.
+allotmentsAreChecked : Script ()
+allotmentsAreChecked = script do
+  (env, oracle) <- setupOracle
+  forA_ [[(0, 0.0)], [(0, 1.0000000001)], [(1, 0.5)], [(0, 0.5), (0, 0.5)]] $ \bad -> do
+    failsWith "Template precondition violated" =<< rollAt env oracle 1.0 bad
+    Some closed <- (fmap fst . headOf) <$> query @R.ClosedQueuedRedeemPeriod env.registrar
+    submit env.registrar (exerciseCmd closed R.ClosedQueuedRedeemPeriod_Reopen)
+  Right _ <- rollAt env oracle 1.0 [(0, 1.0)]
+  pure ()
+
+-- | An oracle-priced vault fills a period's requests only once its roll allots them a share.
+oracleVaultFillsOnlyWhatIsAllotted : Script ()
+oracleVaultFillsOnlyWhatIsAllotted = script do
+  (env, oracle) <- setupOracle
+  (_, req) <- request env env.alice "r1" 100.0
+  Right env <- rollAt env oracle 1.0 []
+  failsWith "no allotment this period for requests of period 0" =<< fillTree env [req]
+
+-- | A request is filled at most once a period, so its allotment is not taken twice.
+requestIsFilledAtMostOnceAPeriod : Script ()
+requestIsFilledAtMostOnceAPeriod = script do
+  (env, _, rest) <- partlyFilled
+  failsWith "a request is filled at most once a period" =<< fillTree env [rest]
+
+-- | The held rest counts as pending, after the escrow's deadline too.
+pendingCountsTheHeldRest : Script ()
+pendingCountsTheHeldRest = script do
+  (env, _, rest) <- partlyFilled
+  pending env 0 env.alice [rest.requestCid] >>= (=== 60.0)
+  passTime (window + days 1)
+  pending env 0 env.alice [rest.requestCid] >>= (=== 60.0)
+
+-- | The owner takes back the held rest, and the request ends.
+ownerReclaimsTheHeldRest : Script ()
+ownerReclaimsTheHeldRest = script do
+  (env, _, rest) <- partlyFilled
+  Right () <- reclaimAs env env.alice rest
+  unlocked env (sharesId env) env.alice >>= (=== 60.0)
+  heldShares env >>= (=== []) . map snd
+  query @R.QueuedRedeemRequest env.alice >>= (=== []) . map snd
+
+-- | Only a request filled in part has shares held to reclaim; a live escrow is the owner's to withdraw.
+onlyAHeldRequestIsReclaimed : Script ()
+onlyAHeldRequestIsReclaimed = script do
+  (env, _) <- setupOracle
+  (_, req) <- request env env.alice "r1" 100.0
+  failsWith "only a request filled in part is reclaimed" =<< reclaimAs env env.alice req
+
+-- | The held rest cannot be dropped or rejected, which would strand the shares; only fulfilment or reclaim ends it.
+heldRestIsNotDroppedOrRejected : Script ()
+heldRestIsNotDroppedOrRejected = script do
+  (env, _, rest) <- partlyFilled
+  passTime (window + days 1)
+  forA_ [env.registrar, env.venue, env.alice] $ \actor ->
+    failsWith "a request filled in part is closed by fulfilment or its owner's reclaim" =<< trySubmit actor do
+      exerciseCmd rest.requestCid R.QueuedRedeemRequest_Archive with actor
+  now <- current env
+  vd <- queryDisclosure env.registrar now.vaultCid
+  failsWith "a request filled in part is returned by its owner's reclaim" =<<
+    trySubmit (actAs env.venue <> discloseMany (optionalToList vd <> [env.shares.disclosure])) do
+      exerciseCmd now.vaultCid R.ReferenceQueuedRedeemVault_Reject with
+        requestCids = [rest.requestCid]; reason = "receiver blocked"; shareExtraArgs = tokenArgs env.shares
+
+-- | A reclaim names this vault, whose factories the registrar pinned; another vault's are refused.
+reclaimNamesThisVault : Script ()
+reclaimNamesThisVault = script do
+  (env, _, rest) <- partlyFilled
+  Some vault <- queryContractId env.registrar env.vaultCid
+  mallory <- allocateParty "mallory"
+  sibling <- submitMulti [env.registrar, env.custodian] [] do
+    createCmd vault with vaultId = "queued-redeem-2"; shareInstrument = vault.shareInstrument with id = "queued-redeem-2"
+  foreign <- submit mallory do
+    createCmd vault with vaultRegistrar = mallory; custodian = mallory; vaultId = "queued-redeem-1"
+                         shareInstrument = vault.shareInstrument with admin = mallory
+                         pricing = OraclePricing with oracle = env.registrar; latest = None
+                         executors = [env.registrar]
+  forA_ [(sibling, env.registrar, "vault.vaultId"), (foreign, mallory, "vault.vaultRegistrar")] $ \(other, keeper, reason) -> do
+    d <- queryDisclosure keeper other
+    failsWith reason =<< trySubmit (actAs env.alice <> discloseMany (optionalToList d <> [env.shares.disclosure])) do
+      exerciseCmd rest.requestCid R.QueuedRedeemRequest_Reclaim with
+        vaultCid = other; heldHoldingCids = []; shareExtraArgs = tokenArgs env.shares
+
+-- | A request's minimum applies pro rata to each part filled, and to the rest.
+minimumAppliesProRata : Script ()
+minimumAppliesProRata = script do
+  (env, oracle) <- setupOracle
+  escrowed <- escrow env env.alice "r1" 100.0
+  receiving <- receipt env env.alice
+  vd <- vaultDisclosure env
+  _ <- submit (actAs env.alice <> discloseMany [vd]) (requestCmdLimited env env.alice "r1" 100.0 escrowed receiving (Some 100.0))
+  req <- requestOf env env.alice "r1"
+  Right env <- rollAt env oracle 1.0 [(0, 0.4)]
+  Right _ <- fillTree env [req]
+  rest <- requestNow env "r1"
+  Some r <- queryContractId env.alice rest.requestCid
+  r.minAssetsOut === Some 60.0
+  Right env <- rollAt env oracle 0.99 [(0, 1.0)]
+  failsWith vaultSlippageExceeded =<< fillTree env [rest]
+
+-- | The escrow pays only the redemption account, so the executors cannot settle it anywhere else on their own.
+executorsCannotMoveTheEscrowElsewhere : Script ()
+executorsCannotMoveTheEscrowElsewhere = script do
+  env <- setup
+  (_, req) <- request env env.alice "r1" 40.0
+  let leg = V2.TransferLeg with
+        transferLegId = requestLegId env.alice "r1" "shares"; sender = basicAccount env.alice
+        receiver = basicAccount env.venue; amount = 40.0; instrumentId = env.vaultId; meta = emptyMetadata
+  mine <- allocateWith env.shares env.venue (V2.AllocationSpecification with
+      admin = env.registrar; authorizer = basicAccount env.venue
+      transferLegSides = [V2.TransferLegSide with
+        transferLegId = leg.transferLegId; side = V2.ReceiverSide; otherside = basicAccount env.alice
+        amount = 40.0; instrumentId = env.vaultId; meta = emptyMetadata]
+      settlementDeadline = None; nextIterationFunding = None; committed = False; meta = emptyMetadata) (settlementOf env) []
+  locked <- lockedTokens env.shares [req.shareAllocation]
+  let escrowed = V2.FinalizedAllocation with
+        allocationCid = req.shareAllocation; extraTransferLegSides = []; nextIterationFunding = None
+      theirs = V2.FinalizedAllocation with allocationCid = mine; extraTransferLegSides = []; nextIterationFunding = None
+  failsWith "missing authorizations" =<< trySubmit (actAs env.venue <> discloseMany (env.shares.disclosure :: locked)) do
+    exerciseCmd (toInterfaceContractId env.shares.rulesCid : ContractId V2.SettlementFactory) V2.SettlementFactory_SettleBatch with
+      settlement = settlementOf env
+      transferLegs = [leg]
+      allocations = [escrowed, theirs]
+      actors = [env.venue]
+      extraArgs = tokenArgs env.shares
+
+headOf : [a] -> Optional a
+headOf (x :: _) = Some x
+headOf [] = None

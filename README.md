@@ -20,12 +20,17 @@ transaction. A leg that comes back pending rather than completed mints nothing.
 Redemption is the reverse. The caller names the holdings funding each leg, in
 `extraArgs.context`, since a registry cannot search the ledger for them.
 
-Pricing is a computed rate with optional linear or continuous accrual, fixed for
-a rate period published on the vault's view. Every quantity rounds in the
-vault's favour, and a deposit that would mint zero shares is rejected. Without
-accrual no action reads the clock: the period's end and any expiry are checked
-as ledger-time bounds, as the token standard checks its deadlines, so an action
-prepared for external signing stays valid until its period ends.
+Pricing is fixed for a rate period published on the vault's view, with optional
+linear or continuous accrual. Each vault takes its price from one source, set
+when it is created: its pool, measured from the custodian's holdings at each
+roll, or an oracle, whose attestation of the price per share each roll uses up.
+An attestation must be the vault's oracle's, for this vault, not from the future
+and newer than the last; how fresh it must be is the operator's choice. Every
+quantity rounds in the vault's favour, and a deposit that would mint zero
+shares is rejected. Without accrual no action reads the clock: the period's end
+and any expiry are checked as ledger-time bounds, as the token standard checks
+its deadlines, so an action prepared for external signing stays valid until its
+period ends.
 
 The choices are nonconsuming, so concurrent deposits do not contend on the vault
 contract. Each action records what it moved, and the registrar folds those in
@@ -50,6 +55,15 @@ when they requested. A request filled later than that gets the current price if
 it is worse for the requester, so a late fill never beats the market. A
 requester may set a minimum, below which the request is not filled.
 
+A vault priced by its oracle may hold assets outside its pool, so it may not be
+able to pay every redemption at once. Its roll allots each earlier period a share
+of that period's unfilled requests, the oldest first, and every request of the
+period fills that share. A redemption escrow pays the registrar's
+`redemptionAccount`, which burns what is filled and holds the rest until a later
+period fills it or the owner reclaims it. Executors can settle the escrow only
+into that account, so they cannot move a holder's shares anywhere else. Instant
+redemptions are paid while the pool lasts.
+
 A batch settles whole or not at all, so one request that cannot settle, such as
 a receiver its registry has blocked, fails the rest. Executors dry-run a batch,
 settle the requests that pass, and `Reject` the one that fails, which returns
@@ -66,14 +80,15 @@ the roll nor the ledger grows with activity.
 ## Trust and limits
 
 - The registrar is trusted. It strikes the price at each roll from the pool it
-  measures, pauses the vault and re-pins its factories, and as admin of the
+  measures, or the attestation it is given, allots what an oracle-priced vault
+  can pay, holds the shares of partly filled redemptions, pauses the vault and re-pins its factories, and as admin of the
   share instrument it can issue itself shares and drain the pool. Holders rely
   on it as they rely on a fund's administrator.
 - A roll may move the price only within the vault's limits: a rise of so many
   basis points a year, pro rata for the period, and a one-off fall. A move
   beyond them, or a change to them, needs the custodian as well as the
-  registrar, so a mistaken measurement cannot reprice the vault on one party's
-  word.
+  registrar, so a mistaken measurement or attestation cannot reprice the vault
+  on one party's word. The oracle cannot be the registrar.
 - Each vault has its own custodian. Every unlocked holding of the underlying the
   custodian owns counts as the vault's pool, so two vaults sharing one would
   count each other's assets. The ledger cannot check this; the registrar must

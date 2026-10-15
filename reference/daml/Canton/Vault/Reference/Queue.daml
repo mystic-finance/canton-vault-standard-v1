@@ -128,9 +128,16 @@ data Outcome
   = Fulfilled with
       received : Decimal
         -- ^ The shares issued, or the underlying paid.
+  | PartlyFilled with
+      received : Decimal
+        -- ^ The underlying paid for the part filled.
+      filled : Decimal
+        -- ^ The shares filled; the rest stay queued.
   | Rejected with
       reason : Text
         -- ^ Why the request could not settle.
+  | Reclaimed
+      -- ^ The owner took back the shares not yet filled.
   deriving (Eq, Show, Serializable)
 
 -- | Reports queued requests' outcomes in the transaction they happen in, as the token standard's `EventLog` does.

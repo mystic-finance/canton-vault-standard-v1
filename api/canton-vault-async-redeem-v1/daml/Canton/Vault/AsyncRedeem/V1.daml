@@ -13,21 +13,25 @@ import Canton.Vault.V1
 -- fail, and its `maxWithdraw` and `maxRedeem` return zero.
 --
 -- The holder escrows a request with two allocations made before requesting:
--- one funded, sending the shares to the burn account, and one authorizing the
--- receiver to be paid the underlying by the custodian. Both are committed for at
--- least the vault's `settlementDeadlineWindow` and carry the settlement id
--- `requestSettlementId`; the escrow's leg carries the leg id `requestLegId`, and
--- the authorization has no legs. Each is issued by its instrument's registry,
--- signed by the registry's admin. The executors fulfil a request before its
--- deadline, settling both legs, at the rate its `RequestId` says; how they do so
--- is the vault's own.
+-- one funded, sending the shares to the registrar's `redemptionAccount`, and
+-- one authorizing the receiver to be paid the underlying by the custodian. Both
+-- are committed for at least the vault's `settlementDeadlineWindow` and carry
+-- the settlement id `requestSettlementId`; the escrow's leg carries the leg id
+-- `requestLegId`, and the authorization has no legs. Each is issued by its
+-- instrument's registry, signed by the registry's admin. The executors fulfil a
+-- request at the rate its `RequestId` says, settling the escrow before its
+-- deadline; how they do so is the vault's own. A vault may fill a request in
+-- parts over several periods, holding the rest of its shares in the redemption
+-- account meanwhile.
 interface VaultAsyncRedeem requires Vault where
   viewtype AsyncView
 
   -- | Shares the party has queued for redemption under the request id, as the
   -- contracts named in `extraArgs` show. A vault cannot look them up, so one not
   -- named does not count, and one named twice counts once; naming one that is
-  -- gone fails. A request counts until it is fulfilled, rejected or expires.
+  -- gone fails. A request counts until it is fulfilled, rejected or expires;
+  -- the unfilled rest of one filled in part counts until it is filled or
+  -- returned.
   pendingRedeemRequest : RequestId -> Party -> ExtraArgs -> Update Decimal
 
   vault_requestRedeemImpl : ContractId VaultAsyncRedeem -> Vault_RequestRedeem -> Update RequestId
@@ -48,8 +52,9 @@ interface VaultAsyncRedeem requires Vault where
         -- ^ The least underlying the receiver accepts; a fulfilment that would
         -- pay less fails rather than fill.
       shareAllocation : ContractId Allocation
-        -- ^ The funded escrow, sending `shares` to the burn account. Committed
-        -- until a deadline at least the vault's window away.
+        -- ^ The funded escrow, sending `shares` to the registrar's
+        -- `redemptionAccount`. Committed until a deadline at least the vault's
+        -- window away.
       underlyingAllocation : ContractId Allocation
         -- ^ The receiver's authorization to be paid the underlying by the
         -- custodian. It has no legs of its own, leaves the settlement open to

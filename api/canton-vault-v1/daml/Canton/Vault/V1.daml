@@ -170,6 +170,12 @@ requestLegId : Party -> Text -> Text -> Text
 requestLegId requester label leg =
   partyToText requester <> "/" <> label <> "/" <> leg
 
+-- | The account a queued redemption's escrow sends its shares to: the
+-- registrar's account for shares it holds for redeemers until they are burned
+-- or returned. Wallets compute it before allocating.
+redemptionAccount : Party -> Account
+redemptionAccount registrar = Account with owner = Some registrar; provider = None; id = "redemptions"
+
 --
 -- Vault
 ---------
