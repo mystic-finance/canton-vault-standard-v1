@@ -51,7 +51,7 @@ Regenerate with \`SPLICE_VERSION=<version> scripts/vendor-splice-dars.sh\`; don'
 the DARs by hand.
 
 These DARs are Splice's, licensed under Apache 2.0, copyright Digital Asset
-(Switzerland) GmbH and its affiliates: see the Splice repository. The MIT license
+(Switzerland) GmbH and its affiliates: see the Splice repository. The license
 at the root of this repository does not apply to them.
 
 | DAR |
