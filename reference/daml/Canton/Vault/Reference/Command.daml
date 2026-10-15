@@ -1,6 +1,8 @@
 -- | Actions signed ahead and run later at whichever period is open, for slow signers.
 module Canton.Vault.Reference.Command where
 
+import DA.Time (isLedgerTimeLT)
+
 import Canton.Vault.V1
 import Canton.Vault.Reference.V1
 
@@ -51,8 +53,8 @@ template VaultCommand
         extraArgs : ExtraArgs
       controller executor
       do
-        now <- getTime
-        require "command has not expired" (now < expiresAt)
+        live <- isLedgerTimeLT expiresAt
+        require "command has not expired" live
         vault <- exercise vaultCid ReferenceVault_Fetch with caller = executor
         require' ("vault.vaultId", vault.vaultId) isEqualR ("vaultId", vaultId)
         require' ("vault.vaultRegistrar", vault.vaultRegistrar) isEqualR ("vaultRegistrar", vaultRegistrar)
