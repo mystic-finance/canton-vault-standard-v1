@@ -1,11 +1,12 @@
 -- | A reference vault whose deposits are queued and redemptions instant.
 module Canton.Vault.Reference.QueuedDeposit where
 
+import DA.Action (unless)
 import DA.Foldable (forA_)
 import DA.List (dedup)
 import DA.Optional (isNone)
 import DA.TextMap qualified as TextMap
-import DA.Time (RelTime)
+import DA.Time (RelTime, isLedgerTimeGE, isLedgerTimeLT)
 
 import Canton.Vault.V1
 import Canton.Vault.AsyncDeposit.V1
@@ -99,12 +100,12 @@ template ReferenceQueuedDepositVault
 
       -- A request's id is the period it was made in.
       pendingDepositRequest requestId party extraArgs = do
-        now <- getTime
         requestCids : [ContractId QueuedDepositRequest] <- dedup <$> getContractIds depositRequestsKey extraArgs.context
         amounts <- forA requestCids $ \cid -> do
           r <- fetch cid
+          live <- isLedgerTimeLT r.expiresAt
           pure $ if r.vaultRegistrar == vaultRegistrar && r.vaultId == vaultId && r.requester == party
-                      && r.epoch == requestId && now < r.expiresAt
+                      && r.epoch == requestId && live
             then r.assets else 0.0
         pure (sum amounts)
 
@@ -214,9 +215,9 @@ template ReferenceQueuedDepositVault
         forA_ priced $ \(_, _, _, s) -> require "each request mints a positive number of shares" (s > 0.0)
 
         -- The vault's own sides: the custodian receives, the mint account sends.
-        custodianSide <- allocateSides underlyingFactories underlyingExtraArgs settlement underlyingInstrument.admin
+        custodianSide <- allocateSides underlyingFactories underlyingExtraArgs settlement rateValidFrom underlyingInstrument.admin
           (basicAccount custodian) [custodian] [] [receiverSide (underlyingLeg p) | p <- priced]
-        mintSide <- allocateSides shareFactories shareExtraArgs settlement vaultRegistrar
+        mintSide <- allocateSides shareFactories shareExtraArgs settlement rateValidFrom vaultRegistrar
           mintAccount [vaultRegistrar] [] [senderSide (shareLeg p) | p <- priced]
 
         _ <- exercise underlyingFactories.settlementFactory V2.SettlementFactory_SettleBatch with
@@ -357,9 +358,10 @@ template QueuedDepositRequest
         actor : Party
       controller actor
       do
-        now <- getTime
-        require "the requester or an executor drops a request, or the registrar once it has expired"
-          (actor `elem` (requester :: executors) || actor == vaultRegistrar && now >= expiresAt)
+        unless (actor `elem` (requester :: executors)) do
+          expired <- isLedgerTimeGE expiresAt
+          require "the requester or an executor drops a request, or the registrar once it has expired"
+            (actor == vaultRegistrar && expired)
 
 -- | The same vault as an instant one, for everything but deposits.
 instantOf' : ReferenceQueuedDepositVault -> ReferenceVault
