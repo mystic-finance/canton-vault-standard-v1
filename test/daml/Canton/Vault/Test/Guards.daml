@@ -36,7 +36,7 @@ rollRejectsDuplicatePoolHoldings = script do
   submitMustFail (actAs f.registrar <> discloseMany ds) do
     exerciseCmd closed2 ClosedPeriod_Open with
       flowCids = map fst flows
-      poolHoldingCids = dup <> dup
+      evidence = PoolHoldings (dup <> dup)
       validUntil = addRelTime now (hours 2)
 
 -- | A sibling vault's flows are readable under a shared registrar, so only the guard refuses them.
@@ -61,6 +61,7 @@ rollRejectsFlowsFromAnotherVault = script do
       depositCap = None
       paused = False
       underlyingTransferFactory = f.registryCid
+      pricing = PoolPricing
       priceLimits = wideLimits
 
   _ <- deposit f f.vaultTemplateCid f.alice 100.0
@@ -73,7 +74,7 @@ rollRejectsFlowsFromAnotherVault = script do
   submitMustFail (actAs f.registrar <> discloseMany ds) do
     exerciseCmd closed3 ClosedPeriod_Open with
       flowCids = map fst flows
-      poolHoldingCids = map (toInterfaceContractId . fst) pool
+      evidence = PoolHoldings (map (toInterfaceContractId . fst) pool)
       validUntil = addRelTime now (hours 2)
 
 -- | A flow a roll left out is still uncounted, so the next roll folds it in.
@@ -90,7 +91,7 @@ aFlowLeftOutOfARollCountsInTheNext = script do
   rolled <- submit (actAs f.registrar <> discloseMany ds) do
     exerciseCmd closed4 ClosedPeriod_Open with
       flowCids = []
-      poolHoldingCids = map (toInterfaceContractId . fst) pool
+      evidence = PoolHoldings (map (toInterfaceContractId . fst) pool)
       validUntil = addRelTime now (hours 2)
   Some missed <- queryContractId f.registrar rolled
   missed.totalShares === 0.0
@@ -99,7 +100,7 @@ aFlowLeftOutOfARollCountsInTheNext = script do
   caught <- submit (actAs f.registrar <> discloseMany ds) do
     exerciseCmd closed5 ClosedPeriod_Open with
       flowCids = map fst stale
-      poolHoldingCids = map (toInterfaceContractId . fst) pool
+      evidence = PoolHoldings (map (toInterfaceContractId . fst) pool)
       validUntil = addRelTime now (hours 3)
   Some vault <- queryContractId f.registrar caught
   vault.totalShares === 100.0
@@ -115,7 +116,7 @@ rollRejectsAPeriodEndingInThePast = script do
   submitMustFail (actAs f.registrar <> discloseMany ds) do
     exerciseCmd closed6 ClosedPeriod_Open with
       flowCids = []
-      poolHoldingCids = map (toInterfaceContractId . fst) pool
+      evidence = PoolHoldings (map (toInterfaceContractId . fst) pool)
       validUntil = addRelTime now (seconds (-1))
 
 -- Period expiry
@@ -343,7 +344,7 @@ rollRejectsLockedPoolHoldings = script do
     Some d -> submitMustFail (actAs f.registrar <> discloseMany [d]) do
       exerciseCmd closed7 ClosedPeriod_Open with
         flowCids = map fst flows
-        poolHoldingCids = [toInterfaceContractId lockedCid]
+        evidence = PoolHoldings ([toInterfaceContractId lockedCid])
         validUntil = addRelTime now (hours 2)
 
 -- | Shares of another instrument cannot be burned to fund a redemption.
@@ -514,7 +515,7 @@ rollRejectsNegativeShares = script do
   submitMustFail (actAs f.registrar <> discloseMany ds') do
     exerciseCmd closed8 ClosedPeriod_Open with
       flowCids = redemptions
-      poolHoldingCids = map (toInterfaceContractId . fst) emptied
+      evidence = PoolHoldings (map (toInterfaceContractId . fst) emptied)
       validUntil = addRelTime now (hours 2)
 
 -- | The period-open check sits on each of the four actions, not just deposit.
@@ -579,7 +580,7 @@ rollRejectsPoolHoldingsOutsideTheCustodianAccount = script do
   submitMustFail (actAs f.registrar <> discloseMany (ds <> [outsideD])) do
     exerciseCmd closed9 ClosedPeriod_Open with
       flowCids = map fst flows
-      poolHoldingCids = map (toInterfaceContractId . fst) pool <> [outside]
+      evidence = PoolHoldings (map (toInterfaceContractId . fst) pool <> [outside])
       validUntil = addRelTime now (hours 2)
 
 -- | The owner's other account is not the one being redeemed; only the guard refuses it.
@@ -719,6 +720,7 @@ mergeRefusesAnotherVaultsFlow = script do
       depositCap = None
       paused = False
       underlyingTransferFactory = f.registryCid
+      pricing = PoolPricing
       priceLimits = wideLimits
   _ <- deposit f f.vaultTemplateCid f.alice 100.0
   _ <- deposit f sibling f.alice 500.0

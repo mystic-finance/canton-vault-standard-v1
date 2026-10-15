@@ -34,7 +34,9 @@ template ReferenceQueuedDepositVault
     totalShares : Decimal
       -- ^ The shares in issue as of `rateValidFrom`.
     totalAssets : Decimal
-      -- ^ The pool as of `rateValidFrom`, before the virtual offset.
+      -- ^ The vault's value as of `rateValidFrom`, before the virtual offset.
+    pricing : Pricing
+      -- ^ Where each roll takes the price from, fixed for the vault's life.
     accrual : Optional Accrual
     depositFeeBps : Int
     redeemFeeBps : Int
@@ -67,6 +69,7 @@ template ReferenceQueuedDepositVault
         && redeemFeeBps >= 0 && redeemFeeBps <= 10000
         && executors /= []
         && validPriceLimits priceLimits
+        && validPricing vaultRegistrar pricing
 
     -- Pricing, redemption and the period accounting are the instant vault's.
     interface instance Vault for ReferenceQueuedDepositVault where
@@ -301,27 +304,27 @@ template ClosedQueuedPeriod
     signatory vault.vaultRegistrar, vault.custodian
 
     choice ClosedQueuedPeriod_Open : ContractId ReferenceQueuedDepositVault
-      -- ^ Open the next period, folding in the flows not yet counted and measuring the pool.
+      -- ^ Open the next period, folding in the flows not yet counted and pricing it from the evidence.
       with
         flowCids : [ContractId PeriodFlow]
-        poolHoldingCids : [ContractId V2.Holding]
+        evidence : PriceEvidence
         validUntil : Time
       controller vault.vaultRegistrar
       do
-        (shares, assets, now) <- rollTotals (instantOf' vault) flowCids poolHoldingCids validUntil
+        (shares, assets, pricing, now) <- rollTotals (instantOf' vault) flowCids evidence validUntil
         requirePriceWithinLimits vault.priceLimits (instantOf' vault) shares assets
-        openNext vault shares assets now validUntil
+        openNext vault shares assets pricing now validUntil
 
     choice ClosedQueuedPeriod_OpenBeyondLimits : ContractId ReferenceQueuedDepositVault
       -- ^ Open the next period at a price outside the vault's limits, on the custodian's word as well.
       with
         flowCids : [ContractId PeriodFlow]
-        poolHoldingCids : [ContractId V2.Holding]
+        evidence : PriceEvidence
         validUntil : Time
       controller vault.vaultRegistrar, vault.custodian
       do
-        (shares, assets, now) <- rollTotals (instantOf' vault) flowCids poolHoldingCids validUntil
-        openNext vault shares assets now validUntil
+        (shares, assets, pricing, now) <- rollTotals (instantOf' vault) flowCids evidence validUntil
+        openNext vault shares assets pricing now validUntil
 
     choice ClosedQueuedPeriod_Reopen : ContractId ReferenceQueuedDepositVault
       -- ^ Undo the close when the next period cannot be opened, restoring the vault as it was.
@@ -373,6 +376,7 @@ instantOf' v = ReferenceVault with
   shareInstrument = v.shareInstrument
   totalShares = v.totalShares
   totalAssets = v.totalAssets
+  pricing = v.pricing
   accrual = v.accrual
   depositFeeBps = v.depositFeeBps
   redeemFeeBps = v.redeemFeeBps
@@ -394,8 +398,8 @@ settlementFor v = V2.SettlementInfo with
   meta = emptyMetadata
 
 -- | Opens the next period at the totals measured, keeping the price it strikes.
-openNext : ReferenceQueuedDepositVault -> Decimal -> Decimal -> Time -> Time -> Update (ContractId ReferenceQueuedDepositVault)
-openNext v shares assets now validUntil = do
+openNext : ReferenceQueuedDepositVault -> Decimal -> Decimal -> Pricing -> Time -> Time -> Update (ContractId ReferenceQueuedDepositVault)
+openNext v shares assets pricing now validUntil = do
   let next = v.epoch + 1
   _ <- create PeriodPrice with
     vaultId = v.vaultId
@@ -407,6 +411,7 @@ openNext v shares assets now validUntil = do
   create v with
     totalShares = shares
     totalAssets = assets
+    pricing
     rateValidFrom = now
     rateValidUntil = validUntil
     epoch = next

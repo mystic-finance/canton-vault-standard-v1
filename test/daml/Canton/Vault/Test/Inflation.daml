@@ -45,7 +45,7 @@ donationBeforeTheFirstDepositDoesNotRobTheNext = script do
   rolledCid <- submit (actAs f.registrar <> discloseMany poolDisclosures) do
     exerciseCmd closed12 ClosedPeriod_Open with
       flowCids = map fst flows
-      poolHoldingCids = map (toInterfaceContractId . fst) pool
+      evidence = PoolHoldings (map (toInterfaceContractId . fst) pool)
       validUntil = addRelTime now (hours 2)
 
   -- The donation is now priced into the pool.

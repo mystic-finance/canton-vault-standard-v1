@@ -15,7 +15,7 @@ import Canton.Vault.AsyncRedeem.V1
 import Canton.Vault.Reference.Math (sharesToAssets, deductFeeBps)
 import Canton.Vault.Reference.QueuedRedeem qualified as R
 import Canton.Vault.Reference.Queue qualified as R
-import Canton.Vault.Reference.V1 (PeriodFlow(..), PriceLimits(..), shareHoldingsKey, underlyingHoldingsKey)
+import Canton.Vault.Reference.V1 (PeriodFlow(..), PriceEvidence(..), PriceLimits(..), Pricing(..), shareHoldingsKey, underlyingHoldingsKey)
 import Canton.Vault.Test.CrossAdminSettlement (Registry(..), setupTokenRegistry, tokenArgs, lockedTokens)
 import Canton.Vault.Test.QueueSupport
 import Canton.Vault.Test.Reports
@@ -88,6 +88,7 @@ setupWithFee redeemFeeBps = do
       underlyingTransferFactory = toInterfaceContractId usd.rulesCid
       underlyingFactories = factoriesOf usd
       shareFactories = factoriesOf shares
+      pricing = PoolPricing
       priceLimits = generousLimits
   let env = Env with usd; shares; registrar; custodian; venue; alice; vaultCid; vaultId
   _ <- holdingOf custodian usd.admin (usdId env) 60.0
@@ -748,7 +749,7 @@ openQueued env closed = do
   vaultCid <- submit (actAs env.registrar <> readAs env.custodian) do
     exerciseCmd closed R.ClosedQueuedRedeemPeriod_Open with
       flowCids = [cid | (cid, flow) <- flows, flow.vaultId == env.vaultId]
-      poolHoldingCids = map (toInterfaceContractId . fst) pool
+      evidence = PoolHoldings (map (toInterfaceContractId . fst) pool)
       validUntil = addRelTime now (hours 1)
   pure env with vaultCid
 
@@ -1377,10 +1378,10 @@ aQueuedRollBeyondTheLimitsNeedsTheCustodian = script do
   let open beyond parties = trySubmit (actAs parties <> readAs env.custodian) $
         if beyond
           then exerciseCmd closed R.ClosedQueuedRedeemPeriod_OpenBeyondLimits with
-            flowCids = map fst flows; poolHoldingCids = map (toInterfaceContractId . fst) pool
+            flowCids = map fst flows; evidence = PoolHoldings (map (toInterfaceContractId . fst) pool)
             validUntil = addRelTime now (hours 1)
           else exerciseCmd closed R.ClosedQueuedRedeemPeriod_Open with
-            flowCids = map fst flows; poolHoldingCids = map (toInterfaceContractId . fst) pool
+            flowCids = map fst flows; evidence = PoolHoldings (map (toInterfaceContractId . fst) pool)
             validUntil = addRelTime now (hours 1)
   failsWith "the price rises within the vault's limit" =<< open False [env.registrar]
   failsWith "requires authorizers" =<< open True [env.registrar]
