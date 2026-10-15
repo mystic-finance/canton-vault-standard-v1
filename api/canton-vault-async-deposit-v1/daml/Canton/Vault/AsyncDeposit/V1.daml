@@ -3,6 +3,7 @@
 module Canton.Vault.AsyncDeposit.V1 where
 
 import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.HoldingV2 (Holding)
 import Splice.Api.Token.AllocationV2 (Allocation)
 
 import Canton.Vault.V1
@@ -12,15 +13,16 @@ import Canton.Vault.V1
 -- `Vault_Mint`, `previewDeposit` and `previewMint` then fail, and its
 -- `maxDeposit` and `maxMint` return zero.
 --
--- The depositor escrows a request with two allocations made before requesting:
--- one funded, sending the underlying to the custodian, and one authorizing the
--- receiver to be issued shares from the mint account. Both are committed for at
--- least the vault's `settlementDeadlineWindow` and carry the settlement id
--- `requestSettlementId`; the escrow's leg carries the leg id `requestLegId`, and
--- the authorization has no legs. Each is issued by its instrument's registry,
--- signed by the registry's admin. The executors fulfil a request before its
--- deadline, settling both legs, at the rate its `RequestId` says; how they do so
--- is the vault's own.
+-- The request escrows the underlying: the vault allocates it from the holdings
+-- the depositor names, sending `assets` to the custodian under the settlement id
+-- `requestSettlementId` with the leg id `requestLegId`, committed until the end
+-- of the request's period plus the vault's `settlementDeadlineWindow`. Each
+-- request so has an escrow of its own, which the vault built. The receiver
+-- authorizes being issued shares from the mint account with an allocation made
+-- before requesting, under the same settlement id, with no legs, committed at
+-- least as long as the escrow and issued by the share registry. The executors
+-- fulfil a request before its deadline, settling both, at the rate its
+-- `RequestId` says; how they do so is the vault's own.
 interface VaultAsyncDeposit requires Vault where
   viewtype AsyncView
 
@@ -47,19 +49,19 @@ interface VaultAsyncDeposit requires Vault where
       minSharesOut : Optional Decimal
         -- ^ The fewest shares the requester accepts; a fulfilment that would
         -- issue fewer fails rather than fill.
-      underlyingAllocation : ContractId Allocation
-        -- ^ The funded escrow, sending `assets` of the underlying to the
-        -- custodian. Committed until a deadline at least the vault's window away.
+      inputHoldingCids : [ContractId Holding]
+        -- ^ The depositor's holdings of the underlying that fund the escrow.
       shareAllocation : ContractId Allocation
         -- ^ The receiver's authorization to be issued shares from the mint
         -- account. It has no legs of its own, leaves the settlement open to
         -- further iterations, where the executors add the share legs, and is
         -- committed as the escrow is.
       actors : [Party]
-        -- ^ Parties executing the request. Checked against the party whose
-        -- underlying is escrowed.
+        -- ^ Parties executing the request: the parties of the account the
+        -- escrow is funded from.
       extraArgs : ExtraArgs
-        -- ^ Additional context required in order to exercise the choice.
+        -- ^ The underlying registry's context for allocating the escrow, and
+        -- the funding account, as the instant deposit takes it.
     observer vault_requestDepositExtraObservers this arg
     controller actors
     do vault_requestDepositImpl this self arg

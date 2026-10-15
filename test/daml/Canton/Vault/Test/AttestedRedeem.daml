@@ -244,7 +244,7 @@ minimumAppliesProRata = script do
   escrowed <- escrow env env.alice "r1" 100.0
   receiving <- receipt env env.alice
   vd <- vaultDisclosure env
-  _ <- submit (actAs env.alice <> discloseMany [vd]) (requestCmdLimited env env.alice "r1" 100.0 escrowed receiving (Some 100.0))
+  _ <- submit (actAs env.alice <> discloseMany [vd, env.shares.disclosure]) (requestCmdLimited env env.alice "r1" 100.0 escrowed receiving (Some 100.0))
   req <- requestOf env env.alice "r1"
   Right env <- rollAt env oracle 1.0 [(0, 0.4)]
   Right _ <- fillTree env [req]

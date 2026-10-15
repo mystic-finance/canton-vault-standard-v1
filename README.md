@@ -42,11 +42,14 @@ leaves nothing on the ledger.
 
 ## Queued requests
 
-A queued vault takes a request instead of settling at once. The
-requester escrows what they pay in as a committed allocation, and the receiver
-authorizes what they get, both under the vault's settlement id
-(`requestSettlementId`). The vault records the pair as a registrar-signed
-request, whose id is the rate period it was made in.
+A queued vault takes a request instead of settling at once. The request
+escrows what the requester pays in: the vault allocates it from the holdings they
+name, with the exact leg it will settle, committed until the request's period
+ends plus the vault's window, so each request has an escrow of its own that lasts
+until it can be filled. The receiver authorizes what they get with an allocation
+lasting at least as long, under the same settlement id (`requestSettlementId`).
+The vault records the pair as a registrar-signed request, whose id is the rate
+period it was made in.
 
 Once that period closes, executors fulfil requests in batches, settling both
 registries' legs in one transaction, at the price struck when the next period

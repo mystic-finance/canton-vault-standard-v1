@@ -6,7 +6,7 @@ import DA.Foldable (forA_)
 import DA.List (dedup, unique)
 import DA.Optional (fromOptional, isNone, isSome)
 import DA.TextMap qualified as TextMap
-import DA.Time (RelTime, isLedgerTimeGE, isLedgerTimeLT)
+import DA.Time (RelTime, addRelTime, isLedgerTimeGE, isLedgerTimeLT)
 
 import Canton.Vault.V1
 import Canton.Vault.AsyncRedeem.V1
@@ -124,29 +124,31 @@ template ReferenceQueuedRedeemVault
         require "the redemption pays out at the current rate"
           (deductFeeBps redeemFeeBps (sharesToAssets totalShares assets' arg.shares) > 0.0)
         let settlement = settlementFor this
+            escrowDeadline = addRelTime rateValidUntil settlementDeadlineWindow
 
-        escrowed <- fetchSigned "escrow" vaultRegistrar arg.shareAllocation
-        let owner = escrowed.allocation.authorizer
-        checkActors arg.actors [regularAccountParties owner]
-        require' ("escrow.settlement", escrowed.settlement) isEqualR ("settlement", settlement)
-        require "escrow is not iterated" (isNone escrowed.allocation.nextIterationFunding)
-        require' ("escrow legs", map legKey escrowed.allocation.transferLegSides) isEqualR
-          ("request legs", [ ( requestLegId (regularAccountOwner owner) arg.label "shares"
-                             , V2.SenderSide, redemptionAccount vaultRegistrar, arg.shares, shareInstrument.id ) ])
-        requireCommittedFor "escrow" settlementDeadlineWindow escrowed.allocation
+        -- The vault builds the escrow, so its leg and deadline are the ones it settles and no other request has it.
+        from <- fundingAccount arg.actors arg.extraArgs
+        let owner = regularAccountOwner from
+        escrow <- allocateEscrow shareFactories arg.extraArgs settlement rateValidFrom escrowDeadline
+          vaultRegistrar from arg.inputHoldingCids V2.TransferLegSide with
+            transferLegId = requestLegId owner arg.label "shares"
+            side = V2.SenderSide
+            otherside = redemptionAccount vaultRegistrar
+            amount = arg.shares
+            instrumentId = shareInstrument.id
+            meta = emptyMetadata
 
-        escrowDeadline <- deadlineOf escrowed.allocation
         -- Only the owner's receipt can be read here; fulfilment checks every receipt again.
-        when (arg.receiver == regularAccountOwner owner) $
+        when (arg.receiver == owner) $
           void (checkReceipt this arg.receiver escrowDeadline arg.underlyingAllocation)
 
         _ <- create QueuedRedeemRequest with
           vaultId; vaultRegistrar; executors
-          owner = regularAccountOwner owner
+          owner
           receiver = arg.receiver
           label = arg.label
           shares = arg.shares
-          shareAllocation = arg.shareAllocation
+          shareAllocation = escrow
           underlyingAllocation = arg.underlyingAllocation
           expiresAt = escrowDeadline
           epoch

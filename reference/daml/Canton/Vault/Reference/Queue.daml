@@ -4,7 +4,6 @@ module Canton.Vault.Reference.Queue where
 import DA.Foldable (forA_)
 import DA.List (dedup, unique)
 import DA.TextMap qualified as TextMap
-import DA.Time (RelTime, addRelTime, isLedgerTimeLE)
 
 import Splice.Api.Token.MetadataV1
 import Splice.Api.Token.HoldingV2 qualified as V2
@@ -18,15 +17,26 @@ data Factories = Factories with
     settlementFactory : ContractId V2.SettlementFactory
   deriving (Show, Eq, Serializable)
 
--- | Refuses an allocation that is not committed for at least the vault's window from now.
-requireCommittedFor : Text -> RelTime -> V2.AllocationSpecification -> Update ()
-requireCommittedFor what window allocation = do
-  require (what <> " is committed") allocation.committed
-  case allocation.settlementDeadline of
-    Some deadline -> do
-      inWindow <- isLedgerTimeLE (addRelTime deadline (negate window))
-      require (what <> " is committed for the vault's window") inWindow
-    None -> fail (what <> " needs a settlement deadline")
+-- | Allocates a request's escrow from the requester's holdings: one leg, committed until the deadline.
+allocateEscrow : Factories -> ExtraArgs -> V2.SettlementInfo -> Time -> Time -> Party -> V2.Account -> [ContractId V2.Holding] -> V2.TransferLegSide -> Update (ContractId V2.Allocation)
+allocateEscrow factories extraArgs settlement requestedAt deadline admin authorizer inputHoldingCids leg = do
+  result <- exercise factories.allocationFactory V2.AllocationFactory_Allocate with
+    settlement
+    allocation = V2.AllocationSpecification with
+      admin
+      authorizer
+      transferLegSides = [leg]
+      settlementDeadline = Some deadline
+      nextIterationFunding = None
+      committed = True
+      meta = emptyMetadata
+    requestedAt
+    inputHoldingCids
+    extraArgs
+    actors = regularAccountParties authorizer
+  case result.output of
+    V2.AllocationInstructionResult_Completed with allocationCid -> pure allocationCid
+    _ -> fail "the escrow's allocation did not complete"
 
 -- | Fetches an allocation, refusing one its registry's admin did not sign.
 fetchSigned : Text -> Party -> ContractId V2.Allocation -> Update V2.AllocationView
@@ -45,7 +55,7 @@ requireDistinct labels allocations = do
   require "each request in the batch has its own label" (unique labels)
   require "each request in the batch has its own allocations" (unique allocations)
 
--- | The allocation's settlement deadline, which `requireCommittedFor` has checked it names.
+-- | The allocation's settlement deadline.
 deadlineOf : V2.AllocationSpecification -> Update Time
 deadlineOf allocation = case allocation.settlementDeadline of
   Some deadline -> pure deadline
@@ -57,9 +67,6 @@ requireFactoriesOf actor admin factories = do
   require' ("allocation factory admin", allocationView.admin) isEqualR ("registry admin", admin)
   settlementView <- exercise factories.settlementFactory V2.SettlementFactory_PublicFetch with actors = [actor]
   require' ("settlement factory admin", settlementView.admin) isEqualR ("registry admin", admin)
-
-legKey : V2.TransferLegSide -> (Text, V2.TransferSide, V2.Account, Decimal, Text)
-legKey leg = (leg.transferLegId, leg.side, leg.otherside, leg.amount, leg.instrumentId)
 
 finalized : ContractId V2.Allocation -> [V2.TransferLegSide] -> V2.FinalizedAllocation
 finalized allocationCid extra = V2.FinalizedAllocation with
