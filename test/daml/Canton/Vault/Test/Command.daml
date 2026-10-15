@@ -2,13 +2,14 @@
 module Canton.Vault.Test.Command where
 
 import DA.Assert ((===))
-import DA.Time (RelTime, addRelTime, hours)
+import DA.Time (RelTime, addRelTime, hours, microseconds, minutes)
 import Daml.Script
 
 import Canton.Vault.V1
 import Canton.Vault.Reference.V1
 import Canton.Vault.Reference.Command
 import Canton.Vault.Test.Deposit
+import Canton.Vault.Test.Limits (failsWith)
 import Canton.Vault.Test.MockToken
 import Canton.Vault.Test.Periods
 
@@ -61,15 +62,18 @@ commandRunsAtTheOpenPeriod = script do
   Right result <- run f venue commandCid rolled
   result.shares === quote.depositPreview
 
+-- | A command runs up to, not at, its expiry.
 commandPastItsExpiryIsRefused : Script ()
 commandPastItsExpiryIsRefused = script do
   f <- setupVault
   venue <- allocateParty "venue"
-  commandCid <- sign f venue (hours 1)
-  passTime (hours 2)
-  rolled <- rollPeriod f f.vaultTemplateCid
-  Left _ <- run f venue commandCid rolled
-  pure ()
+  now <- getTime
+  early <- sign f venue (minutes 30)
+  late <- sign f venue (minutes 30)
+  setTime (addRelTime now (minutes 30 + microseconds (-1)))
+  Right _ <- run f venue early f.vaultTemplateCid
+  setTime (addRelTime now (minutes 30))
+  failsWith "command has not expired" =<< run f venue late f.vaultTemplateCid
 
 -- | A sibling vault under the same registrar is not the vault the command names.
 commandForAnotherVaultIsRefused : Script ()

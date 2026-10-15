@@ -4,6 +4,7 @@ module Canton.Vault.Reference.V1 where
 import DA.List (dedup, head)
 import DA.Optional (fromOptional)
 import DA.TextMap qualified as TextMap
+import DA.Time (isLedgerTimeLT)
 
 import Canton.Vault.V1
 import Canton.Vault.Reference.Math
@@ -473,10 +474,13 @@ heldShares vault extraArgs party = do
     pure holding.amount
   pure (sum amounts)
 
+-- | The pool's value now; only a vault that accrues reads the clock.
 currentAssets : ReferenceVault -> Update Decimal
-currentAssets vault = do
-  now <- getTime
-  pure (accrue vault.accrual vault.totalAssets vault.rateValidFrom now)
+currentAssets vault = case vault.accrual of
+  None -> pure vault.totalAssets
+  Some _ -> do
+    now <- getTime
+    pure (accrue vault.accrual vault.totalAssets vault.rateValidFrom now)
 
 -- | A clear failure for a receiver outside the actors, who could not sign their shares.
 requireReceiverAuthorizes : Party -> [Party] -> Update ()
@@ -486,8 +490,8 @@ requireReceiverAuthorizes receiver actors =
 -- | Refuses to transact against a rate period that has ended.
 requirePeriodOpen : ReferenceVault -> Update ()
 requirePeriodOpen vault = do
-  now <- getTime
-  require "rate period is still open" (now < vault.rateValidUntil)
+  open <- isLedgerTimeLT vault.rateValidUntil
+  require "rate period is still open" open
 
 -- | The deposit's funding account; the actors must be exactly its parties.
 fundingAccount : [Party] -> ExtraArgs -> Update V2.Account
@@ -557,14 +561,13 @@ completed output = case output of
 
 transferOutput : ReferenceVault -> ExtraArgs -> [Party] -> V2.Account -> V2.Account -> Decimal -> [ContractId V2.Holding] -> Update V2.TransferInstructionResult_Output
 transferOutput vault extraArgs actors sender receiver amount inputHoldingCids = do
-  now <- getTime
   result <- exercise vault.underlyingTransferFactory V2.TransferFactory_Transfer with
     transfer = V2.Transfer with
       sender
       receiver
       amount
       instrumentId = vault.underlyingInstrument
-      requestedAt = now
+      requestedAt = vault.rateValidFrom
       executeBefore = vault.rateValidUntil
       inputHoldingCids
       meta = emptyMetadata
