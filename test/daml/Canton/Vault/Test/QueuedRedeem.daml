@@ -7,7 +7,7 @@ import DA.Foldable (forA_)
 import DA.List (head)
 import DA.Optional (fromSome, optionalToList)
 import DA.TextMap qualified as TextMap
-import DA.Time (RelTime, addRelTime, days, hours)
+import DA.Time (RelTime, addRelTime, days, hours, microseconds)
 import Daml.Script
 
 import Canton.Vault.V1
@@ -1147,12 +1147,28 @@ registrarDropsAnExpiredRequest = script do
   submit env.registrar (exerciseCmd req.requestCid R.QueuedRedeemRequest_Archive with actor = env.registrar)
   query @R.QueuedRedeemRequest env.alice >>= (=== []) . map snd
 
--- | Until then the request is live, and the registrar cannot drop it.
+-- | Until then the request is live, and the registrar cannot drop it; from its expiry, it can.
 registrarCannotDropALiveRequest : Script ()
 registrarCannotDropALiveRequest = script do
   env <- setup
   (_, req) <- request env env.alice "r1" 10.0
-  submitMustFail env.registrar (exerciseCmd req.requestCid R.QueuedRedeemRequest_Archive with actor = env.registrar)
+  Some r <- queryContractId env.registrar req.requestCid
+  setTime (addRelTime r.expiresAt (microseconds (-1)))
+  failsWith "or the registrar once it has expired" =<<
+    trySubmit env.registrar (exerciseCmd req.requestCid R.QueuedRedeemRequest_Archive with actor = env.registrar)
+  setTime r.expiresAt
+  submit env.registrar (exerciseCmd req.requestCid R.QueuedRedeemRequest_Archive with actor = env.registrar)
+
+-- | A request counts as pending up to, not at, its expiry.
+pendingEndsAtExpiry : Script ()
+pendingEndsAtExpiry = script do
+  env <- setup
+  (rid, req) <- request env env.alice "r1" 10.0
+  Some r <- queryContractId env.registrar req.requestCid
+  setTime (addRelTime r.expiresAt (microseconds (-1)))
+  pending env rid env.alice [req.requestCid] >>= (=== 10.0)
+  setTime r.expiresAt
+  pending env rid env.alice [req.requestCid] >>= (=== 0.0)
 
 -- | A request expires with its escrow, though its receipt lasts longer.
 requestExpiresWithItsEscrow : Script ()

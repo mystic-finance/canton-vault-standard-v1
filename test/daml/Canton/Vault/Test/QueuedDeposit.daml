@@ -6,7 +6,7 @@ import DA.Action (void)
 import DA.Foldable (forA_)
 import DA.Optional (fromSome)
 import DA.TextMap qualified as TextMap
-import DA.Time (RelTime, addRelTime, days, hours)
+import DA.Time (RelTime, addRelTime, days, hours, microseconds)
 import Daml.Script
 
 import Canton.Vault.V1
@@ -385,6 +385,19 @@ escrowShorterThanTheWindowIsRefused : Script ()
 escrowShorterThanTheWindowIsRefused = script do
   env <- setup
   requestRefused env "r1" (standardEscrow env 100.0) with deadline = Some (hours 1)
+
+-- | An escrow committed for exactly the window is enough; a microsecond less is not.
+escrowCommittedForExactlyTheWindowIsAccepted : Script ()
+escrowCommittedForExactlyTheWindowIsAccepted = script do
+  env <- setup
+  vd <- vaultDisclosure env
+  exact <- fund env env.alice "r1" ((standardEscrow env 100.0) with deadline = Some window)
+  receiving <- authorize env env.alice (settlementOf env)
+  _ <- submit (actAs env.alice <> discloseMany [vd]) (requestCmd env env.alice "r1" 100.0 exact receiving)
+  short <- fund env env.alice "r2" ((standardEscrow env 100.0) with deadline = Some (window + microseconds (-1)))
+  receiving <- authorize env env.alice (settlementOf env)
+  failsWith "escrow is committed for the vault's window" =<<
+    trySubmit (actAs env.alice <> discloseMany [vd]) (requestCmd env env.alice "r2" 100.0 short receiving)
 
 -- | A share authorization that fixes its own amount would pre-empt the rate.
 shareAuthorizationWithLegsIsRefused : Script ()
@@ -1130,12 +1143,28 @@ registrarDropsAnExpiredRequest = script do
   submit env.registrar (exerciseCmd req.requestCid Q.QueuedDepositRequest_Archive with actor = env.registrar)
   query @Q.QueuedDepositRequest env.alice >>= (=== []) . map snd
 
--- | Until then the request is live, and the registrar cannot drop it.
+-- | Until then the request is live, and the registrar cannot drop it; from its expiry, it can.
 registrarCannotDropALiveRequest : Script ()
 registrarCannotDropALiveRequest = script do
   env <- setup
   (_, req) <- request env env.alice "r1" 10.0
-  submitMustFail env.registrar (exerciseCmd req.requestCid Q.QueuedDepositRequest_Archive with actor = env.registrar)
+  Some r <- queryContractId env.registrar req.requestCid
+  setTime (addRelTime r.expiresAt (microseconds (-1)))
+  failsWith "or the registrar once it has expired" =<<
+    trySubmit env.registrar (exerciseCmd req.requestCid Q.QueuedDepositRequest_Archive with actor = env.registrar)
+  setTime r.expiresAt
+  submit env.registrar (exerciseCmd req.requestCid Q.QueuedDepositRequest_Archive with actor = env.registrar)
+
+-- | A request counts as pending up to, not at, its expiry.
+pendingEndsAtExpiry : Script ()
+pendingEndsAtExpiry = script do
+  env <- setup
+  (rid, req) <- request env env.alice "r1" 10.0
+  Some r <- queryContractId env.registrar req.requestCid
+  setTime (addRelTime r.expiresAt (microseconds (-1)))
+  pending env rid env.alice [req.requestCid] >>= (=== 10.0)
+  setTime r.expiresAt
+  pending env rid env.alice [req.requestCid] >>= (=== 0.0)
 
 -- | A request expires with its escrow, though its authorization lasts longer.
 requestExpiresWithItsEscrow : Script ()

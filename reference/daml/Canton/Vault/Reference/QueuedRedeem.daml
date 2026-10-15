@@ -1,12 +1,12 @@
 -- | A reference vault whose deposits are instant and redemptions queued.
 module Canton.Vault.Reference.QueuedRedeem where
 
-import DA.Action (void, when)
+import DA.Action (unless, void, when)
 import DA.Foldable (forA_)
 import DA.List (dedup)
 import DA.Optional (isNone)
 import DA.TextMap qualified as TextMap
-import DA.Time (RelTime)
+import DA.Time (RelTime, isLedgerTimeGE, isLedgerTimeLT)
 
 import Canton.Vault.V1
 import Canton.Vault.AsyncRedeem.V1
@@ -101,12 +101,12 @@ template ReferenceQueuedRedeemVault
 
       -- A request's id is the period it was made in.
       pendingRedeemRequest requestId party extraArgs = do
-        now <- getTime
         requestCids : [ContractId QueuedRedeemRequest] <- dedup <$> getContractIds redeemRequestsKey extraArgs.context
         amounts <- forA requestCids $ \cid -> do
           r <- fetch cid
+          live <- isLedgerTimeLT r.expiresAt
           pure $ if r.vaultRegistrar == vaultRegistrar && r.vaultId == vaultId && r.owner == party
-                      && r.epoch == requestId && now < r.expiresAt
+                      && r.epoch == requestId && live
             then r.shares else 0.0
         pure (sum amounts)
 
@@ -210,9 +210,9 @@ template ReferenceQueuedRedeemVault
         pool <- coveringHoldings payout poolHoldingCids
 
         -- The vault's own sides: the burn account receives the shares, the custodian pays out.
-        burnSide <- allocateSides shareFactories shareExtraArgs settlement vaultRegistrar
+        burnSide <- allocateSides shareFactories shareExtraArgs settlement rateValidFrom vaultRegistrar
           burnAccount [vaultRegistrar] [] [receiverSide (shareLeg p) | p <- priced]
-        custodianSide <- allocateSides underlyingFactories underlyingExtraArgs settlement underlyingInstrument.admin
+        custodianSide <- allocateSides underlyingFactories underlyingExtraArgs settlement rateValidFrom underlyingInstrument.admin
           (basicAccount custodian) [custodian] pool [senderSide (payoutLeg p) | p <- priced]
 
         _ <- exercise shareFactories.settlementFactory V2.SettlementFactory_SettleBatch with
@@ -353,9 +353,10 @@ template QueuedRedeemRequest
         actor : Party
       controller actor
       do
-        now <- getTime
-        require "the owner or an executor drops a request, or the registrar once it has expired"
-          (actor `elem` (owner :: executors) || actor == vaultRegistrar && now >= expiresAt)
+        unless (actor `elem` (owner :: executors)) do
+          expired <- isLedgerTimeGE expiresAt
+          require "the owner or an executor drops a request, or the registrar once it has expired"
+            (actor == vaultRegistrar && expired)
 
 -- | The same vault as an instant one, for everything but redemptions.
 instantOf' : ReferenceQueuedRedeemVault -> ReferenceVault

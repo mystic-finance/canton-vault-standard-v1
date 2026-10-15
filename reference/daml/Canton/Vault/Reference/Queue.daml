@@ -4,7 +4,7 @@ module Canton.Vault.Reference.Queue where
 import DA.Foldable (forA_)
 import DA.List (dedup, unique)
 import DA.TextMap qualified as TextMap
-import DA.Time (RelTime, addRelTime)
+import DA.Time (RelTime, addRelTime, isLedgerTimeLE)
 
 import Splice.Api.Token.MetadataV1
 import Splice.Api.Token.HoldingV2 qualified as V2
@@ -21,10 +21,11 @@ data Factories = Factories with
 -- | Refuses an allocation that is not committed for at least the vault's window from now.
 requireCommittedFor : Text -> RelTime -> V2.AllocationSpecification -> Update ()
 requireCommittedFor what window allocation = do
-  now <- getTime
   require (what <> " is committed") allocation.committed
   case allocation.settlementDeadline of
-    Some deadline -> require (what <> " is committed for the vault's window") (deadline >= addRelTime now window)
+    Some deadline -> do
+      inWindow <- isLedgerTimeLE (addRelTime deadline (negate window))
+      require (what <> " is committed for the vault's window") inWindow
     None -> fail (what <> " needs a settlement deadline")
 
 -- | Fetches an allocation, refusing one its registry's admin did not sign.
@@ -67,9 +68,8 @@ finalized allocationCid extra = V2.FinalizedAllocation with
   nextIterationFunding = None
 
 -- | Allocates the vault's side of every leg in a batch, which settles at once.
-allocateSides : Factories -> ExtraArgs -> V2.SettlementInfo -> Party -> V2.Account -> [Party] -> [ContractId V2.Holding] -> [V2.TransferLegSide] -> Update (ContractId V2.Allocation)
-allocateSides factories extraArgs settlement admin authorizer actors inputHoldingCids sides = do
-  now <- getTime
+allocateSides : Factories -> ExtraArgs -> V2.SettlementInfo -> Time -> Party -> V2.Account -> [Party] -> [ContractId V2.Holding] -> [V2.TransferLegSide] -> Update (ContractId V2.Allocation)
+allocateSides factories extraArgs settlement requestedAt admin authorizer actors inputHoldingCids sides = do
   result <- exercise factories.allocationFactory V2.AllocationFactory_Allocate with
     settlement
     allocation = V2.AllocationSpecification with
@@ -80,7 +80,7 @@ allocateSides factories extraArgs settlement admin authorizer actors inputHoldin
       nextIterationFunding = None
       committed = False
       meta = emptyMetadata
-    requestedAt = now
+    requestedAt
     inputHoldingCids
     extraArgs
     actors
