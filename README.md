@@ -37,9 +37,12 @@ leaves nothing on the ledger.
 
 ## Queued requests
 
-A queued-deposit vault takes a request instead of settling at once. The
-requester escrows the underlying as a committed allocation, and the receiver
-authorizes being issued shares, both under the vault's settlement id
+A queued-deposit vault takes a request instead of settling at once. The request
+escrows the underlying: the vault allocates it from the holdings the requester
+names, with the exact leg it will settle, committed until the request's period
+ends plus the vault's window, so each request has an escrow of its own that lasts
+until it can be filled. The receiver authorizes being issued shares with an
+allocation lasting at least as long, under the same settlement id
 (`requestSettlementId`). The vault records the pair as a registrar-signed
 request, whose id is the rate period it was made in.
 
