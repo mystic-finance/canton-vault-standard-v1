@@ -6,7 +6,7 @@ import DA.Foldable (forA_)
 import DA.List (dedup)
 import DA.Optional (isNone)
 import DA.TextMap qualified as TextMap
-import DA.Time (RelTime, isLedgerTimeGE, isLedgerTimeLT)
+import DA.Time (RelTime, addRelTime, isLedgerTimeGE, isLedgerTimeLT)
 
 import Canton.Vault.V1
 import Canton.Vault.AsyncDeposit.V1
@@ -118,16 +118,19 @@ template ReferenceQueuedDepositVault
         require "the deposit is worth shares at the current rate"
           (assetsToShares totalShares assets' (deductFeeBps depositFeeBps arg.assets) > 0.0)
         let settlement = settlementFor this
+            escrowDeadline = addRelTime rateValidUntil settlementDeadlineWindow
 
-        funded <- fetchSigned "escrow" underlyingInstrument.admin arg.underlyingAllocation
-        let requester = funded.allocation.authorizer
-        checkActors arg.actors [regularAccountParties requester]
-        require' ("escrow.settlement", funded.settlement) isEqualR ("settlement", settlement)
-        require "escrow is not iterated" (isNone funded.allocation.nextIterationFunding)
-        require' ("escrow legs", map legKey funded.allocation.transferLegSides) isEqualR
-          ("request legs", [ ( requestLegId (regularAccountOwner requester) arg.label "underlying"
-                             , V2.SenderSide, basicAccount custodian, arg.assets, underlyingInstrument.id ) ])
-        requireCommittedFor "escrow" settlementDeadlineWindow funded.allocation
+        -- The vault builds the escrow, so its leg and deadline are the ones it settles and no other request has it.
+        from <- fundingAccount arg.actors arg.extraArgs
+        let requester = regularAccountOwner from
+        escrow <- allocateEscrow underlyingFactories arg.extraArgs settlement rateValidFrom escrowDeadline
+          underlyingInstrument.admin from arg.inputHoldingCids V2.TransferLegSide with
+            transferLegId = requestLegId requester arg.label "underlying"
+            side = V2.SenderSide
+            otherside = basicAccount custodian
+            amount = arg.assets
+            instrumentId = underlyingInstrument.id
+            meta = emptyMetadata
 
         receiving <- fetchSigned "share authorization" vaultRegistrar arg.shareAllocation
         require' ("share authorization.settlement", receiving.settlement) isEqualR ("settlement", settlement)
@@ -137,18 +140,17 @@ template ReferenceQueuedDepositVault
         require "share authorization names no legs" (receiving.allocation.transferLegSides == [])
         require "share authorization allows the executors to add a leg"
           (receiving.allocation.nextIterationFunding == Some TextMap.empty)
-        requireCommittedFor "share authorization" settlementDeadlineWindow receiving.allocation
-        escrowDeadline <- deadlineOf funded.allocation
+        require "share authorization is committed" receiving.allocation.committed
         authorizationDeadline <- deadlineOf receiving.allocation
         require "the share authorization lasts as long as the escrow" (authorizationDeadline >= escrowDeadline)
 
         _ <- create QueuedDepositRequest with
           vaultId; vaultRegistrar; executors
-          requester = regularAccountOwner requester
+          requester
           receiver = arg.receiver
           label = arg.label
           assets = arg.assets
-          underlyingAllocation = arg.underlyingAllocation
+          underlyingAllocation = escrow
           shareAllocation = arg.shareAllocation
           expiresAt = escrowDeadline
           epoch

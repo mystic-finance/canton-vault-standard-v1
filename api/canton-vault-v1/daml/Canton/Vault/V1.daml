@@ -126,9 +126,10 @@ data AsyncView = AsyncView with
       -- ^ The parties who fulfil and cancel requests, acting together: settling
       -- or cancelling a pending escrow needs all of them.
     settlementDeadlineWindow : RelTime
-      -- ^ The least time a request's allocations stay committed after it is
-      -- made. Until their deadline only the executors can settle or cancel
-      -- them; after it, the requester can withdraw them.
+      -- ^ How long after the end of its period a request's escrow stays
+      -- committed: the time the executors have to fill it. Until the deadline
+      -- only the executors can settle or cancel it; after it, the requester can
+      -- withdraw it.
     meta : Metadata
       -- ^ Additional metadata specific to the vault, used for extensibility.
   deriving (Show, Eq, Serializable)
