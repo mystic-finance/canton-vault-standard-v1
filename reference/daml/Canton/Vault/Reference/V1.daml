@@ -269,14 +269,23 @@ template ReferenceVault
           let cost shares = grossUpFeeBps depositFeeBps (sharesToAssetsUp totalShares assets' shares)
           pure (fitDown (\s -> cost s <= cap) (assetsToShares totalShares assets' (deductFeeBps depositFeeBps cap)))
 
-      -- The most assets whose shares, fee included, the party holds.
+      -- The most assets whose shares, fee included, the party holds, and that the pool can pay.
       maxWithdraw party extraArgs = do
         assets' <- currentAssets this
         held <- heldShares this extraArgs party
+        payable <- payableFrom this extraArgs
         let burned assets = assetsToSharesUp totalShares assets' (grossUpFeeBps redeemFeeBps assets)
-        pure (fitDown (\a -> burned a <= held) (deductFeeBps redeemFeeBps (sharesToAssets totalShares assets' held)))
+        pure (fitDown (\a -> burned a <= held) (min payable (deductFeeBps redeemFeeBps (sharesToAssets totalShares assets' held))))
 
-      maxRedeem party extraArgs = heldShares this extraArgs party
+      -- The shares the party holds, as many as the pool can pay for.
+      maxRedeem party extraArgs = do
+        held <- heldShares this extraArgs party
+        payable <- payableFrom this extraArgs
+        if payable >= uncapped || redeemFeeBps >= 10000 then pure held else do
+          assets' <- currentAssets this
+          let paid s = deductFeeBps redeemFeeBps (sharesToAssets totalShares assets' s)
+          pure (fitDown (\s -> paid s <= payable)
+            (min held (assetsToShares totalShares assets' (grossUpFeeBps redeemFeeBps payable))))
 
       previewDeposit assets = do
         assets' <- currentAssets this
@@ -538,6 +547,13 @@ sumPool vault holdingCids = do
     require "pool holding is unlocked" (holding.lock == None)
     pure holding.amount
   pure (sum amounts)
+
+-- | What an exit can be paid: the pool named in `extraArgs` for a vault priced by its oracle, whose value can sit
+-- outside the pool; no limit for one priced from its pool, which holds all its value.
+payableFrom : ReferenceVault -> ExtraArgs -> Update Decimal
+payableFrom vault extraArgs = case vault.pricing of
+  PoolPricing -> pure uncapped
+  OraclePricing {} -> sumPool vault =<< getUnderlyingHoldings extraArgs.context
 
 -- | Shares the party holds among the holdings they named; unnamed ones do not count.
 heldShares : ReferenceVault -> ExtraArgs -> Party -> Update Decimal

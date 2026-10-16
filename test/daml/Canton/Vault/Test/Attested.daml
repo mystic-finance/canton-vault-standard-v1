@@ -13,6 +13,8 @@ import Canton.Vault.Test.Limits (failsWith, lidoLimits)
 import Canton.Vault.Test.MockToken
 import Canton.Vault.Test.Periods
 
+import Splice.Api.Token.MetadataV1 (ExtraArgs)
+
 -- | The fixture's vault, re-created to be priced by a new oracle party.
 setupOracleVault : Script (Fixture, Party)
 setupOracleVault = do
@@ -81,6 +83,48 @@ instantRedemptionsArePaidWhileThePoolLasts = script do
   Right first <- redeemFrom f rolled 50.0
   first.assets === 75.0
   failsWith "'available' is less than 'transfer.amount'" =<< redeemFrom f rolled 50.0
+
+-- | Reads exit limits with the registrar's and custodian's authority, which the shares and the pool need.
+template ExitProbe
+  with
+    registrar : Party
+    custodian : Party
+  where
+    signatory registrar, custodian
+
+    choice ExitProbe_Max : (Decimal, Decimal)
+      with
+        vaultCid : ContractId Vault
+        party : Party
+        extraArgs : ExtraArgs
+      controller registrar
+      do
+        vault <- fetch vaultCid
+        (,) <$> maxWithdraw vault party extraArgs <*> maxRedeem vault party extraArgs
+
+-- | Alice's most withdrawable assets and redeemable shares, naming her shares and the pool.
+maxExits : Fixture -> ContractId ReferenceVault -> Script (Decimal, Decimal)
+maxExits f vaultCid = do
+  held <- query @ShareHolding f.alice
+  pool <- query @MockHolding f.custodian
+  submit (actAs [f.registrar, f.custodian]) do
+    createAndExerciseCmd (ExitProbe with registrar = f.registrar; custodian = f.custodian) ExitProbe_Max with
+      vaultCid = toInterfaceContractId vaultCid; party = f.alice
+      extraArgs = redeemArgs f (map (toInterfaceContractId . fst) pool) (map fst held)
+
+-- | An oracle-priced vault's exits are capped at what the pool can pay, so a withdrawal or redemption at the
+-- maximum goes through.
+maxExitsAreWhatThePoolCanPay : Script ()
+maxExitsAreWhatThePoolCanPay = script do
+  (f, oracle) <- setupOracleVault
+  _ <- deposit f f.vaultTemplateCid f.alice 100.0
+  now <- getTime
+  Right rolled <- rollAttested f f.vaultTemplateCid =<< attest f oracle 1.5 now "nav-1"
+  (withdrawMax, redeemMax) <- maxExits f rolled
+  (withdrawMax, redeemMax) === (100.0, 66.6666666666)
+  failsWith "'available' is less than 'transfer.amount'" =<< redeemFrom f rolled 100.0
+  Right redeemed <- redeemFrom f rolled redeemMax
+  redeemed.assets === 99.9999999999
 
 attestationFromAnotherPartyIsRefused : Script ()
 attestationFromAnotherPartyIsRefused = script do
