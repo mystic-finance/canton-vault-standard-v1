@@ -3,8 +3,6 @@
 module Canton.Vault.AsyncDeposit.V1 where
 
 import Splice.Api.Token.MetadataV1
-import Splice.Api.Token.HoldingV2 (Holding)
-import Splice.Api.Token.AllocationV2 (Allocation)
 
 import Canton.Vault.V1
 
@@ -13,23 +11,26 @@ import Canton.Vault.V1
 -- `Vault_Mint`, `previewDeposit` and `previewMint` then fail, and its
 -- `maxDeposit` and `maxMint` return zero.
 --
--- The request escrows the underlying: the vault allocates it from the holdings
--- the depositor names, sending `assets` to the custodian under the settlement id
--- `requestSettlementId` with the leg id `requestLegId`, committed until the end
--- of the request's period plus the vault's `settlementDeadlineWindow`. Each
--- request so has an escrow of its own, which the vault built. The receiver
--- authorizes being issued shares from the mint account with an allocation made
--- before requesting, under the same settlement id, with no legs, committed at
--- least as long as the escrow and issued by the share registry. The executors
--- fulfil a request before its deadline, settling both, at the rate its
--- `RequestId` says; how they do so is the vault's own.
+-- A request names its terms, and the vault publishes the allocations it needs
+-- as the token standard's `AllocationRequest`: the depositor's escrow, sending
+-- `assets` to the custodian with the leg id `requestLegId`, and the receiver's
+-- authorization to be issued shares, with no legs. Both carry the request's own
+-- settlement, with the id `requestSettlementId` and a contract id naming the
+-- request, so an allocation made for one request settles no other; both are
+-- committed until the end of the request's period plus the vault's
+-- `settlementDeadlineWindow`. Wallets allocate exactly as requested, and the
+-- executors bind the allocations before the request's period ends, so none is
+-- made knowing the price; a request unfunded by then is dropped. The executors
+-- fulfil a request before its deadline, at the rate its `RequestId` says; how
+-- they do so is the vault's own.
 interface VaultAsyncDeposit requires Vault where
   viewtype AsyncView
 
   -- | Units of the underlying the party has queued under the request id, as the
   -- contracts named in `extraArgs` show. A vault cannot look them up, so one not
   -- named does not count, and one named twice counts once; naming one that is
-  -- gone fails. A request counts until it is fulfilled, rejected or expires.
+  -- gone fails. A request counts once its allocations are bound, until it is
+  -- fulfilled, rejected or expires.
   pendingDepositRequest : RequestId -> Party -> ExtraArgs -> Update Decimal
 
   vault_requestDepositImpl : ContractId VaultAsyncDeposit -> Vault_RequestDeposit -> Update RequestId
@@ -49,19 +50,12 @@ interface VaultAsyncDeposit requires Vault where
       minSharesOut : Optional Decimal
         -- ^ The fewest shares the requester accepts; a fulfilment that would
         -- issue fewer fails rather than fill.
-      inputHoldingCids : [ContractId Holding]
-        -- ^ The depositor's holdings of the underlying that fund the escrow.
-      shareAllocation : ContractId Allocation
-        -- ^ The receiver's authorization to be issued shares from the mint
-        -- account. It has no legs of its own, leaves the settlement open to
-        -- further iterations, where the executors add the share legs, and is
-        -- committed as the escrow is.
       actors : [Party]
         -- ^ Parties executing the request: the parties of the account the
         -- escrow is funded from.
       extraArgs : ExtraArgs
-        -- ^ The underlying registry's context for allocating the escrow, and
-        -- the funding account, as the instant deposit takes it.
+        -- ^ The funding account, as the instant deposit takes it, and the
+        -- receiver's account under `receiver`, both in `meta`.
     observer vault_requestDepositExtraObservers this arg
     controller actors
     do vault_requestDepositImpl this self arg
