@@ -3,8 +3,6 @@
 module Canton.Vault.AsyncRedeem.V1 where
 
 import Splice.Api.Token.MetadataV1
-import Splice.Api.Token.HoldingV2 (Holding)
-import Splice.Api.Token.AllocationV2 (Allocation)
 
 import Canton.Vault.V1
 
@@ -13,23 +11,27 @@ import Canton.Vault.V1
 -- `Vault_Withdraw`, `Vault_Redeem`, `previewWithdraw` and `previewRedeem` then
 -- fail, and its `maxWithdraw` and `maxRedeem` return zero.
 --
--- The request escrows the shares: the vault allocates them from the holdings
--- the holder names, sending `shares` to the burn account under the settlement id
--- `requestSettlementId` with the leg id `requestLegId`, committed until the end
--- of the request's period plus the vault's `settlementDeadlineWindow`. Each
--- request so has an escrow of its own, which the vault built. The receiver
--- authorizes being paid the underlying by the custodian with an allocation made
--- before requesting, under the same settlement id, with no legs, committed at
--- least as long as the escrow and issued by the underlying's registry. The
--- executors fulfil a request before its deadline, settling both, at the rate its
--- `RequestId` says; how they do so is the vault's own.
+-- A request names its terms, and the vault publishes the allocations it needs
+-- as the token standard's `AllocationRequest`: the holder's escrow, sending
+-- `shares` to the burn account with the leg id `requestLegId`, and the
+-- receiver's authorization to be paid the underlying by the custodian, with no
+-- legs. Both carry the request's own settlement, with the id
+-- `requestSettlementId` and a contract id naming the request, so an allocation
+-- made for one request settles no other; both are committed until the end of
+-- the request's period plus the vault's `settlementDeadlineWindow`. Wallets
+-- allocate exactly as requested, and the executors bind the allocations before
+-- the request's period ends, so none is made knowing the price; a request
+-- unfunded by then is dropped. The executors fulfil a request before its
+-- deadline, at the rate its `RequestId` says; how they do so is the vault's
+-- own.
 interface VaultAsyncRedeem requires Vault where
   viewtype AsyncView
 
   -- | Shares the party has queued for redemption under the request id, as the
   -- contracts named in `extraArgs` show. A vault cannot look them up, so one not
   -- named does not count, and one named twice counts once; naming one that is
-  -- gone fails. A request counts until it is fulfilled, rejected or expires.
+  -- gone fails. A request counts once its allocations are bound, until it is
+  -- fulfilled, rejected or expires.
   pendingRedeemRequest : RequestId -> Party -> ExtraArgs -> Update Decimal
 
   vault_requestRedeemImpl : ContractId VaultAsyncRedeem -> Vault_RequestRedeem -> Update RequestId
@@ -49,19 +51,12 @@ interface VaultAsyncRedeem requires Vault where
       minAssetsOut : Optional Decimal
         -- ^ The least underlying the receiver accepts; a fulfilment that would
         -- pay less fails rather than fill.
-      inputHoldingCids : [ContractId Holding]
-        -- ^ The holder's share holdings that fund the escrow.
-      underlyingAllocation : ContractId Allocation
-        -- ^ The receiver's authorization to be paid the underlying by the
-        -- custodian. It has no legs of its own, leaves the settlement open to
-        -- further iterations, where the executors add the payout leg, and is
-        -- committed as the escrow is.
       actors : [Party]
         -- ^ Parties executing the request: the parties of the account the
         -- escrow is funded from.
       extraArgs : ExtraArgs
-        -- ^ The share registry's context for allocating the escrow, and the
-        -- funding account, as the instant deposit takes it.
+        -- ^ The funding account, as the instant deposit takes it, and the
+        -- receiver's account under `receiver`, both in `meta`.
     observer vault_requestRedeemExtraObservers this arg
     controller actors
     do vault_requestRedeemImpl this self arg

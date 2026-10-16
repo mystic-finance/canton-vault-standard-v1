@@ -23,6 +23,7 @@ import Canton.Vault.Test.Reports
 import Splice.Api.Token.MetadataV1
 import Splice.Api.Token.HoldingV2 qualified as V2
 import Splice.Api.Token.AllocationV2 qualified as V2
+import Splice.Api.Token.AllocationRequestV2 qualified as AR
 import Splice.Api.Token.AllocationInstructionV2 qualified as V2
 import Splice.Api.Token.TransferInstructionV2 qualified as V2
 import Splice.TokenStandard.Utils
@@ -152,10 +153,6 @@ escrowSpec env party label amount now = V2.AllocationSpecification with
   committed = True
   meta = emptyMetadata
 
--- | The holder's shares funding one request, which the vault escrows.
-escrow : Env -> Party -> Text -> Decimal -> Script [ContractId V2.Holding]
-escrow env party _label _amount = map (toInterfaceContractId . fst) <$> heldBy env (sharesId env) party
-
 -- | The receiver's committed authorization to be paid, the amount left to fulfilment.
 receiptSpec : Env -> Party -> Time -> V2.AllocationSpecification
 receiptSpec env party now = V2.AllocationSpecification with
@@ -188,33 +185,44 @@ vaultDisclosure env = do
   now <- current env
   fromSome <$> queryDisclosure env.registrar now.vaultCid
 
-requestCmd : Env -> Party -> Text -> Decimal -> [ContractId V2.Holding] -> ContractId V2.Allocation -> Commands RequestId
-requestCmd env party label shares escrowed receiving = requestCmdLimited env party label shares escrowed receiving None
-
-requestCmdLimited : Env -> Party -> Text -> Decimal -> [ContractId V2.Holding] -> ContractId V2.Allocation -> Optional Decimal -> Commands RequestId
-requestCmdLimited env party label shares escrowed receiving minAssetsOut =
+-- | A request on the party's behalf, naming its terms; the vault publishes the allocations it needs.
+requestCmd : Env -> Party -> Text -> Decimal -> Party -> Optional Decimal -> Commands RequestId
+requestCmd env party label shares receiver minAssetsOut =
   exerciseCmd (toInterfaceContractId env.vaultCid : ContractId VaultAsyncRedeem) Vault_RequestRedeem with
-    label
-    shares
-    receiver = party
-    minAssetsOut
-    inputHoldingCids = escrowed
-    underlyingAllocation = receiving
+    label; shares; receiver; minAssetsOut
     actors = [party]
-    extraArgs = tokenArgs env.shares
+    extraArgs = ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata
 
--- | A request made by the given actors, the holder's account parties.
-requestCmdAs : Env -> [Party] -> Text -> Decimal -> [ContractId V2.Holding] -> ContractId V2.Allocation -> Commands RequestId
-requestCmdAs env actors label shares escrowed receiving =
-  exerciseCmd (toInterfaceContractId env.vaultCid : ContractId VaultAsyncRedeem) Vault_RequestRedeem with
-    label
-    shares
-    receiver = env.alice
-    minAssetsOut = None
-    inputHoldingCids = escrowed
-    underlyingAllocation = receiving
-    actors
-    extraArgs = tokenArgs env.shares
+requestTerms : Env -> Party -> Text -> Decimal -> Party -> Optional Decimal -> Script (Either SubmitError RequestId)
+requestTerms env party label shares receiver minAssetsOut = do
+  now <- current env
+  vd <- vaultDisclosure now
+  trySubmit (actAs party <> discloseMany [vd]) (requestCmd now party label shares receiver minAssetsOut)
+
+-- | The allocation request the vault published for the party's request under the label.
+published : Env -> Party -> Text -> Script (ContractId R.RequestAllocations, R.RequestAllocations)
+published env party label = do
+  open <- query @R.RequestAllocations party
+  case [(cid, r) | (cid, r) <- open, r.vaultId == env.vaultId, r.label == label] of
+    found :: _ -> pure found
+    [] -> abort ("no allocation request under " <> label)
+
+-- | The escrow, allocated exactly as requested from the holder's shares.
+escrowAsRequested : Env -> R.RequestAllocations -> Script (ContractId V2.Allocation)
+escrowAsRequested env r = do
+  inputs <- map (toInterfaceContractId . fst) <$> heldBy env (sharesId env) r.requester
+  allocateWith env.shares r.requester r.escrow r.settlement inputs
+
+-- | The receiver's receipt authorization, allocated exactly as requested.
+receiptAsRequested : Env -> R.RequestAllocations -> Script (ContractId V2.Allocation)
+receiptAsRequested env r = allocateWith env.usd r.receiver r.authorization r.settlement []
+
+bindAs : Env -> Party -> ContractId R.RequestAllocations -> ContractId V2.Allocation -> ContractId V2.Allocation -> Script (Either SubmitError (ContractId R.QueuedRedeemRequest))
+bindAs env party requestCid shareAllocation underlyingAllocation = do
+  now <- current env
+  vd <- vaultDisclosure now
+  trySubmit (actAs party <> discloseMany [vd, env.usd.disclosure, env.shares.disclosure]) do
+    exerciseCmd now.vaultCid R.ReferenceQueuedRedeemVault_Bind with requestCid; shareAllocation; underlyingAllocation
 
 -- | A request the vault recorded, with the allocations it binds.
 data Req = Req with
@@ -230,15 +238,19 @@ requestOf env party label = do
     (cid, r) :: _ -> pure Req with requestCid = cid; shareAllocation = r.shareAllocation; underlyingAllocation = r.underlyingAllocation
     [] -> abort ("no request recorded under " <> label)
 
-request : Env -> Party -> Text -> Decimal -> Script (RequestId, Req)
-request env party label shares = do
-  escrowed <- escrow env party label shares
-  receiving <- receipt env party
-  now <- current env
-  vd <- vaultDisclosure now
-  rid <- submit (actAs party <> discloseMany [vd, env.shares.disclosure]) (requestCmd now party label shares escrowed receiving)
+-- | A request made, allocated exactly as requested and bound, as holder, receiver and executors would.
+requestFor : Env -> Party -> Party -> Text -> Decimal -> Optional Decimal -> Script (RequestId, Req)
+requestFor env party receiver label shares minAssetsOut = do
+  Right rid <- requestTerms env party label shares receiver minAssetsOut
+  (cid, r) <- published env party label
+  escrowed <- escrowAsRequested env r
+  receiving <- receiptAsRequested env r
+  Right _ <- bindAs env env.venue cid escrowed receiving
   req <- requestOf env party label
   pure (rid, req)
+
+request : Env -> Party -> Text -> Decimal -> Script (RequestId, Req)
+request env party label shares = requestFor env party party label shares None
 
 -- | Every price the vault has struck.
 pricesOf : Env -> Script [ContractId R.PeriodPrice]
@@ -440,20 +452,6 @@ payoutTakesOnlyTheHoldingsItNeeds = script do
   Some _ <- queryContractId env.custodian (head smaller)
   pure ()
 
--- | A receipt names only the vault, so a roll between signing and requesting leaves it usable.
-receiptSurvivesARoll : Script ()
-receiptSurvivesARoll = script do
-  env <- setup
-  receiving <- receipt env env.alice
-  closed <- closeQueued env
-  next <- openQueued env closed
-  escrowed <- escrow env env.alice "r1" 40.0
-  vd <- vaultDisclosure next
-  _ <- submit (actAs env.alice <> discloseMany [vd, env.shares.disclosure]) (requestCmd next env.alice "r1" 40.0 escrowed receiving)
-  req <- requestOf next env.alice "r1"
-  Right () <- fulfilAs next env.venue [req]
-  unlocked env (usdId env) env.alice >>= (=== 40.0)
-
 -- What a queued-redemption vault refuses
 ------------------------------------------
 
@@ -475,121 +473,22 @@ instantRedemptionIsRefused = script do
       shares = 10.0; owner = env.alice; receiver = env.alice; minAssetsOut = None
       actors = [env.alice]; extraArgs = args
 
-requestRefused : Env -> [ContractId V2.Holding] -> ContractId V2.Allocation -> Script ()
-requestRefused env escrowed receiving = do
-  vd <- vaultDisclosure env
-  submitMustFail (actAs env.alice <> discloseMany [vd, env.shares.disclosure]) (requestCmd env env.alice "r1" 40.0 escrowed receiving)
-
-receiptRefused : Env -> ContractId V2.Allocation -> Script ()
-receiptRefused env receiving = do
-  escrowed <- escrow env env.alice "r1" 40.0
-  requestRefused env escrowed receiving
-
--- | Shares of another registry under the vault's instrument name cannot fund the escrow.
-fundingOfAnotherRegistryIsRefused : Script ()
-fundingOfAnotherRegistryIsRefused = script do
-  env <- setup
-  other <- setupTokenRegistry "otherRegistrar"
-  fake <- holdingOf env.alice other.admin (V2.InstrumentId with admin = other.admin; id = env.vaultId) 40.0
-  receiving <- receipt env env.alice
-  vd <- vaultDisclosure env
-  failsWith "inputHolding.instrumentId.admin" =<< trySubmit (actAs env.alice <> discloseMany [vd, env.shares.disclosure]) do
-    requestCmd env env.alice "r1" 40.0 [toInterfaceContractId fake] receiving
-
--- | Funding short of the shares cannot be escrowed, so the request is refused.
-fundingShortOfTheSharesIsRefused : Script ()
-fundingShortOfTheSharesIsRefused = script do
-  env <- setup
-  escrowed <- escrow env env.alice "r1" 200.0
-  receiving <- receipt env env.alice
-  vd <- vaultDisclosure env
-  failsWith "Not enough funds for allocation" =<< trySubmit (actAs env.alice <> discloseMany [vd, env.shares.disclosure]) do
-    requestCmd env env.alice "r1" 200.0 escrowed receiving
-
 -- | The funding account is Alice's, so only Alice may request from it, not Alice and a stranger.
 requestWithAStrangerIsRefused : Script ()
 requestWithAStrangerIsRefused = script do
   env <- setup
   carol <- allocateParty "carol"
-  escrowed <- escrow env env.alice "r1" 40.0
-  receiving <- receipt env env.alice
   vd <- vaultDisclosure env
-  submitMustFail (actAs [env.alice, carol] <> discloseMany [vd, env.shares.disclosure]) do
+  submitMustFail (actAs [env.alice, carol] <> discloseMany [vd]) do
     exerciseCmd (toInterfaceContractId env.vaultCid : ContractId VaultAsyncRedeem) Vault_RequestRedeem with
       label = "r1"; shares = 40.0; receiver = env.alice; minAssetsOut = None
-      inputHoldingCids = escrowed; underlyingAllocation = receiving
-      actors = [env.alice, carol]; extraArgs = tokenArgs env.shares
-
-uncommittedReceiptIsRefused : Script ()
-uncommittedReceiptIsRefused = script do
-  env <- setup
-  receiptRefused env =<< receiptWith env env.alice (settlementOf env) (\spec -> spec with committed = False)
-
-receiptShorterThanTheWindowIsRefused : Script ()
-receiptShorterThanTheWindowIsRefused = script do
-  env <- setup
-  now <- getTime
-  receiptRefused env =<< receiptWith env env.alice (settlementOf env)
-    (\spec -> spec with settlementDeadline = Some (addRelTime now (hours 1)))
-
-receiptWithoutADeadlineIsRefused : Script ()
-receiptWithoutADeadlineIsRefused = script do
-  env <- setup
-  receiptRefused env =<< receiptWith env env.alice (settlementOf env) (\spec -> spec with settlementDeadline = None)
-
--- | A receipt that fixes its own amount would pre-empt the rate.
-receiptWithLegsIsRefused : Script ()
-receiptWithLegsIsRefused = script do
-  env <- setup
-  receiptRefused env =<< receiptWith env env.alice (settlementOf env) (\spec -> spec with
-    transferLegSides = [V2.TransferLegSide with
-      transferLegId = "fixed"; side = V2.ReceiverSide; otherside = basicAccount env.custodian
-      amount = 1000.0; instrumentId = "USD"; meta = emptyMetadata])
-
--- | A receipt that also locks the receiver's own funds would hand them to the executors.
-receiptThatFundsTheNextIterationIsRefused : Script ()
-receiptThatFundsTheNextIterationIsRefused = script do
-  env <- setup
-  own <- holdingOf env.alice env.usd.admin (usdId env) 10.0
-  now <- getTime
-  receiving <- allocateWith env.usd env.alice ((receiptSpec env env.alice now) with
-      nextIterationFunding = Some (TextMap.fromList [("USD", 10.0)]))
-    (settlementOf env) [toInterfaceContractId own]
-  receiptRefused env receiving
-
--- | A receipt the vault can read, the custodian's, but for a receiver other than the one named.
-receiptForAnotherReceiverIsRefused : Script ()
-receiptForAnotherReceiverIsRefused = script do
-  env <- setup
-  receiving <- receiptWith env env.custodian (settlementOf env) identity
-  cd <- fromSome <$> queryDisclosure env.custodian (fromInterfaceContractId receiving : ContractId TokenAllocationV2)
-  escrowed <- escrow env env.alice "r1" 40.0
-  vd <- vaultDisclosure env
-  submitMustFail (actAs env.alice <> discloseMany [vd, cd, env.shares.disclosure]) (requestCmd env env.alice "r1" 40.0 escrowed receiving)
-
-receiptForAnotherSettlementIsRefused : Script ()
-receiptForAnotherSettlementIsRefused = script do
-  env <- setup
-  receiptRefused env =<< receiptWith env env.alice ((settlementOf env) with id = "somewhere-else") identity
-
--- | A receipt on the share registry, which cannot pay the underlying.
-receiptOfAnotherRegistryIsRefused : Script ()
-receiptOfAnotherRegistryIsRefused = script do
-  env <- setup
-  now <- getTime
-  receiving <- allocateWith env.shares env.alice ((receiptSpec env env.alice now) with admin = env.registrar)
-    (settlementOf env) []
-  receiptRefused env receiving
+      actors = [env.alice, carol]; extraArgs = ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata
 
 requestAfterThePeriodEndsIsRefused : Script ()
 requestAfterThePeriodEndsIsRefused = script do
   env <- setup
-  escrowed <- escrow env env.alice "r1" 40.0
-  receiving <- receiptWith env env.alice (settlementOf env) (\spec -> spec with
-    settlementDeadline = (\d -> addRelTime d (days 1)) <$> spec.settlementDeadline)
-  vd <- vaultDisclosure env
   passTime (hours 2)
-  submitMustFail (actAs env.alice <> discloseMany [vd, env.shares.disclosure]) (requestCmd env env.alice "r1" 40.0 escrowed receiving)
+  failsWith "rate period is still open" =<< requestTerms env env.alice "r1" 40.0 env.alice None
 
 fulfilmentByAnotherPartyIsRefused : Script ()
 fulfilmentByAnotherPartyIsRefused = script do
@@ -712,11 +611,9 @@ closedPeriodRefusesRequestsAndFulfilment : Script ()
 closedPeriodRefusesRequestsAndFulfilment = script do
   env <- setup
   (_, req) <- request env env.alice "r1" 40.0
-  escrowed <- escrow env env.alice "r2" 10.0
-  receiving <- receipt env env.alice
   vd <- vaultDisclosure env
   _ <- closeQueued env
-  submitMustFail (actAs env.alice <> discloseMany [vd, env.shares.disclosure]) (requestCmd env env.alice "r2" 10.0 escrowed receiving)
+  submitMustFail (actAs env.alice <> discloseMany [vd]) (requestCmd env env.alice "r2" 10.0 env.alice None)
   Left _ <- fulfilAs env env.venue [req]
   pure ()
 
@@ -833,18 +730,21 @@ allocateApproved registry owner provider args cfgD spec settlement inputs = do
     V2.AllocationInstructionResult_Completed with allocationCid -> pure allocationCid
     other -> abort ("expected the allocation once approved, got " <> show other)
 
--- | A receiver who authorizes receipt from a provider account, approved by the provider, is paid into it.
+-- | A receiver who names a provider account, and authorizes receipt into it with the provider's approval, is paid there.
 providerAccountReceiverIsPaid : Script ()
 providerAccountReceiverIsPaid = script do
   env <- setup
   bank <- allocateParty "bank"
   (account, args, cfgD) <- providerAccount env.usd env.alice bank
-  now <- getTime
-  receiving <- allocateApproved env.usd env.alice bank args cfgD ((receiptSpec env env.alice now) with authorizer = account)
-    (settlementOf env) []
-  escrowed <- escrow env env.alice "r1" 40.0
   vd <- vaultDisclosure env
-  _ <- submit (actAs env.alice <> discloseMany [vd, env.shares.disclosure]) (requestCmd env env.alice "r1" 40.0 escrowed receiving)
+  _ <- submit (actAs env.alice <> discloseMany [vd]) do
+    exerciseCmd (toInterfaceContractId env.vaultCid : ContractId VaultAsyncRedeem) Vault_RequestRedeem with
+      label = "r1"; shares = 40.0; receiver = env.alice; minAssetsOut = None
+      actors = [env.alice]; extraArgs = ExtraArgs with context = emptyChoiceContext; meta = accountToMeta "receiver" account emptyMetadata
+  (cid, r) <- published env env.alice "r1"
+  escrowed <- escrowAsRequested env r
+  receiving <- allocateApproved env.usd env.alice bank args cfgD r.authorization r.settlement []
+  Right _ <- bindAs env env.venue cid escrowed receiving
   req <- requestOf env env.alice "r1"
   next <- nextPeriod env
   locked <- lockedTokens env.shares [req.shareAllocation]
@@ -858,7 +758,7 @@ providerAccountReceiverIsPaid = script do
   held <- query @Token env.alice
   sum [h.holding.amount | (_, h) <- held, h.holding.account == account, h.holding.instrumentId == usdId env] === 40.0
 
--- | Shares held in a provider account, requested by owner and provider, are burned from it.
+-- | Shares held in a provider account, escrowed with the provider's approval, are burned from it.
 providerAccountSharesAreRedeemed : Script ()
 providerAccountSharesAreRedeemed = script do
   env <- setup
@@ -866,13 +766,15 @@ providerAccountSharesAreRedeemed = script do
   (account, args, cfgD) <- providerAccount env.shares env.alice bank
   held <- submitMulti [env.alice, bank, env.registrar] [] do
     createCmd Token with holding = V2.HoldingView with account; instrumentId = sharesId env; amount = 40.0; lock = None; meta = emptyMetadata
-  receiving <- receipt env env.alice
   vd <- vaultDisclosure env
-  _ <- submit (actAs [env.alice, bank] <> discloseMany [vd, cfgD, env.shares.disclosure]) do
+  _ <- submit (actAs [env.alice, bank] <> discloseMany [vd]) do
     exerciseCmd (toInterfaceContractId env.vaultCid : ContractId VaultAsyncRedeem) Vault_RequestRedeem with
       label = "r1"; shares = 40.0; receiver = env.alice; minAssetsOut = None
-      inputHoldingCids = [toInterfaceContractId held]; underlyingAllocation = receiving
-      actors = [env.alice, bank]; extraArgs = args with meta = accountToMeta "sender" account emptyMetadata
+      actors = [env.alice, bank]; extraArgs = ExtraArgs with context = emptyChoiceContext; meta = accountToMeta "sender" account emptyMetadata
+  (cid, r) <- published env env.alice "r1"
+  escrowed <- allocateApproved env.shares env.alice bank args cfgD r.escrow r.settlement [toInterfaceContractId held]
+  receiving <- receiptAsRequested env r
+  Right _ <- bindAs env env.venue cid escrowed receiving
   req <- requestOf env env.alice "r1"
   next <- nextPeriod env
   locked <- lockedTokens env.shares [req.shareAllocation]
@@ -896,12 +798,12 @@ executorCannotForgeARequest = script do
   env <- setup
   (_, req) <- request env env.alice "r1" 40.0
   bob <- allocateParty "bob"
-  bobs <- receipt env bob
   forgedAt <- getTime
+  bobs <- allocateWith env.usd bob (receiptSpec env bob forgedAt) (settlementOf env) []
   submitMustFail env.venue do
     createCmd R.QueuedRedeemRequest with
       vaultId = env.vaultId; vaultRegistrar = env.registrar; executors = [env.venue]
-      owner = env.alice; receiver = bob; label = "r1"; shares = 40.0
+      owner = env.alice; receiver = bob; label = "r1"; shares = 40.0; anchor = coerceContractId req.requestCid
       shareAllocation = req.shareAllocation; underlyingAllocation = bobs
       expiresAt = forgedAt; epoch = 0; minAssetsOut = None
 
@@ -952,12 +854,12 @@ executorCannotSignARequestAsRegistrar : Script ()
 executorCannotSignARequestAsRegistrar = script do
   env <- setup
   (_, req) <- request env env.alice "r1" 40.0
-  venues <- receipt env env.venue
   forgedAt <- getTime
+  venues <- allocateWith env.usd env.venue (receiptSpec env env.venue forgedAt) (settlementOf env) []
   forged <- submit env.venue do
     createCmd R.QueuedRedeemRequest with
       vaultId = env.vaultId; vaultRegistrar = env.venue; executors = [env.venue]
-      owner = env.alice; receiver = env.venue; label = "r1"; shares = 40.0
+      owner = env.alice; receiver = env.venue; label = "r1"; shares = 40.0; anchor = coerceContractId req.requestCid
       shareAllocation = req.shareAllocation; underlyingAllocation = venues
       expiresAt = forgedAt; epoch = 0; minAssetsOut = None
   failsWith "request.vaultRegistrar" =<<
@@ -967,20 +869,6 @@ executorCannotSignARequestAsRegistrar = script do
 
 -- Allocations the registries did not issue
 --------------------------------------------
-
-requestWith : Env -> [ContractId V2.Holding] -> ContractId V2.Allocation -> Script (Either SubmitError RequestId)
-requestWith env escrowed receiving = do
-  vd <- vaultDisclosure env
-  trySubmit (actAs env.alice <> discloseMany [vd, env.shares.disclosure]) (requestCmd env env.alice "r1" 40.0 escrowed receiving)
-
--- | A receipt authorization the receiver wrote themselves is refused.
-fakeReceiptIsRefused : Script ()
-fakeReceiptIsRefused = script do
-  env <- setup
-  now <- getTime
-  escrowed <- escrow env env.alice "r1" 40.0
-  receiving <- fakeAllocation env.alice (settlementOf env) (receiptSpec env env.alice now)
-  failsWith "receipt authorization is signed by its registry" =<< requestWith env escrowed receiving
 
 -- Batches
 -----------
@@ -1004,19 +892,6 @@ aBatchRepeatingALabelIsRefused = script do
   Right () <- fulfilAs env env.venue [b]
   unlocked env (usdId env) env.alice >>= (=== 30.0)
 
--- | One receipt bound to two requests cannot settle both, so a batch holding both is refused.
-aBatchSharingAReceiptIsRefused : Script ()
-aBatchSharingAReceiptIsRefused = script do
-  env <- setup
-  receiving <- receipt env env.alice
-  vd <- vaultDisclosure env
-  forA_ ["a", "b"] $ \label -> do
-    escrowed <- escrow env env.alice label 10.0
-    submit (actAs env.alice <> discloseMany [vd, env.shares.disclosure]) (requestCmd env env.alice label 10.0 escrowed receiving)
-  a <- requestOf env env.alice "a"
-  b <- requestOf env env.alice "b"
-  failsWith "each request in the batch has its own allocations" =<< fulfilAs env env.venue [a, b]
-
 emptyFulfilmentIsRefused : Script ()
 emptyFulfilmentIsRefused = script do
   env <- setup
@@ -1037,11 +912,7 @@ withLoss env = do
 dustRequestIsRefused : Script ()
 dustRequestIsRefused = script do
   env <- withLoss =<< setup
-  escrowed <- escrow env env.alice "r1" 0.0000000001
-  receiving <- receipt env env.alice
-  vd <- vaultDisclosure env
-  failsWith "the redemption pays out at the current rate" =<<
-    trySubmit (actAs env.alice <> discloseMany [vd, env.shares.disclosure]) (requestCmd env env.alice "r1" 0.0000000001 escrowed receiving)
+  failsWith "the redemption pays out at the current rate" =<< requestTerms env env.alice "r1" 0.0000000001 env.alice None
 
 -- | A request that paid something when made but nothing at fulfilment is refused, and names itself.
 requestWorthNothingAtFulfilmentIsRefused : Script ()
@@ -1068,7 +939,7 @@ pendingCountsTheirRequestsOfThatPeriodOnce = script do
   forged <- submit env.venue do
     createCmd R.QueuedRedeemRequest with
       vaultId = env.vaultId; vaultRegistrar = env.venue; executors = [env.venue]
-      owner = env.alice; receiver = env.alice; label = "f1"; shares = 1000.0
+      owner = env.alice; receiver = env.alice; label = "f1"; shares = 1000.0; anchor = coerceContractId r1.requestCid
       shareAllocation = r1.shareAllocation; underlyingAllocation = r1.underlyingAllocation
       expiresAt = addRelTime forgedAt (days 1); epoch = 0; minAssetsOut = None
   other <- anotherVault env "queued-redeem-2"
@@ -1117,63 +988,13 @@ pendingEndsAtExpiry = script do
   setTime r.expiresAt
   pending env rid env.alice [req.requestCid] >>= (=== 0.0)
 
--- | A request expires with its escrow, though its receipt lasts longer.
+-- | A request expires with its escrow, and the registrar may then drop it.
 requestExpiresWithItsEscrow : Script ()
 requestExpiresWithItsEscrow = script do
   env <- setup
-  now <- getTime
-  escrowed <- escrow env env.alice "r1" 10.0
-  receiving <- receiptWith env env.alice (settlementOf env) (\spec -> spec with
-    settlementDeadline = Some (addRelTime now (days 3)))
-  vd <- vaultDisclosure env
-  _ <- submit (actAs env.alice <> discloseMany [vd, env.shares.disclosure]) (requestCmd env env.alice "r1" 10.0 escrowed receiving)
-  req <- requestOf env env.alice "r1"
+  (_, req) <- request env env.alice "r1" 10.0
   passTime (window + hours 2)
   submit env.registrar (exerciseCmd req.requestCid R.QueuedRedeemRequest_Archive with actor = env.registrar)
-
--- | A receipt that lapses before the escrow would leave the request stuck, so it is refused; one lasting exactly as
--- long is enough.
-receiptShorterThanTheEscrowIsRefused : Script ()
-receiptShorterThanTheEscrowIsRefused = script do
-  env <- setup
-  Some vault <- queryContractId env.registrar env.vaultCid
-  let escrowDeadline = addRelTime vault.rateValidUntil window
-  vd <- vaultDisclosure env
-  short <- receiptWith env env.alice (settlementOf env) (\spec -> spec with
-    settlementDeadline = Some (addRelTime escrowDeadline (microseconds (-1))))
-  escrowed <- escrow env env.alice "r1" 10.0
-  failsWith "the receipt authorization lasts as long as the escrow" =<<
-    trySubmit (actAs env.alice <> discloseMany [vd, env.shares.disclosure]) (requestCmd env env.alice "r1" 10.0 escrowed short)
-  exact <- receiptWith env env.alice (settlementOf env) (\spec -> spec with settlementDeadline = Some escrowDeadline)
-  _ <- submit (actAs env.alice <> discloseMany [vd, env.shares.disclosure]) (requestCmd env env.alice "r1" 10.0 escrowed exact)
-  pure ()
-
--- | The vault builds each request's escrow: the leg it settles, metadata and all, committed until the period's end
--- plus the window, however late in the period the request comes.
-requestEscrowIsBuiltByTheVault : Script ()
-requestEscrowIsBuiltByTheVault = script do
-  env <- setup
-  Some vault <- queryContractId env.registrar env.vaultCid
-  passTime (minutes 30)
-  (_, first) <- request env env.alice "r1" 10.0
-  (_, second) <- request env env.alice "r2" 10.0
-  assertMsg "each request has an escrow of its own" (first.shareAllocation /= second.shareAllocation)
-  Some escrowed <- queryInterfaceContractId @V2.Allocation env.alice first.shareAllocation
-  escrowed.settlement === settlementOf env
-  escrowed.allocation === V2.AllocationSpecification with
-    admin = env.registrar
-    authorizer = basicAccount env.alice
-    transferLegSides = [V2.TransferLegSide with
-      transferLegId = requestLegId env.alice "r1" "shares"
-      side = V2.SenderSide
-      otherside = burnAccount
-      amount = 10.0
-      instrumentId = env.vaultId
-      meta = emptyMetadata]
-    settlementDeadline = Some (addRelTime vault.rateValidUntil window)
-    nextIterationFunding = None
-    committed = True
-    meta = emptyMetadata
 
 -- Rejecting
 -------------
@@ -1217,7 +1038,7 @@ rejectRefusesARecordTheRegistrarDidNotSign = script do
   forged <- submit env.venue do
     createCmd R.QueuedRedeemRequest with
       vaultId = env.vaultId; vaultRegistrar = env.venue; executors = [env.venue]
-      owner = env.alice; receiver = env.alice; label = "r1"; shares = 40.0
+      owner = env.alice; receiver = env.alice; label = "r1"; shares = 40.0; anchor = coerceContractId req.requestCid
       shareAllocation = req.shareAllocation; underlyingAllocation = req.underlyingAllocation
       expiresAt = forgedAt; epoch = 0; minAssetsOut = None
   failsWith "request.vaultRegistrar" =<< rejectAs env env.venue [req with requestCid = forged] "forged"
@@ -1324,10 +1145,8 @@ aRequestBelowItsMinimumIsNotFilled : Script ()
 aRequestBelowItsMinimumIsNotFilled = script do
   env <- setup
   vd <- vaultDisclosure env
-  forA_ [("high", 35.0), ("low", 30.0)] $ \(label, minimum) -> do
-    escrowed <- escrow env env.alice label 40.0
-    receiving <- receipt env env.alice
-    submit (actAs env.alice <> discloseMany [vd, env.shares.disclosure]) (requestCmdLimited env env.alice label 40.0 escrowed receiving (Some minimum))
+  forA_ [("high", 35.0), ("low", 30.0)] $ \(label, minimum) ->
+    requestFor env env.alice env.alice label 40.0 (Some minimum)
   high <- requestOf env env.alice "high"
   low <- requestOf env env.alice "low"
   moveUsdPool env (-20.0)
@@ -1372,48 +1191,82 @@ aQueuedRollBeyondTheLimitsNeedsTheCustodian = script do
 -- Paying another receiver
 ---------------------------
 
--- | A redemption the owner asks to be paid to another receiver, whose receipt only the executors can read.
-requestFor : Env -> Party -> Text -> Decimal -> [ContractId V2.Holding] -> ContractId V2.Allocation -> Script ()
-requestFor env receiver label shares escrowed receiving = do
-  vd <- vaultDisclosure env
-  void $ submit (actAs env.alice <> discloseMany [vd, env.shares.disclosure]) do
-    exerciseCmd (toInterfaceContractId env.vaultCid : ContractId VaultAsyncRedeem) Vault_RequestRedeem with
-      label; shares; receiver; minAssetsOut = None
-      inputHoldingCids = escrowed; underlyingAllocation = receiving
-      actors = [env.alice]; extraArgs = tokenArgs env.shares
-
--- | Alice redeems for Bob: his receipt is read at fulfilment, he is paid, and both see the report.
+-- | Alice redeems for Bob: his receipt is bound to her request, he is paid, and both see the report.
 aThirdPartyReceiverIsPaid : Script ()
 aThirdPartyReceiverIsPaid = script do
   env <- setup
   bob <- allocateParty "bob"
-  escrowed <- escrow env env.alice "r1" 40.0
-  receiving <- receipt env bob
-  requestFor env bob "r1" 40.0 escrowed receiving
-  req <- requestOf env env.alice "r1"
+  (_, req) <- requestFor env env.alice bob "r1" 40.0 None
   next <- nextPeriod env
   Right tree <- fulfilNowTree next env.venue [req]
   map (.observers) (exercisesOf @R.QueueLog @R.QueueLog_Report tree) === [[env.alice, bob]]
   unlocked env (usdId env) bob >>= (=== 40.0)
 
--- | A receipt that is not the receiver's, or not the registry's, fails at fulfilment, and the executors reject it.
-aBadThirdPartyReceiptIsRefusedAtFulfilment : Script ()
-aBadThirdPartyReceiptIsRefusedAtFulfilment = script do
+
+-- Allocation requests
+-----------------------
+
+-- | A request publishes, as the token standard's allocation request, exactly the escrow and receipt it needs, under its
+-- own settlement, committed until the period's end plus the window.
+requestPublishesTheAllocationsItNeeds : Script ()
+requestPublishesTheAllocationsItNeeds = script do
+  env <- setup
+  Some vault <- queryContractId env.registrar env.vaultCid
+  bob <- allocateParty "bob"
+  Right _ <- requestTerms env env.alice "r1" 10.0 bob None
+  (cid, r) <- published env env.alice "r1"
+  r.settlement === (settlementOf env) with cid = Some (toAnyContractId r.anchor)
+  let deadline = Some (addRelTime vault.rateValidUntil window)
+  Some v <- queryInterfaceContractId @AR.AllocationRequest bob (toInterfaceContractId @AR.AllocationRequest cid)
+  v.allocations ===
+    [ V2.AllocationSpecification with
+        admin = env.registrar; authorizer = basicAccount env.alice
+        transferLegSides = [V2.TransferLegSide with
+          transferLegId = requestLegId env.alice "r1" "shares"; side = V2.SenderSide
+          otherside = burnAccount; amount = 10.0; instrumentId = env.vaultId; meta = emptyMetadata]
+        settlementDeadline = deadline; nextIterationFunding = None; committed = True; meta = emptyMetadata
+    , V2.AllocationSpecification with
+        admin = env.usd.admin; authorizer = basicAccount bob; transferLegSides = []
+        settlementDeadline = deadline; nextIterationFunding = Some TextMap.empty; committed = True; meta = emptyMetadata ]
+
+-- | Only allocations made exactly as requested bind: another party's receipt, a receipt the registry did not sign, an
+-- escrow with other metadata, or one made for another request do not.
+onlyTheRequestedAllocationsBind : Script ()
+onlyTheRequestedAllocationsBind = script do
   env <- setup
   bob <- allocateParty "bob"
   carol <- allocateParty "carol"
-  now <- getTime
-  escrowed <- escrow env env.alice "r1" 40.0
-  carols <- receipt env carol
-  requestFor env bob "r1" 40.0 escrowed carols
-  escrowed' <- escrow env env.alice "r2" 20.0
-  fake <- fakeAllocation bob (settlementOf env) (receiptSpec env bob now)
-  requestFor env bob "r2" 20.0 escrowed' fake
-  notBobs <- requestOf env env.alice "r1"
-  faked <- requestOf env env.alice "r2"
-  next <- nextPeriod env
-  failsWith "receipt authorization.authorizer.owner" =<< fulfilNow next env.venue [notBobs]
-  failsWith "receipt authorization is signed by its registry" =<< fulfilNow next env.venue [faked]
-  Right () <- rejectAs next env.venue [notBobs, faked] "receipt is not the receiver's"
-  unlocked env (sharesId env) env.alice >>= (=== 100.0)
+  Right _ <- requestTerms env env.alice "r1" 10.0 bob None
+  Right _ <- requestTerms env env.alice "r2" 10.0 env.alice None
+  (cid, r) <- published env env.alice "r1"
+  (_, other) <- published env env.alice "r2"
+  escrowed <- escrowAsRequested env r
+  carols <- allocateWith env.usd carol (r.authorization with authorizer = basicAccount carol) r.settlement []
+  failsWith "'receipt authorization' is not equal to 'requested'" =<< bindAs env env.venue cid escrowed carols
+  fake <- fakeAllocation bob r.settlement r.authorization
+  failsWith "receipt authorization is signed by its registry" =<< bindAs env env.venue cid escrowed fake
+  bobs <- receiptAsRequested env r
+  forOther <- escrowAsRequested env other
+  failsWith "escrow.settlement" =<< bindAs env env.venue cid forOther bobs
+  let tagged = Metadata with values = TextMap.fromList [("x", "y")]
+  inputs <- map (toInterfaceContractId . fst) <$> heldBy env (sharesId env) env.alice
+  withMeta <- allocateWith env.shares env.alice
+    (r.escrow with transferLegSides = [leg with meta = tagged | leg <- r.escrow.transferLegSides]) r.settlement inputs
+  failsWith "'escrow' is not equal to 'requested'" =<< bindAs env env.venue cid withMeta bobs
+  Right _ <- bindAs env env.venue cid escrowed bobs
+  pure ()
 
+-- | Allocations bind up to, not at, the end of the request's period, so none is made knowing the price.
+allocationsBindBeforeThePeriodEnds : Script ()
+allocationsBindBeforeThePeriodEnds = script do
+  env <- setup
+  Right _ <- requestTerms env env.alice "r1" 10.0 env.alice None
+  Right _ <- requestTerms env env.alice "r2" 10.0 env.alice None
+  (c1, r1) <- published env env.alice "r1"
+  (c2, r2) <- published env env.alice "r2"
+  e1 <- escrowAsRequested env r1; a1 <- receiptAsRequested env r1
+  e2 <- escrowAsRequested env r2; a2 <- receiptAsRequested env r2
+  setTime (addRelTime r1.fundBy (microseconds (-1)))
+  Right _ <- bindAs env env.venue c1 e1 a1
+  setTime r1.fundBy
+  failsWith "allocations are bound before the request's period ends" =<< bindAs env env.venue c2 e2 a2

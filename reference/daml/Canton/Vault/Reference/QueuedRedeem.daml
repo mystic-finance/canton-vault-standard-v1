@@ -1,10 +1,10 @@
 -- | A reference vault whose deposits are instant and redemptions queued.
 module Canton.Vault.Reference.QueuedRedeem where
 
-import DA.Action (unless, void, when)
+import DA.Action (foldlA, unless, void, when)
 import DA.Foldable (forA_)
 import DA.List (dedup)
-import DA.Optional (isNone)
+import DA.Optional (fromOptional, isNone)
 import DA.TextMap qualified as TextMap
 import DA.Time (RelTime, addRelTime, isLedgerTimeGE, isLedgerTimeLT)
 
@@ -117,37 +117,76 @@ template ReferenceQueuedRedeemVault
         assets' <- currentAssets (instantOf' this)
         require "the redemption pays out at the current rate"
           (deductFeeBps redeemFeeBps (sharesToAssets totalShares assets' arg.shares) > 0.0)
-        let settlement = settlementFor this
-            escrowDeadline = addRelTime rateValidUntil settlementDeadlineWindow
-
-        -- The vault builds the escrow, so its leg and deadline are the ones it settles and no other request has it.
         from <- fundingAccount arg.actors arg.extraArgs
         let owner = regularAccountOwner from
-        escrow <- allocateEscrow shareFactories arg.extraArgs settlement rateValidFrom escrowDeadline
-          vaultRegistrar from arg.inputHoldingCids V2.TransferLegSide with
-            transferLegId = requestLegId owner arg.label "shares"
-            side = V2.SenderSide
-            otherside = burnAccount
-            amount = arg.shares
-            instrumentId = shareInstrument.id
-            meta = emptyMetadata
-
-        -- Only the owner's receipt can be read here; fulfilment checks every receipt again.
-        when (arg.receiver == owner) $
-          void (checkReceipt this arg.receiver escrowDeadline arg.underlyingAllocation)
-
-        _ <- create QueuedRedeemRequest with
+            deadline = addRelTime rateValidUntil settlementDeadlineWindow
+        -- Each request is its own settlement, so an allocation made for it can settle nothing else.
+        anchor <- create RequestAnchor with vaultId; vaultRegistrar; executors; requester = owner
+        let settlement = settlementOf this anchor
+        _ <- create RequestAllocations with
           vaultId; vaultRegistrar; executors
-          owner
+          requester = owner
           receiver = arg.receiver
           label = arg.label
-          shares = arg.shares
-          shareAllocation = escrow
-          underlyingAllocation = arg.underlyingAllocation
-          expiresAt = escrowDeadline
-          epoch
-          minAssetsOut = arg.minAssetsOut
+          amount = arg.shares
+          minOut = arg.minAssetsOut
+          epoch; anchor; settlement
+          escrow = V2.AllocationSpecification with
+            admin = vaultRegistrar
+            authorizer = from
+            transferLegSides = [V2.TransferLegSide with
+              transferLegId = requestLegId owner arg.label "shares"
+              side = V2.SenderSide
+              otherside = burnAccount
+              amount = arg.shares
+              instrumentId = shareInstrument.id
+              meta = emptyMetadata]
+            settlementDeadline = Some deadline
+            nextIterationFunding = None
+            committed = True
+            meta = emptyMetadata
+          -- The payout is set at fulfilment, which adds the receiving leg.
+          authorization = V2.AllocationSpecification with
+            admin = underlyingInstrument.admin
+            authorizer = accountFromMeta arg.receiver "receiver" arg.extraArgs.meta
+            transferLegSides = []
+            settlementDeadline = Some deadline
+            nextIterationFunding = Some TextMap.empty
+            committed = True
+            meta = emptyMetadata
+          requestedAt = rateValidFrom
+          fundBy = rateValidUntil
         pure epoch
+
+    nonconsuming choice ReferenceQueuedRedeemVault_Bind : ContractId QueuedRedeemRequest
+      -- ^ Bind a request's allocations, once made exactly as requested, before the request's period ends.
+      with
+        requestCid : ContractId RequestAllocations
+        shareAllocation : ContractId V2.Allocation
+          -- ^ The owner's escrowed shares.
+        underlyingAllocation : ContractId V2.Allocation
+          -- ^ The receiver's authorization to be paid.
+      controller executors
+      do
+        r <- fetch requestCid
+        require' ("request.vaultRegistrar", r.vaultRegistrar) isEqualR ("vaultRegistrar", vaultRegistrar)
+        require' ("request.vaultId", r.vaultId) isEqualR ("vaultId", vaultId)
+        inTime <- isLedgerTimeLT r.fundBy
+        require "allocations are bound before the request's period ends" inTime
+        requireRequested "escrow" vaultRegistrar r.settlement r.escrow shareAllocation
+        requireRequested "receipt authorization" underlyingInstrument.admin r.settlement r.authorization underlyingAllocation
+        archive requestCid
+        create QueuedRedeemRequest with
+          vaultId; vaultRegistrar; executors
+          owner = r.requester
+          receiver = r.receiver
+          label = r.label
+          shares = r.amount
+          anchor = r.anchor
+          shareAllocation; underlyingAllocation
+          expiresAt = fromOptional r.fundBy r.escrow.settlementDeadline
+          epoch = r.epoch
+          minAssetsOut = r.minOut
 
     nonconsuming choice ReferenceQueuedRedeemVault_Fulfil : ()
       -- ^ Fulfil requests made in earlier periods, in one transaction; one that fails fails them all. Each
@@ -184,7 +223,7 @@ template ReferenceQueuedRedeemVault
         -- Each leg uses the account its allocation names, which may have a provider.
         priced <- forA requests $ \r -> do
           escrowed <- view <$> fetch r.shareAllocation
-          receivingAccount <- checkReceipt this r.receiver r.expiresAt r.underlyingAllocation
+          receivingAccount <- (.allocation.authorizer) . view <$> fetch r.underlyingAllocation
           (struckShares, struckAssets) <- struckFor r.epoch epoch (totalShares, totalAssets) prices
           let paid = min (sharesToAssets struckShares struckAssets r.shares) (sharesToAssets totalShares totalAssets r.shares)
               assets = deductFeeBps redeemFeeBps paid
@@ -192,8 +231,7 @@ template ReferenceQueuedRedeemVault
             Some limit | assets < limit -> fail (vaultSlippageExceeded <> ": request " <> r.label)
             _ -> pure ()
           pure (r, escrowed.allocation.authorizer, receivingAccount, assets)
-        let settlement = settlementFor this
-            shareLeg (r, from, _, _) = V2.TransferLeg with
+        let shareLeg (r, from, _, _) = V2.TransferLeg with
               transferLegId = requestLegId r.owner r.label "shares"
               sender = from
               receiver = burnAccount
@@ -209,27 +247,31 @@ template ReferenceQueuedRedeemVault
               meta = emptyMetadata
             payout = sum [a | (_, _, _, a) <- priced]
         forA_ priced $ \(_, _, _, a) -> require "each request pays out a positive amount" (a > 0.0)
-        pool <- coveringHoldings payout poolHoldingCids
 
-        -- The vault's own sides: the burn account receives the shares, the custodian pays out.
-        burnSide <- allocateSides shareFactories shareExtraArgs settlement rateValidFrom vaultRegistrar
-          burnAccount [vaultRegistrar] [] [receiverSide (shareLeg p) | p <- priced]
-        custodianSide <- allocateSides underlyingFactories underlyingExtraArgs settlement rateValidFrom underlyingInstrument.admin
-          (basicAccount custodian) [custodian] pool [senderSide (payoutLeg p) | p <- priced]
-
-        _ <- exercise shareFactories.settlementFactory V2.SettlementFactory_SettleBatch with
-          settlement
-          transferLegs = map shareLeg priced
-          allocations = finalized burnSide [] :: [finalized r.shareAllocation [] | (r, _, _, _) <- priced]
-          actors = executors
-          extraArgs = shareExtraArgs
-        _ <- exercise underlyingFactories.settlementFactory V2.SettlementFactory_SettleBatch with
-          settlement
-          transferLegs = map payoutLeg priced
-          allocations = finalized custodianSide []
-            :: [finalized r.underlyingAllocation [receiverSide (payoutLeg p)] | p@(r, _, _, _) <- priced]
-          actors = executors
-          extraArgs = underlyingExtraArgs
+        -- Each request settles under its own settlement: the burn account receives, the custodian pays out from the
+        -- pool named, then from the change of the request before.
+        _ <- foldlA (\pool p@(r, _, _, a) -> do
+            let settlement = settlementOf this r.anchor
+            used <- coveringHoldings a pool
+            burnSide <- allocateSides shareFactories shareExtraArgs settlement rateValidFrom vaultRegistrar
+              burnAccount [vaultRegistrar] [] [receiverSide (shareLeg p)]
+            (custodianSide, change) <- allocateSidesWithChange underlyingFactories underlyingExtraArgs settlement rateValidFrom
+              underlyingInstrument.admin (basicAccount custodian) [custodian] used [senderSide (payoutLeg p)]
+            _ <- exercise shareFactories.settlementFactory V2.SettlementFactory_SettleBatch with
+              settlement
+              transferLegs = [shareLeg p]
+              allocations = [finalized burnSide [], finalized r.shareAllocation []]
+              actors = executors
+              extraArgs = shareExtraArgs
+            _ <- exercise underlyingFactories.settlementFactory V2.SettlementFactory_SettleBatch with
+              settlement
+              transferLegs = [payoutLeg p]
+              allocations = [finalized custodianSide [], finalized r.underlyingAllocation [receiverSide (payoutLeg p)]]
+              actors = executors
+              extraArgs = underlyingExtraArgs
+            archive r.anchor
+            pure (drop (length used) pool <> change))
+          poolHoldingCids priced
 
         recordFlow (instantOf' this) (negate payout) (negate (sum (map (.shares) requests)))
         reportQueued vaultRegistrar [ eventOf r (Fulfilled with received = a) | (r, _, _, a) <- priced ]
@@ -249,6 +291,7 @@ template ReferenceQueuedRedeemVault
           request <- fetch cid
           require' ("request.vaultRegistrar", request.vaultRegistrar) isEqualR ("vaultRegistrar", vaultRegistrar)
           archive cid
+          archive request.anchor
           _ <- exercise request.shareAllocation V2.Allocation_Cancel with actors = executors; extraArgs = shareExtraArgs
           pure (eventOf request (Rejected with reason))
         reportQueued vaultRegistrar events
@@ -335,6 +378,8 @@ template QueuedRedeemRequest
     receiver : Party
     label : Text
     shares : Decimal
+    anchor : ContractId RequestAnchor
+      -- ^ The request's settlement reference, which its allocations name.
     shareAllocation : ContractId V2.Allocation
       -- ^ The owner's escrowed shares.
     underlyingAllocation : ContractId V2.Allocation
@@ -359,6 +404,7 @@ template QueuedRedeemRequest
           expired <- isLedgerTimeGE expiresAt
           require "the owner or an executor drops a request, or the registrar once it has expired"
             (actor == vaultRegistrar && expired)
+        archive anchor
 
 -- | The same vault as an instant one, for everything but redemptions.
 instantOf' : ReferenceQueuedRedeemVault -> ReferenceVault
@@ -383,29 +429,16 @@ instantOf' v = ReferenceVault with
 instantOf : ReferenceQueuedRedeemVault -> Vault
 instantOf = toInterface . instantOf'
 
+-- | A request's own settlement: the vault's, naming the request's anchor.
+settlementOf : ReferenceQueuedRedeemVault -> ContractId RequestAnchor -> V2.SettlementInfo
+settlementOf v anchor = (settlementFor v) with cid = Some (toAnyContractId anchor)
+
 settlementFor : ReferenceQueuedRedeemVault -> V2.SettlementInfo
 settlementFor v = V2.SettlementInfo with
   executors = v.executors
   id = requestSettlementId v.vaultId
   cid = None
   meta = emptyMetadata
-
--- | Refuses a receipt authorization that is not the receiver's committed, leg-less one for the vault's settlement,
--- lasting as long as the escrow, which covered the vault's window when requested. Returns the account it pays.
-checkReceipt : ReferenceQueuedRedeemVault -> Party -> Time -> ContractId V2.Allocation -> Update V2.Account
-checkReceipt v receiver escrowDeadline cid = do
-  receiving <- fetchSigned "receipt authorization" v.underlyingInstrument.admin cid
-  require' ("receipt authorization.settlement", receiving.settlement) isEqualR ("settlement", settlementFor v)
-  require' ("receipt authorization.authorizer.owner", receiving.allocation.authorizer.owner) isEqualR
-    ("receiver", Some receiver)
-  -- The payout is set at fulfilment, which adds the receiving leg.
-  require "receipt authorization names no legs" (receiving.allocation.transferLegSides == [])
-  require "receipt authorization allows the executors to add a leg"
-    (receiving.allocation.nextIterationFunding == Some TextMap.empty)
-  require "receipt authorization is committed" receiving.allocation.committed
-  authorizationDeadline <- deadlineOf receiving.allocation
-  require "the receipt authorization lasts as long as the escrow" (authorizationDeadline >= escrowDeadline)
-  pure receiving.allocation.authorizer
 
 -- | Opens the next period at the totals measured, keeping the price it strikes.
 openNext : ReferenceQueuedRedeemVault -> Decimal -> Decimal -> Time -> Time -> Update (ContractId ReferenceQueuedRedeemVault)
