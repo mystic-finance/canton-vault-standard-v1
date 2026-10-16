@@ -42,14 +42,16 @@ leaves nothing on the ledger.
 
 ## Queued requests
 
-A queued vault takes a request instead of settling at once. The request
-escrows what the requester pays in: the vault allocates it from the holdings they
-name, with the exact leg it will settle, committed until the request's period
-ends plus the vault's window, so each request has an escrow of its own that lasts
-until it can be filled. The receiver authorizes what they get with an allocation
-lasting at least as long, under the same settlement id (`requestSettlementId`).
-The vault records the pair as a registrar-signed request, whose id is the rate
-period it was made in.
+A queued vault takes a request instead of settling at once. The request names
+its terms, and the vault publishes the allocations it needs as the token
+standard's `AllocationRequest`: the requester's escrow and the receiver's
+authorization, each specified exactly, committed until the request's period ends
+plus the vault's window, and under the request's own settlement, so an allocation
+made for one request can settle no other. Wallets allocate as requested; the
+executors bind the allocations to the request before its period ends, so nobody
+funds a request after seeing its price, and a request left unfunded is dropped.
+The bound request is registrar-signed, and its id is the rate period it was made
+in.
 
 Once that period closes, executors fulfil requests in batches, settling both
 registries' legs in one transaction, at the price struck when the next period
@@ -72,8 +74,8 @@ redemptions are paid while the pool lasts.
 A batch settles whole or not at all, so one request that cannot settle, such as
 a receiver its registry has blocked, fails the rest. Executors dry-run a batch,
 settle the requests that pass, and `Reject` the one that fails, which returns
-its escrow and reports why. Every registry accepts batches of up to 25 legs, one
-per request per registry; Canton Coin accepts 100.
+its escrow and reports why. Each request settles as its own batch on each
+registry, inside one fulfilment of up to 25 requests.
 
 Fulfilments and rejections are reported to the requester and receiver through a
 log created and archived in the same transaction, as the token standard's event

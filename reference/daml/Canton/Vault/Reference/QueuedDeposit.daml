@@ -4,7 +4,7 @@ module Canton.Vault.Reference.QueuedDeposit where
 import DA.Action (unless)
 import DA.Foldable (forA_)
 import DA.List (dedup)
-import DA.Optional (isNone)
+import DA.Optional (fromOptional, isNone)
 import DA.TextMap qualified as TextMap
 import DA.Time (RelTime, addRelTime, isLedgerTimeGE, isLedgerTimeLT)
 
@@ -120,45 +120,75 @@ template ReferenceQueuedDepositVault
         assets' <- currentAssets (instantOf' this)
         require "the deposit is worth shares at the current rate"
           (assetsToShares totalShares assets' (deductFeeBps depositFeeBps arg.assets) > 0.0)
-        let settlement = settlementFor this
-            escrowDeadline = addRelTime rateValidUntil settlementDeadlineWindow
-
-        -- The vault builds the escrow, so its leg and deadline are the ones it settles and no other request has it.
         from <- fundingAccount arg.actors arg.extraArgs
         let requester = regularAccountOwner from
-        escrow <- allocateEscrow underlyingFactories arg.extraArgs settlement rateValidFrom escrowDeadline
-          underlyingInstrument.admin from arg.inputHoldingCids V2.TransferLegSide with
-            transferLegId = requestLegId requester arg.label "underlying"
-            side = V2.SenderSide
-            otherside = basicAccount custodian
-            amount = arg.assets
-            instrumentId = underlyingInstrument.id
-            meta = emptyMetadata
-
-        receiving <- fetchSigned "share authorization" vaultRegistrar arg.shareAllocation
-        require' ("share authorization.settlement", receiving.settlement) isEqualR ("settlement", settlement)
-        require' ("share authorization.authorizer.owner", receiving.allocation.authorizer.owner) isEqualR
-          ("receiver", Some arg.receiver)
-        -- The share amount is set at fulfilment, which adds the receiving leg.
-        require "share authorization names no legs" (receiving.allocation.transferLegSides == [])
-        require "share authorization allows the executors to add a leg"
-          (receiving.allocation.nextIterationFunding == Some TextMap.empty)
-        require "share authorization is committed" receiving.allocation.committed
-        authorizationDeadline <- deadlineOf receiving.allocation
-        require "the share authorization lasts as long as the escrow" (authorizationDeadline >= escrowDeadline)
-
-        _ <- create QueuedDepositRequest with
-          vaultId; vaultRegistrar; executors
-          requester
+            deadline = addRelTime rateValidUntil settlementDeadlineWindow
+        -- Each request is its own settlement, so an allocation made for it can settle nothing else.
+        anchor <- create RequestAnchor with vaultId; vaultRegistrar; executors; requester
+        let settlement = settlementOf this anchor
+        _ <- create RequestAllocations with
+          vaultId; vaultRegistrar; executors; requester
           receiver = arg.receiver
           label = arg.label
-          assets = arg.assets
-          underlyingAllocation = escrow
-          shareAllocation = arg.shareAllocation
-          expiresAt = escrowDeadline
-          epoch
-          minSharesOut = arg.minSharesOut
+          amount = arg.assets
+          minOut = arg.minSharesOut
+          epoch; anchor; settlement
+          escrow = V2.AllocationSpecification with
+            admin = underlyingInstrument.admin
+            authorizer = from
+            transferLegSides = [V2.TransferLegSide with
+              transferLegId = requestLegId requester arg.label "underlying"
+              side = V2.SenderSide
+              otherside = basicAccount custodian
+              amount = arg.assets
+              instrumentId = underlyingInstrument.id
+              meta = emptyMetadata]
+            settlementDeadline = Some deadline
+            nextIterationFunding = None
+            committed = True
+            meta = emptyMetadata
+          -- The share amount is set at fulfilment, which adds the receiving leg.
+          authorization = V2.AllocationSpecification with
+            admin = vaultRegistrar
+            authorizer = accountFromMeta arg.receiver "receiver" arg.extraArgs.meta
+            transferLegSides = []
+            settlementDeadline = Some deadline
+            nextIterationFunding = Some TextMap.empty
+            committed = True
+            meta = emptyMetadata
+          requestedAt = rateValidFrom
+          fundBy = rateValidUntil
         pure epoch
+
+    nonconsuming choice ReferenceQueuedDepositVault_Bind : ContractId QueuedDepositRequest
+      -- ^ Bind a request's allocations, once made exactly as requested, before the request's period ends.
+      with
+        requestCid : ContractId RequestAllocations
+        underlyingAllocation : ContractId V2.Allocation
+          -- ^ The requester's escrow.
+        shareAllocation : ContractId V2.Allocation
+          -- ^ The receiver's authorization to be issued shares.
+      controller executors
+      do
+        r <- fetch requestCid
+        require' ("request.vaultRegistrar", r.vaultRegistrar) isEqualR ("vaultRegistrar", vaultRegistrar)
+        require' ("request.vaultId", r.vaultId) isEqualR ("vaultId", vaultId)
+        inTime <- isLedgerTimeLT r.fundBy
+        require "allocations are bound before the request's period ends" inTime
+        requireRequested "escrow" underlyingInstrument.admin r.settlement r.escrow underlyingAllocation
+        requireRequested "share authorization" vaultRegistrar r.settlement r.authorization shareAllocation
+        archive requestCid
+        create QueuedDepositRequest with
+          vaultId; vaultRegistrar; executors
+          requester = r.requester
+          receiver = r.receiver
+          label = r.label
+          assets = r.amount
+          anchor = r.anchor
+          underlyingAllocation; shareAllocation
+          expiresAt = fromOptional r.fundBy r.escrow.settlementDeadline
+          epoch = r.epoch
+          minSharesOut = r.minOut
 
     nonconsuming choice ReferenceQueuedDepositVault_Fulfil : ()
       -- ^ Fulfil requests made in earlier periods, in one transaction; one that fails fails them all. Each
@@ -202,8 +232,7 @@ template ReferenceQueuedDepositVault
             Some limit | shares < limit -> fail (vaultSlippageExceeded <> ": request " <> r.label)
             _ -> pure ()
           pure (r, funded.allocation.authorizer, receiving.allocation.authorizer, shares)
-        let settlement = settlementFor this
-            underlyingLeg (r, from, _, _) = V2.TransferLeg with
+        let underlyingLeg (r, from, _, _) = V2.TransferLeg with
               transferLegId = requestLegId r.requester r.label "underlying"
               sender = from
               receiver = basicAccount custodian
@@ -219,25 +248,26 @@ template ReferenceQueuedDepositVault
               meta = emptyMetadata
         forA_ priced $ \(_, _, _, s) -> require "each request mints a positive number of shares" (s > 0.0)
 
-        -- The vault's own sides: the custodian receives, the mint account sends.
-        custodianSide <- allocateSides underlyingFactories underlyingExtraArgs settlement rateValidFrom underlyingInstrument.admin
-          (basicAccount custodian) [custodian] [] [receiverSide (underlyingLeg p) | p <- priced]
-        mintSide <- allocateSides shareFactories shareExtraArgs settlement rateValidFrom vaultRegistrar
-          mintAccount [vaultRegistrar] [] [senderSide (shareLeg p) | p <- priced]
-
-        _ <- exercise underlyingFactories.settlementFactory V2.SettlementFactory_SettleBatch with
-          settlement
-          transferLegs = map underlyingLeg priced
-          allocations = finalized custodianSide [] :: [finalized r.underlyingAllocation [] | (r, _, _, _) <- priced]
-          actors = executors
-          extraArgs = underlyingExtraArgs
-        _ <- exercise shareFactories.settlementFactory V2.SettlementFactory_SettleBatch with
-          settlement
-          transferLegs = map shareLeg priced
-          allocations = finalized mintSide []
-            :: [finalized r.shareAllocation [receiverSide (shareLeg p)] | p@(r, _, _, _) <- priced]
-          actors = executors
-          extraArgs = shareExtraArgs
+        -- Each request settles under its own settlement: the custodian receives, the mint account sends.
+        forA_ priced $ \p@(r, _, _, _) -> do
+          let settlement = settlementOf this r.anchor
+          custodianSide <- allocateSides underlyingFactories underlyingExtraArgs settlement rateValidFrom underlyingInstrument.admin
+            (basicAccount custodian) [custodian] [] [receiverSide (underlyingLeg p)]
+          mintSide <- allocateSides shareFactories shareExtraArgs settlement rateValidFrom vaultRegistrar
+            mintAccount [vaultRegistrar] [] [senderSide (shareLeg p)]
+          _ <- exercise underlyingFactories.settlementFactory V2.SettlementFactory_SettleBatch with
+            settlement
+            transferLegs = [underlyingLeg p]
+            allocations = [finalized custodianSide [], finalized r.underlyingAllocation []]
+            actors = executors
+            extraArgs = underlyingExtraArgs
+          _ <- exercise shareFactories.settlementFactory V2.SettlementFactory_SettleBatch with
+            settlement
+            transferLegs = [shareLeg p]
+            allocations = [finalized mintSide [], finalized r.shareAllocation [receiverSide (shareLeg p)]]
+            actors = executors
+            extraArgs = shareExtraArgs
+          archive r.anchor
 
         recordFlow (instantOf' this) (sum (map (.assets) requests)) (sum [s | (_, _, _, s) <- priced])
         reportQueued vaultRegistrar [ eventOf r (Fulfilled with received = s) | (r, _, _, s) <- priced ]
@@ -257,6 +287,7 @@ template ReferenceQueuedDepositVault
           request <- fetch cid
           require' ("request.vaultRegistrar", request.vaultRegistrar) isEqualR ("vaultRegistrar", vaultRegistrar)
           archive cid
+          archive request.anchor
           _ <- exercise request.underlyingAllocation V2.Allocation_Cancel with actors = executors; extraArgs = underlyingExtraArgs
           pure (eventOf request (Rejected with reason))
         reportQueued vaultRegistrar events
@@ -343,6 +374,8 @@ template QueuedDepositRequest
     receiver : Party
     label : Text
     assets : Decimal
+    anchor : ContractId RequestAnchor
+      -- ^ The request's settlement reference, which its allocations name.
     underlyingAllocation : ContractId V2.Allocation
       -- ^ The requester's funded escrow.
     shareAllocation : ContractId V2.Allocation
@@ -367,6 +400,7 @@ template QueuedDepositRequest
           expired <- isLedgerTimeGE expiresAt
           require "the requester or an executor drops a request, or the registrar once it has expired"
             (actor == vaultRegistrar && expired)
+        archive anchor
 
 -- | The same vault as an instant one, for everything but deposits.
 instantOf' : ReferenceQueuedDepositVault -> ReferenceVault
@@ -391,6 +425,10 @@ instantOf' v = ReferenceVault with
 
 instantOf : ReferenceQueuedDepositVault -> Vault
 instantOf = toInterface . instantOf'
+
+-- | A request's own settlement: the vault's, naming the request's anchor.
+settlementOf : ReferenceQueuedDepositVault -> ContractId RequestAnchor -> V2.SettlementInfo
+settlementOf v anchor = (settlementFor v) with cid = Some (toAnyContractId anchor)
 
 settlementFor : ReferenceQueuedDepositVault -> V2.SettlementInfo
 settlementFor v = V2.SettlementInfo with

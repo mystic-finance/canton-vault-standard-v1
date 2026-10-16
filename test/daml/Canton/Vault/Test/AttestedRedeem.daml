@@ -272,11 +272,7 @@ reclaimNamesThisVault = script do
 minimumAppliesProRata : Script ()
 minimumAppliesProRata = script do
   (env, oracle) <- setupOracle
-  escrowed <- escrow env env.alice "r1" 100.0
-  receiving <- receipt env env.alice
-  vd <- vaultDisclosure env
-  _ <- submit (actAs env.alice <> discloseMany [vd, env.shares.disclosure]) (requestCmdLimited env env.alice "r1" 100.0 escrowed receiving (Some 100.0))
-  req <- requestOf env env.alice "r1"
+  (_, req) <- requestFor env env.alice env.alice "r1" 100.0 (Some 100.0)
   Right env <- rollAt env oracle 1.0 [(0, 0.4)]
   Right _ <- fillTree env [req]
   rest <- requestNow env "r1"
@@ -290,6 +286,8 @@ executorsCannotMoveTheEscrowElsewhere : Script ()
 executorsCannotMoveTheEscrowElsewhere = script do
   env <- setup
   (_, req) <- request env env.alice "r1" 40.0
+  Some recorded <- queryContractId env.alice req.requestCid
+  let settlement = (settlementOf env) with cid = Some (toAnyContractId recorded.anchor)
   let leg = V2.TransferLeg with
         transferLegId = requestLegId env.alice "r1" "shares"; sender = basicAccount env.alice
         receiver = basicAccount env.venue; amount = 40.0; instrumentId = env.vaultId; meta = emptyMetadata
@@ -298,14 +296,14 @@ executorsCannotMoveTheEscrowElsewhere = script do
       transferLegSides = [V2.TransferLegSide with
         transferLegId = leg.transferLegId; side = V2.ReceiverSide; otherside = basicAccount env.alice
         amount = 40.0; instrumentId = env.vaultId; meta = emptyMetadata]
-      settlementDeadline = None; nextIterationFunding = None; committed = False; meta = emptyMetadata) (settlementOf env) []
+      settlementDeadline = None; nextIterationFunding = None; committed = False; meta = emptyMetadata) settlement []
   locked <- lockedTokens env.shares [req.shareAllocation]
   let escrowed = V2.FinalizedAllocation with
         allocationCid = req.shareAllocation; extraTransferLegSides = []; nextIterationFunding = None
       theirs = V2.FinalizedAllocation with allocationCid = mine; extraTransferLegSides = []; nextIterationFunding = None
   failsWith "missing authorizations" =<< trySubmit (actAs env.venue <> discloseMany (env.shares.disclosure :: locked)) do
     exerciseCmd (toInterfaceContractId env.shares.rulesCid : ContractId V2.SettlementFactory) V2.SettlementFactory_SettleBatch with
-      settlement = settlementOf env
+      settlement
       transferLegs = [leg]
       allocations = [escrowed, theirs]
       actors = [env.venue]
