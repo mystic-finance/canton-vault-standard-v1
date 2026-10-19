@@ -1277,4 +1277,15 @@ allocationsBindBeforeThePeriodEnds = script do
   setTime (addRelTime r1.fundBy (microseconds (-1)))
   Right _ <- bindAs env env.venue c1 e1 a1
   setTime r1.fundBy
-  failsWith "allocations are bound before the request's period ends" =<< bindAs env env.venue c2 e2 a2
+  failsWith "rate period is still open" =<< bindAs env env.venue c2 e2 a2
+
+-- | A period rolled early has struck the next price, so allocations are no longer bound to its requests.
+allocationsAreNotBoundAfterAnEarlyRoll : Script ()
+allocationsAreNotBoundAfterAnEarlyRoll = script do
+  env <- setup
+  Right _ <- requestTerms env env.alice "r1" 10.0 env.alice None
+  (cid, r) <- published env env.alice "r1"
+  escrowed <- escrowAsRequested env r
+  receiving <- receiptAsRequested env r
+  next <- nextPeriod env
+  failsWith "allocations are bound in the request's own period" =<< bindAs next env.venue cid escrowed receiving
