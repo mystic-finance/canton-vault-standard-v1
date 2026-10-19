@@ -170,8 +170,9 @@ template ReferenceQueuedDepositVault
         r <- fetch requestCid
         require' ("request.vaultRegistrar", r.vaultRegistrar) isEqualR ("vaultRegistrar", vaultRegistrar)
         require' ("request.vaultId", r.vaultId) isEqualR ("vaultId", vaultId)
-        inTime <- isLedgerTimeLT r.fundBy
-        require "allocations are bound before the request's period ends" inTime
+        -- Bound only in the request's own period, before any later price is struck.
+        requirePeriodOpen (instantOf' this)
+        require "allocations are bound in the request's own period" (r.epoch == epoch)
         requireRequested "escrow" underlyingInstrument.admin r.settlement r.escrow underlyingAllocation
         requireRequested "share authorization" vaultRegistrar r.settlement r.authorization shareAllocation
         archive requestCid
