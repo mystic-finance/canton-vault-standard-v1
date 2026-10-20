@@ -195,7 +195,7 @@ template ReferenceQueuedRedeemVault
       with
         requestCids : [ContractId QueuedRedeemRequest]
           -- ^ The requests to fulfil, each binding its escrow to its receiver's authorization. Each
-          -- adds a leg to each registry's batch; every registry accepts batches of up to 25 legs.
+          -- settles as its own batch on each registry.
         priceCids : [ContractId PeriodPrice]
           -- ^ The prices struck in periods before the current one, for requests filled late.
         poolHoldingCids : [ContractId V2.Holding]
