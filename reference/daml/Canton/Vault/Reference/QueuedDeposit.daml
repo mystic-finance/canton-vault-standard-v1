@@ -4,7 +4,7 @@ module Canton.Vault.Reference.QueuedDeposit where
 import DA.Action (unless)
 import DA.Foldable (forA_)
 import DA.List (dedup)
-import DA.Optional (fromOptional, isNone)
+import DA.Optional (fromOptional)
 import DA.TextMap qualified as TextMap
 import DA.Time (RelTime, addRelTime, isLedgerTimeGE, isLedgerTimeLT)
 
@@ -17,7 +17,6 @@ import Canton.Vault.Reference.Queue
 import Splice.Api.Token.MetadataV1
 import Splice.Api.Token.HoldingV2 qualified as V2
 import Splice.Api.Token.AllocationV2 qualified as V2
-import Splice.Api.Token.AllocationInstructionV2 qualified as V2
 import Splice.Api.Token.TransferInstructionV2 qualified as V2
 import Splice.TokenStandard.Utils
 

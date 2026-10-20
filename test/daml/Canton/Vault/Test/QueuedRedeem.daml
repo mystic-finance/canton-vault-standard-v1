@@ -1,13 +1,13 @@
 -- | Queued redemptions: request, fulfilment, and what each refuses.
 module Canton.Vault.Test.QueuedRedeem where
 
-import DA.Assert ((===), assertMsg)
+import DA.Assert ((===))
 import DA.Action (void)
 import DA.Foldable (forA_)
 import DA.List (head)
 import DA.Optional (fromSome, optionalToList)
 import DA.TextMap qualified as TextMap
-import DA.Time (RelTime, addRelTime, days, hours, microseconds, minutes)
+import DA.Time (RelTime, addRelTime, days, hours, microseconds)
 import Daml.Script
 
 import Canton.Vault.V1
@@ -28,7 +28,6 @@ import Splice.Api.Token.AllocationInstructionV2 qualified as V2
 import Splice.Api.Token.TransferInstructionV2 qualified as V2
 import Splice.TokenStandard.Utils
 import Splice.Testing.Tokens.TestTokenV2 (TokenRules(..))
-import Splice.Testing.Tokens.TestTokenV2.Allocation (TokenAllocationV2)
 import Splice.Testing.Tokens.TestTokenV2.AccountConfig (AccountConfig(..), PartyConfig(..), accountConfigsContextKey)
 import Splice.Testing.Tokens.TestTokenV2.Holding (Token(..))
 
@@ -51,7 +50,7 @@ factoriesOf r = R.Factories with
   settlementFactory = toInterfaceContractId r.rulesCid
 
 holdingOf : Party -> Party -> V2.InstrumentId -> Decimal -> Script (ContractId Token)
-holdingOf owner admin instrumentId amount = submitMulti [owner, admin] [] do
+holdingOf owner admin instrumentId amount = submit (actAs [owner, admin]) do
   createCmd Token with
     holding = V2.HoldingView with
       account = basicAccount owner; instrumentId; amount; lock = None; meta = emptyMetadata
@@ -67,7 +66,7 @@ setupWithFee redeemFeeBps = do
   alice <- allocateParty "alice"
   now <- getTime
   let vaultId = "queued-redeem-1"
-  vaultCid <- submitMulti [registrar, custodian] [] do
+  vaultCid <- submit (actAs [registrar, custodian]) do
     createCmd R.ReferenceQueuedRedeemVault with
       vaultId
       vaultRegistrar = registrar
@@ -702,7 +701,7 @@ fulfilsALargeQueueInOneBatch = script do
 providerAccount : Registry -> Party -> Party -> Script (V2.Account, ExtraArgs, Disclosure)
 providerAccount registry owner provider = do
   let account = V2.Account with owner = Some owner; provider = Some provider; id = "custody"
-  cfg <- submitMulti [owner, provider] [] do
+  cfg <- submit (actAs [owner, provider]) do
     createCmd AccountConfig with
       admin = registry.admin; account
       ownerConfig = PartyConfig with canInitiate = True; mustApprove = False
@@ -764,7 +763,7 @@ providerAccountSharesAreRedeemed = script do
   env <- setup
   bank <- allocateParty "bank"
   (account, args, cfgD) <- providerAccount env.shares env.alice bank
-  held <- submitMulti [env.alice, bank, env.registrar] [] do
+  held <- submit (actAs [env.alice, bank, env.registrar]) do
     createCmd Token with holding = V2.HoldingView with account; instrumentId = sharesId env; amount = 40.0; lock = None; meta = emptyMetadata
   vd <- vaultDisclosure env
   _ <- submit (actAs [env.alice, bank] <> discloseMany [vd]) do
@@ -813,7 +812,7 @@ anotherVault env vaultId = do
   now <- current env
   Some vault <- queryContractId env.registrar now.vaultCid
   custodian <- allocateParty "otherCustodian"
-  vaultCid <- submitMulti [env.registrar, custodian] [] do
+  vaultCid <- submit (actAs [env.registrar, custodian]) do
     createCmd vault with vaultId; custodian; shareInstrument = vault.shareInstrument with id = vaultId
   let other = env with vaultCid; vaultId; custodian
   _ <- holdingOf custodian env.usd.admin (usdId env) 100.0
@@ -905,7 +904,7 @@ withLoss : Env -> Script Env
 withLoss env = do
   pool <- heldBy env (usdId env) env.custodian
   forA_ [cid | (cid, amount) <- pool, amount == 60.0] $ \cid ->
-    submitMulti [env.custodian, env.usd.admin] [] (archiveCmd cid)
+    submit (actAs [env.custodian, env.usd.admin]) (archiveCmd cid)
   closeQueued env >>= openQueued env
 
 -- | A redemption that pays nothing at the current rate is refused when requested.
@@ -1080,7 +1079,7 @@ moveUsdPool env delta
   | delta >= 0.0 = void (holdingOf env.custodian env.usd.admin (usdId env) delta)
   | otherwise = do
       pool <- heldBy env (usdId env) env.custodian
-      forA_ pool $ \(cid, _) -> submitMulti [env.custodian, env.usd.admin] [] (archiveCmd cid)
+      forA_ pool $ \(cid, _) -> submit (actAs [env.custodian, env.usd.admin]) (archiveCmd cid)
       void (holdingOf env.custodian env.usd.admin (usdId env) (sum (map snd pool) + delta))
 
 -- | Requests from one period fill at one price, however the executors order them and whatever lands in between.

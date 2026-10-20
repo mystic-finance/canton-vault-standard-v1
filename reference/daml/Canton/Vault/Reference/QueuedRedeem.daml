@@ -1,10 +1,10 @@
 -- | A reference vault whose deposits are instant and redemptions queued.
 module Canton.Vault.Reference.QueuedRedeem where
 
-import DA.Action (foldlA, unless, void, when)
+import DA.Action (foldlA, unless)
 import DA.Foldable (forA_)
 import DA.List (dedup)
-import DA.Optional (fromOptional, isNone)
+import DA.Optional (fromOptional)
 import DA.TextMap qualified as TextMap
 import DA.Time (RelTime, addRelTime, isLedgerTimeGE, isLedgerTimeLT)
 
