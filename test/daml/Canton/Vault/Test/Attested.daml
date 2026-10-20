@@ -21,7 +21,7 @@ setupOracleVault = do
   f <- setupVault
   oracle <- allocateParty "oracle"
   Some vault <- queryContractId f.registrar f.vaultTemplateCid
-  vaultTemplateCid <- submitMulti [f.registrar, f.custodian] [] $
+  vaultTemplateCid <- submit (actAs [f.registrar, f.custodian]) $
     archiveCmd f.vaultTemplateCid *> createCmd vault with pricing = OraclePricing with oracle; latest = None
   let f' = f with vaultTemplateCid; vaultCid = toInterfaceContractId vaultTemplateCid
   pure (f', oracle)
@@ -210,7 +210,7 @@ evidenceMustMatchThePricing = script do
 attestedPriceStaysWithinLimits : Script ()
 attestedPriceStaysWithinLimits = script do
   (f, oracle) <- setupOracleVault
-  limited <- submitMulti [f.registrar, f.custodian] [] do
+  limited <- submit (actAs [f.registrar, f.custodian]) do
     exerciseCmd f.vaultTemplateCid ReferenceVault_SetPriceLimits with limits = lidoLimits
   now <- getTime
   a <- attest f oracle 1.5 now "nav-1"

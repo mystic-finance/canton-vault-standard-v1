@@ -11,13 +11,11 @@ import Canton.Vault.V1
 import Canton.Vault.Reference.QueuedRedeem qualified as R
 import Canton.Vault.Reference.Queue qualified as R
 import Canton.Vault.Reference.V1 (PeriodFlow(..), PriceEvidence(..), Pricing(..), RateAttestation(..))
-import Canton.Vault.Test.CrossAdminSettlement (Registry(..), tokenArgs, lockedTokens)
+import Canton.Vault.Test.CrossAdminSettlement (tokenArgs, lockedTokens)
 import Canton.Vault.Test.QueueSupport
 import Canton.Vault.Test.QueuedRedeem
-import Canton.Vault.Test.Reports
 
 import Splice.Api.Token.MetadataV1
-import Splice.Api.Token.HoldingV2 qualified as V2
 import Splice.Api.Token.AllocationV2 qualified as V2
 import Splice.TokenStandard.Utils
 import Splice.Testing.Tokens.TestTokenV2.Holding (Token(..))
@@ -28,7 +26,7 @@ setupOracle = do
   env <- setup
   oracle <- allocateParty "oracle"
   Some vault <- queryContractId env.registrar env.vaultCid
-  vaultCid <- submitMulti [env.registrar, env.custodian] [] $
+  vaultCid <- submit (actAs [env.registrar, env.custodian]) $
     archiveCmd env.vaultCid *> createCmd vault with pricing = OraclePricing with oracle; latest = None
   let env' = env with vaultCid
   pure (env', oracle)
@@ -255,7 +253,7 @@ reclaimNamesThisVault = script do
   (env, _, rest) <- partlyFilled
   Some vault <- queryContractId env.registrar env.vaultCid
   mallory <- allocateParty "mallory"
-  sibling <- submitMulti [env.registrar, env.custodian] [] do
+  sibling <- submit (actAs [env.registrar, env.custodian]) do
     createCmd vault with vaultId = "queued-redeem-2"; shareInstrument = vault.shareInstrument with id = "queued-redeem-2"
   foreign <- submit mallory do
     createCmd vault with vaultRegistrar = mallory; custodian = mallory; vaultId = "queued-redeem-1"
