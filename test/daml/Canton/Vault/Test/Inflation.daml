@@ -1,7 +1,7 @@
 -- | The first-depositor inflation attack, and the offset that blunts it.
 module Canton.Vault.Test.Inflation where
 
-import DA.Assert ((===), assertMsg)
+import DA.Assert ((===))
 import DA.Time (addRelTime, hours)
 import Daml.Script
 
@@ -9,9 +9,6 @@ import Canton.Vault.V1
 import Canton.Vault.Reference.V1
 import Canton.Vault.Test.Deposit
 import Canton.Vault.Test.MockToken
-
-import Splice.Api.Token.HoldingV2 qualified as V2
-import Splice.TokenStandard.Utils
 
 -- | A donation after the attacker's first share still leaves the victim's deposit whole.
 donationBeforeTheFirstDepositDoesNotRobTheNext : Script ()
@@ -22,7 +19,7 @@ donationBeforeTheFirstDepositDoesNotRobTheNext = script do
 
   -- The smallest deposit the vault will take.
   attackerFunds <- fund f f.alice 0.0000000001
-  attackerResult <- submitWithDisclosures f.alice disclosures do
+  attackerResult <- submit (actAs f.alice <> discloseMany disclosures) do
     exerciseCmd f.vaultCid Vault_Deposit with
       assets = 0.0000000001
       receiver = f.alice
@@ -59,7 +56,7 @@ donationBeforeTheFirstDepositDoesNotRobTheNext = script do
     _ -> abort "disclosures not available"
 
   victimFunds <- fund f victim 100.0
-  victimResult <- submitWithDisclosures victim rolledDisclosures do
+  victimResult <- submit (actAs victim <> discloseMany rolledDisclosures) do
     exerciseCmd (toInterfaceContractId rolledCid : ContractId Vault) Vault_Deposit with
       assets = 100.0
       receiver = victim

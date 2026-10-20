@@ -68,7 +68,7 @@ shrinkPoolTo : Fixture -> Decimal -> Script ()
 shrinkPoolTo f fraction = do
   pool <- query @MockHolding f.custodian
   let total = sum [h.holding.amount | (_, h) <- pool]
-  forA_ pool $ \(cid, _) -> submitMulti [f.underlyingAdmin, f.custodian] [] (archiveCmd cid)
+  forA_ pool $ \(cid, _) -> submit (actAs [f.underlyingAdmin, f.custodian]) (archiveCmd cid)
   _ <- fund f f.custodian (total * fraction)
   pure ()
 
