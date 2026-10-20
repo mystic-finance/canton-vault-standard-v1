@@ -64,7 +64,7 @@ setupVaultLimited limits depositFeeBps redeemFeeBps vaultAccrual cap = do
     createCmd MockRegistry with admin = underlyingAdmin
 
   now <- getTime
-  vaultTemplateCid <- submitMulti [registrar, custodian] [] do
+  vaultTemplateCid <- submit (actAs [registrar, custodian]) do
     createCmd ReferenceVault with
       vaultId = "reference-1"
       vaultRegistrar = registrar
@@ -153,7 +153,7 @@ firstDepositMintsAtPar = script do
   holdingCid <- fund f f.alice 100.0
 
   disclosures <- vaultDisclosure f
-  result <- submitWithDisclosures f.alice disclosures do
+  result <- submit (actAs f.alice <> discloseMany disclosures) do
     exerciseCmd f.vaultCid Vault_Deposit with
       assets = 100.0
       receiver = f.alice
@@ -174,7 +174,7 @@ slippageLimitIsEnforced = script do
   holdingCid <- fund f f.alice 100.0
 
   disclosures <- vaultDisclosure f
-  submitWithDisclosuresMustFail f.alice disclosures do
+  submitMustFail (actAs f.alice <> discloseMany disclosures) do
     exerciseCmd f.vaultCid Vault_Deposit with
       assets = 100.0
       receiver = f.alice
@@ -189,7 +189,7 @@ redeemReturnsUnderlying = script do
   holdingCid <- fund f f.alice 100.0
 
   disclosures <- vaultDisclosure f
-  depositResult <- submitWithDisclosures f.alice disclosures do
+  depositResult <- submit (actAs f.alice <> discloseMany disclosures) do
     exerciseCmd f.vaultCid Vault_Deposit with
       assets = 100.0
       receiver = f.alice
@@ -207,7 +207,7 @@ redeemReturnsUnderlying = script do
       Some d' -> pure d'
       None -> abort "pool holding disclosure not available"
 
-  redeemResult <- submitWithDisclosures f.alice (disclosures <> poolDisclosures) do
+  redeemResult <- submit (actAs f.alice <> discloseMany (disclosures <> poolDisclosures)) do
     exerciseCmd f.vaultCid Vault_Redeem with
       shares = 100.0
       owner = f.alice
@@ -228,7 +228,7 @@ redeemRequiresTheOwner = script do
   holdingCid <- fund f f.alice 100.0
   disclosures <- vaultDisclosure f
 
-  depositResult <- submitWithDisclosures f.alice disclosures do
+  depositResult <- submit (actAs f.alice <> discloseMany disclosures) do
     exerciseCmd f.vaultCid Vault_Deposit with
       assets = 100.0
       receiver = f.alice
@@ -248,7 +248,7 @@ redeemRequiresTheOwner = script do
       Some d' -> pure d'
       None -> abort "share holding disclosure not available"
 
-  submitWithDisclosuresMustFail mallory (disclosures <> poolDisclosures <> shareDisclosures) do
+  submitMustFail (actAs mallory <> discloseMany (disclosures <> poolDisclosures <> shareDisclosures)) do
     exerciseCmd f.vaultCid Vault_Redeem with
       shares = 100.0
       owner = f.alice
@@ -269,7 +269,7 @@ periodRollCarriesTotals = script do
   aliceFunds <- fund f f.alice 100.0
   bobFunds <- fund f bob 100.0
 
-  aliceResult <- submitWithDisclosures f.alice disclosures do
+  aliceResult <- submit (actAs f.alice <> discloseMany disclosures) do
     exerciseCmd f.vaultCid Vault_Deposit with
       assets = 100.0
       receiver = f.alice
@@ -277,7 +277,7 @@ periodRollCarriesTotals = script do
       actors = [f.alice]
       extraArgs = depositArgs f [aliceFunds]
 
-  bobResult <- submitWithDisclosures bob disclosures do
+  bobResult <- submit (actAs bob <> discloseMany disclosures) do
     exerciseCmd f.vaultCid Vault_Deposit with
       assets = 100.0
       receiver = bob
@@ -302,7 +302,7 @@ periodRollCarriesTotals = script do
 
   now <- getTime
   closed10 <- closePeriod f f.vaultTemplateCid
-  rolledCid <- submitWithDisclosures f.registrar poolDisclosures do
+  rolledCid <- submit (actAs f.registrar <> discloseMany poolDisclosures) do
     exerciseCmd closed10 ClosedPeriod_Open with
       flowCids = map fst flows
       evidence = PoolHoldings (map (toInterfaceContractId . fst) custodianHoldings)
@@ -322,7 +322,7 @@ rollRejectsWrongInstrument = script do
   disclosures <- vaultDisclosure f
   holdingCid <- fund f f.alice 100.0
 
-  _ <- submitWithDisclosures f.alice disclosures do
+  _ <- submit (actAs f.alice <> discloseMany disclosures) do
     exerciseCmd f.vaultCid Vault_Deposit with
       assets = 100.0
       receiver = f.alice
@@ -344,7 +344,7 @@ rollRejectsWrongInstrument = script do
   flows <- query @PeriodFlow f.registrar
   now <- getTime
   closed11 <- closePeriod f f.vaultTemplateCid
-  submitWithDisclosuresMustFail f.registrar poolDisclosures do
+  submitMustFail (actAs f.registrar <> discloseMany poolDisclosures) do
     exerciseCmd closed11 ClosedPeriod_Open with
       flowCids = map fst flows
       evidence = PoolHoldings (map (toInterfaceContractId . fst) custodianHoldings)
@@ -412,7 +412,7 @@ maxRedeemCountsOnlyTheParty = script do
   aliceFunds <- fund f f.alice 100.0
   bobFunds <- fund f bob 900.0
 
-  aliceResult <- submitWithDisclosures f.alice disclosures do
+  aliceResult <- submit (actAs f.alice <> discloseMany disclosures) do
     exerciseCmd f.vaultCid Vault_Deposit with
       assets = 100.0
       receiver = f.alice
@@ -420,7 +420,7 @@ maxRedeemCountsOnlyTheParty = script do
       actors = [f.alice]
       extraArgs = depositArgs f [aliceFunds]
 
-  _ <- submitWithDisclosures bob disclosures do
+  _ <- submit (actAs bob <> discloseMany disclosures) do
     exerciseCmd f.vaultCid Vault_Deposit with
       assets = 900.0
       receiver = bob
@@ -446,7 +446,7 @@ maxRedeemWithoutEvidenceIsZero = script do
   disclosures <- vaultDisclosure f
   holdingCid <- fund f f.alice 100.0
 
-  _ <- submitWithDisclosures f.alice disclosures do
+  _ <- submit (actAs f.alice <> discloseMany disclosures) do
     exerciseCmd f.vaultCid Vault_Deposit with
       assets = 100.0
       receiver = f.alice

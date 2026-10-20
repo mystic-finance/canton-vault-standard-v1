@@ -1,7 +1,7 @@
 -- | Share accounting rounds in the vault's favour, exactly.
 module Canton.Vault.Test.Rounding where
 
-import DA.Assert ((===), assertMsg)
+import DA.Assert ((===))
 import DA.Action (when)
 import DA.Foldable (forA_)
 import Daml.Script

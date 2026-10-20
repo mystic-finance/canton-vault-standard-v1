@@ -44,7 +44,7 @@ rollRejectsFlowsFromAnotherVault : Script ()
 rollRejectsFlowsFromAnotherVault = script do
   f <- setupVault
   now <- getTime
-  sibling <- submitMulti [f.registrar, f.custodian] [] do
+  sibling <- submit (actAs [f.registrar, f.custodian]) do
     createCmd ReferenceVault with
       vaultId = "reference-2"
       vaultRegistrar = f.registrar
@@ -149,7 +149,7 @@ depositOverTheCapIsRejected = script do
   f <- setupCappedVault 50.0
   ds <- disclosuresFor f f.vaultTemplateCid
   funds <- fund f f.alice 100.0
-  submitWithDisclosuresMustFail f.alice ds do
+  submitMustFail (actAs f.alice <> discloseMany ds) do
     exerciseCmd (toInterfaceContractId f.vaultTemplateCid : ContractId Vault) Vault_Deposit with
       assets = 100.0
       receiver = f.alice
@@ -165,7 +165,7 @@ nonPositiveAmountsAreRejected = script do
   funds <- fund f f.alice 100.0
   let vaultCid : ContractId Vault = toInterfaceContractId f.vaultTemplateCid
 
-  submitWithDisclosuresMustFail f.alice ds do
+  submitMustFail (actAs f.alice <> discloseMany ds) do
     exerciseCmd vaultCid Vault_Mint with
       shares = 0.0
       receiver = f.alice
@@ -173,7 +173,7 @@ nonPositiveAmountsAreRejected = script do
       actors = [f.alice]
       extraArgs = depositArgs f [funds]
 
-  submitWithDisclosuresMustFail f.alice ds do
+  submitMustFail (actAs f.alice <> discloseMany ds) do
     exerciseCmd vaultCid Vault_Withdraw with
       assets = 0.0
       owner = f.alice
@@ -182,7 +182,7 @@ nonPositiveAmountsAreRejected = script do
       actors = [f.alice]
       extraArgs = depositArgs f [funds]
 
-  submitWithDisclosuresMustFail f.alice ds do
+  submitMustFail (actAs f.alice <> discloseMany ds) do
     exerciseCmd vaultCid Vault_Redeem with
       shares = 0.0
       owner = f.alice
@@ -201,7 +201,7 @@ depositMintingZeroSharesIsRejected = script do
   rolled <- rollPeriod f f.vaultTemplateCid
   ds <- disclosuresFor f rolled
   funds <- fund f f.alice 0.0000000001
-  submitWithDisclosuresMustFail f.alice ds do
+  submitMustFail (actAs f.alice <> discloseMany ds) do
     exerciseCmd (toInterfaceContractId rolled : ContractId Vault) Vault_Deposit with
       assets = 0.0000000001
       receiver = f.alice
@@ -229,7 +229,7 @@ withdrawRequiresTheOwner = script do
       Some d' -> pure d'
       None -> abort "share disclosure not available"
 
-  submitWithDisclosuresMustFail mallory (ds <> poolDs <> shareDs) do
+  submitMustFail (actAs mallory <> discloseMany (ds <> poolDs <> shareDs)) do
     exerciseCmd (toInterfaceContractId rolled : ContractId Vault) Vault_Withdraw with
       assets = 50.0
       owner = f.alice
@@ -254,7 +254,7 @@ redeemBeyondTheNamedHoldingsIsRejected = script do
   poolDs <- poolDisclosures f
   aliceShares <- query @ShareHolding f.alice
 
-  submitWithDisclosuresMustFail f.alice (ds <> poolDs) do
+  submitMustFail (actAs f.alice <> discloseMany (ds <> poolDs)) do
     exerciseCmd (toInterfaceContractId rolled : ContractId Vault) Vault_Redeem with
       shares = first.shares
       owner = f.alice
@@ -276,8 +276,8 @@ lockedSharesCannotBeRedeemed = script do
 
   -- Re-issue Alice's shares locked.
   aliceShares <- query @ShareHolding f.alice
-  forA_ aliceShares $ \(cid, _) -> submitMulti [f.alice, f.registrar] [] (archiveCmd cid)
-  lockedCid <- submitMulti [f.alice, f.registrar] [] do
+  forA_ aliceShares $ \(cid, _) -> submit (actAs [f.alice, f.registrar]) (archiveCmd cid)
+  lockedCid <- submit (actAs [f.alice, f.registrar]) do
     createCmd Token with
       holding = V2.HoldingView with
         account = basicAccount f.alice
@@ -290,7 +290,7 @@ lockedSharesCannotBeRedeemed = script do
           context = None
         meta = emptyMetadata
 
-  submitWithDisclosuresMustFail f.alice (ds <> poolDs) do
+  submitMustFail (actAs f.alice <> discloseMany (ds <> poolDs)) do
     exerciseCmd (toInterfaceContractId rolled : ContractId Vault) Vault_Redeem with
       shares = first.shares
       owner = f.alice
@@ -305,7 +305,7 @@ mintOverTheCapIsRejected = script do
   f <- setupCappedVault 50.0
   ds <- disclosuresFor f f.vaultTemplateCid
   funds <- fund f f.alice 100.0
-  submitWithDisclosuresMustFail f.alice ds do
+  submitMustFail (actAs f.alice <> discloseMany ds) do
     exerciseCmd (toInterfaceContractId f.vaultTemplateCid : ContractId Vault) Vault_Mint with
       shares = 100.0
       receiver = f.alice
@@ -321,7 +321,7 @@ rollRejectsLockedPoolHoldings = script do
 
   -- Re-issue the pool locked.
   pool <- query @MockHolding f.custodian
-  forA_ pool $ \(cid, _) -> submitMulti [f.underlyingAdmin, f.custodian] [] (archiveCmd cid)
+  forA_ pool $ \(cid, _) -> submit (actAs [f.underlyingAdmin, f.custodian]) (archiveCmd cid)
   lockedCid <- submit f.underlyingAdmin do
     createCmd MockHolding with
       holding = V2.HoldingView with
@@ -359,7 +359,7 @@ burningTheWrongInstrumentIsRejected = script do
 
   -- Shares of a different instrument, in Alice's own account.
   let other = V2.InstrumentId with admin = f.registrar; id = "vEUR"
-  otherCid <- submitMulti [f.alice, f.registrar] [] do
+  otherCid <- submit (actAs [f.alice, f.registrar]) do
     createCmd Token with
       holding = V2.HoldingView with
         account = basicAccount f.alice
@@ -368,7 +368,7 @@ burningTheWrongInstrumentIsRejected = script do
         lock = None
         meta = emptyMetadata
 
-  submitWithDisclosuresMustFail f.alice (ds <> poolDs) do
+  submitMustFail (actAs f.alice <> discloseMany (ds <> poolDs)) do
     exerciseCmd (toInterfaceContractId rolled : ContractId Vault) Vault_Redeem with
       shares = first.shares
       owner = f.alice
@@ -385,7 +385,7 @@ redemptionReturningNothingIsRejected = script do
 
   -- The pool loses almost everything, so the next roll prices it far below par.
   pool <- query @MockHolding f.custodian
-  forA_ pool $ \(cid, _) -> submitMulti [f.underlyingAdmin, f.custodian] [] (archiveCmd cid)
+  forA_ pool $ \(cid, _) -> submit (actAs [f.underlyingAdmin, f.custodian]) (archiveCmd cid)
   _ <- submit f.underlyingAdmin do
     createCmd MockHolding with
       holding = V2.HoldingView with
@@ -401,7 +401,7 @@ redemptionReturningNothingIsRejected = script do
   shrunk <- query @MockHolding f.custodian
   aliceShares <- query @ShareHolding f.alice
 
-  submitWithDisclosuresMustFail f.alice (ds <> poolDs) do
+  submitMustFail (actAs f.alice <> discloseMany (ds <> poolDs)) do
     exerciseCmd (toInterfaceContractId rolled : ContractId Vault) Vault_Redeem with
       shares = 0.0000000001
       owner = f.alice
@@ -447,7 +447,7 @@ maxRedeemRejectsTheWrongInstrument = script do
   f <- setupVault
   _ <- deposit f f.vaultTemplateCid f.alice 100.0
   let other = V2.InstrumentId with admin = f.registrar; id = "vEUR"
-  otherCid <- submitMulti [f.alice, f.registrar] [] do
+  otherCid <- submit (actAs [f.alice, f.registrar]) do
     createCmd Token with
       holding = V2.HoldingView with
         account = basicAccount f.alice
@@ -467,8 +467,8 @@ maxRedeemRejectsALockedShareHolding = script do
   f <- setupVault
   _ <- deposit f f.vaultTemplateCid f.alice 100.0
   aliceShares <- query @ShareHolding f.alice
-  forA_ aliceShares $ \(cid, _) -> submitMulti [f.alice, f.registrar] [] (archiveCmd cid)
-  lockedCid <- submitMulti [f.alice, f.registrar] [] do
+  forA_ aliceShares $ \(cid, _) -> submit (actAs [f.alice, f.registrar]) (archiveCmd cid)
+  lockedCid <- submit (actAs [f.alice, f.registrar]) do
     createCmd Token with
       holding = V2.HoldingView with
         account = basicAccount f.alice
@@ -497,7 +497,7 @@ rollRejectsNegativeShares = script do
   poolDs <- poolDisclosures f
   pool <- query @MockHolding f.custodian
   aliceShares <- map fst <$> query @ShareHolding f.alice
-  _ <- submitWithDisclosures f.alice (ds <> poolDs) do
+  _ <- submit (actAs f.alice <> discloseMany (ds <> poolDs)) do
     exerciseCmd (toInterfaceContractId f.vaultTemplateCid : ContractId Vault) Vault_Redeem with
       shares = first.shares
       owner = f.alice
@@ -533,7 +533,7 @@ mintWithdrawAndRedeemFailAfterThePeriodEnds = script do
       poolCids = map (toInterfaceContractId . fst) pool
   passTime (hours 2)
 
-  submitWithDisclosuresMustFail f.alice (ds <> poolDs) do
+  submitMustFail (actAs f.alice <> discloseMany (ds <> poolDs)) do
     exerciseCmd vaultCid Vault_Mint with
       shares = 10.0
       receiver = f.alice
@@ -541,7 +541,7 @@ mintWithdrawAndRedeemFailAfterThePeriodEnds = script do
       actors = [f.alice]
       extraArgs = depositArgs f [funds]
 
-  submitWithDisclosuresMustFail f.alice (ds <> poolDs) do
+  submitMustFail (actAs f.alice <> discloseMany (ds <> poolDs)) do
     exerciseCmd vaultCid Vault_Withdraw with
       assets = 10.0
       owner = f.alice
@@ -550,7 +550,7 @@ mintWithdrawAndRedeemFailAfterThePeriodEnds = script do
       actors = [f.alice]
       extraArgs = redeemArgs f poolCids aliceShares
 
-  submitWithDisclosuresMustFail f.alice (ds <> poolDs) do
+  submitMustFail (actAs f.alice <> discloseMany (ds <> poolDs)) do
     exerciseCmd vaultCid Vault_Redeem with
       shares = 10.0
       owner = f.alice
@@ -589,7 +589,7 @@ burningFromAnotherAccountIsRejected = script do
   f <- setupVault
   first <- deposit f f.vaultTemplateCid f.alice 100.0
   let other = V2.Account with owner = Some f.alice; provider = None; id = "sub"
-  otherCid <- submitMulti [f.alice, f.registrar] [] do
+  otherCid <- submit (actAs [f.alice, f.registrar]) do
     createCmd Token with
       holding = V2.HoldingView with
         account = other
@@ -603,7 +603,7 @@ burningFromAnotherAccountIsRejected = script do
   poolDs <- poolDisclosures f
   pool <- query @MockHolding f.custodian
 
-  submitWithDisclosuresMustFail f.alice (ds <> poolDs) do
+  submitMustFail (actAs f.alice <> discloseMany (ds <> poolDs)) do
     exerciseCmd (toInterfaceContractId rolled : ContractId Vault) Vault_Redeem with
       shares = 10.0
       owner = f.alice
@@ -626,7 +626,7 @@ payoutTakesOnlyTheHoldingsItNeeds = script do
   ds <- disclosuresFor f f.vaultTemplateCid
   poolDs <- poolDisclosures f
   bobShares <- map fst <$> query @ShareHolding bob
-  _ <- submitWithDisclosures bob (ds <> poolDs) do
+  _ <- submit (actAs bob <> discloseMany (ds <> poolDs)) do
     exerciseCmd (toInterfaceContractId f.vaultTemplateCid : ContractId Vault) Vault_Redeem with
       shares = 1.0
       owner = bob
@@ -645,7 +645,7 @@ callerNamedFactoryCannotFakeADeposit = script do
   ds <- vaultDisclosure f
   forged <- submit mallory do
     createCmd ForgedFactory with owner = mallory; claimedAdmin = f.underlyingAdmin; drain = None
-  submitWithDisclosuresMustFail mallory ds do
+  submitMustFail (actAs mallory <> discloseMany ds) do
     exerciseCmd f.vaultCid Vault_Deposit with
       assets = 1000.0
       receiver = mallory
@@ -703,7 +703,7 @@ mergeRefusesAnotherVaultsFlow : Script ()
 mergeRefusesAnotherVaultsFlow = script do
   f <- setupVault
   now <- getTime
-  sibling <- submitMulti [f.registrar, f.custodian] [] do
+  sibling <- submit (actAs [f.registrar, f.custodian]) do
     createCmd ReferenceVault with
       vaultId = "reference-2"
       vaultRegistrar = f.registrar

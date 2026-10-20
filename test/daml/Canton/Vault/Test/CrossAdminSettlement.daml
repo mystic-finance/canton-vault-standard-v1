@@ -122,7 +122,7 @@ depositAllocations = do
   custodian <- allocateParty "custodian"
   venue <- allocateParty "venue"
 
-  usdCid <- submitMulti [alice, underlying.admin] [] do
+  usdCid <- submit (actAs [alice, underlying.admin]) do
     createCmd Token with
       holding = V2.HoldingView with
         account = basicAccount alice

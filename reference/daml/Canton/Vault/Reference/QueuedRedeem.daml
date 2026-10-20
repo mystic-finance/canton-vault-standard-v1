@@ -1,7 +1,7 @@
 -- | A reference vault whose deposits are instant and redemptions queued.
 module Canton.Vault.Reference.QueuedRedeem where
 
-import DA.Action (foldlA, unless, void, when)
+import DA.Action (foldlA, unless, void)
 import DA.Foldable (forA_)
 import DA.List (dedup, unique)
 import DA.Optional (fromOptional, isNone, isSome)
@@ -202,7 +202,7 @@ template ReferenceQueuedRedeemVault
       -- the held rest of a request filled in part takes the current one.
       with
         requestCids : [ContractId QueuedRedeemRequest]
-          -- ^ The requests to fill; each adds a leg to each registry's batch, and every registry accepts 25.
+          -- ^ The requests to fill; each settles as its own batch on each registry.
         priceCids : [ContractId PeriodPrice]
           -- ^ The prices struck in periods before the current one, for requests filled late.
         poolHoldingCids : [ContractId V2.Holding]

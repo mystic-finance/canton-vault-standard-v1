@@ -29,7 +29,7 @@ usdId : Env -> V2.InstrumentId
 usdId env = V2.InstrumentId with admin = env.usd.admin; id = "USD"
 
 holdingOf : Party -> Party -> V2.InstrumentId -> Decimal -> Script (ContractId Token)
-holdingOf owner admin instrumentId amount = submitMulti [owner, admin] [] do
+holdingOf owner admin instrumentId amount = submit (actAs [owner, admin]) do
   createCmd Token with
     holding = V2.HoldingView with
       account = basicAccount owner; instrumentId; amount; lock = None; meta = emptyMetadata
@@ -43,7 +43,7 @@ setup = do
   alice <- allocateParty "alice"
   now <- getTime
   let shareId = V2.InstrumentId with admin = registrar; id = "test-token-vault"
-  vaultCid <- submitMulti [registrar, custodian] [] do
+  vaultCid <- submit (actAs [registrar, custodian]) do
     createCmd ReferenceVault with
       vaultId = "test-token-vault"
       vaultRegistrar = registrar

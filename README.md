@@ -75,7 +75,7 @@ A batch settles whole or not at all, so one request that cannot settle, such as
 a receiver its registry has blocked, fails the rest. Executors dry-run a batch,
 settle the requests that pass, and `Reject` the one that fails, which returns
 its escrow and reports why. Each request settles as its own batch on each
-registry, inside one fulfilment of up to 25 requests.
+registry, all inside one fulfilment transaction.
 
 Fulfilments and rejections are reported to the requester and receiver through a
 log created and archived in the same transaction, as the token standard's event
