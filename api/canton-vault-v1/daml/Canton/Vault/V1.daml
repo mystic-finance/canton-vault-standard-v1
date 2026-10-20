@@ -212,12 +212,12 @@ interface Vault where
   maxMint : Party -> ExtraArgs -> Update Decimal
 
   -- | Most of the underlying the party's named share holdings can withdraw,
-  -- after the fee. Reading the pool needs the custodian's authority, which a
-  -- read method does not carry, so available liquidity is not reflected and a
-  -- withdrawal may still fail for want of it.
+  -- after the fee. A vault whose value can sit outside its pool, such as one
+  -- with an attested rate, also caps it at what the pool holdings named in
+  -- `extraArgs` can pay.
   maxWithdraw : Party -> ExtraArgs -> Update Decimal
 
-  -- | The party's named share holdings. Liquidity as for `maxWithdraw`.
+  -- | The party's named share holdings, capped as for `maxWithdraw`.
   maxRedeem : Party -> ExtraArgs -> Update Decimal
 
   -- | Shares `assets` would mint, including fees. Rounds down.
