@@ -134,10 +134,10 @@ data AsyncView = AsyncView with
       -- ^ Additional metadata specific to the vault, used for extensibility.
   deriving (Show, Eq, Serializable)
 
--- | The settlement id every allocation for a request to the vault carries, in
--- any period, so its requests can settle in one batch. Wallets compute it
--- before allocating. The rest of the settlement is the vault's `executors`, no
--- contract id and no metadata.
+-- | The settlement id every allocation for a request to the vault carries. The
+-- rest of the settlement is the vault's `executors`, a contract id naming the
+-- request and no metadata, so an allocation made for one request settles no
+-- other. Wallets take it from the request's allocation request.
 requestSettlementId : Text -> Text
 requestSettlementId vaultId = vaultId <> "/requests"
 
