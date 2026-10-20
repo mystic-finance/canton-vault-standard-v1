@@ -13,10 +13,6 @@ import Canton.Vault.Test.Deposit
 import Canton.Vault.Test.MockToken
 import Canton.Vault.Test.Periods
 
-import Splice.Api.Token.MetadataV1
-import Splice.Api.Token.HoldingV2 qualified as V2
-import Splice.TokenStandard.Utils
-
 next : Int -> Int
 next s = (s * 1103515245 + 12345) % 2147483648
 
@@ -42,7 +38,7 @@ randomState seed cap = do
       fee = case s1 % 4 of { 0 -> 0; 1 -> 30; 2 -> 250; _ -> 999 }
   f <- setupVaultFull fee None cap
   bob <- allocateParty "bob"
-  _ <- deposit f f.vaultTemplateCid bob (maybe identity min cap (amountFrom s2))
+  _ <- deposit f f.vaultTemplateCid bob (optional identity min cap (amountFrom s2))
   case s3 % 3 of
     0 -> pure ()
     1 -> do
@@ -56,7 +52,7 @@ shrinkPool : Fixture -> Decimal -> Script ()
 shrinkPool f fraction = do
   pool <- query @MockHolding f.custodian
   let total = sum [h.holding.amount | (_, h) <- pool]
-  forA_ pool $ \(cid, _) -> submitMulti [f.underlyingAdmin, f.custodian] [] (archiveCmd cid)
+  forA_ pool $ \(cid, _) -> submit (actAs [f.underlyingAdmin, f.custodian]) (archiveCmd cid)
   _ <- fund f f.custodian (total * fraction)
   pure ()
 
