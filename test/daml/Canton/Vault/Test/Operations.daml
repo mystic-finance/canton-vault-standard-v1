@@ -2,7 +2,6 @@
 module Canton.Vault.Test.Operations where
 
 import DA.Assert ((===))
-import DA.Foldable (forA_)
 import DA.Time (addRelTime, hours)
 import Daml.Script
 
@@ -13,8 +12,6 @@ import Canton.Vault.Test.Deposit
 import Canton.Vault.Test.MockToken
 import Canton.Vault.Test.Periods
 import Canton.Vault.Test.Reports
-
-import Splice.Api.Token.MetadataV1
 
 setPaused : Fixture -> ContractId ReferenceVault -> Bool -> Script (ContractId ReferenceVault)
 setPaused f vaultCid paused = submit f.registrar do
@@ -29,14 +26,14 @@ pauseStopsEntriesNotExits = script do
   ds <- disclosuresFor f paused
   funds <- fund f f.alice 100.0
   let vaultCid : ContractId Vault = toInterfaceContractId paused
-  submitWithDisclosuresMustFail f.alice ds do
+  submitMustFail (actAs f.alice <> discloseMany ds) do
     exerciseCmd vaultCid Vault_Deposit with
       assets = 100.0
       receiver = f.alice
       minSharesOut = None
       actors = [f.alice]
       extraArgs = depositArgs f [funds]
-  submitWithDisclosuresMustFail f.alice ds do
+  submitMustFail (actAs f.alice <> discloseMany ds) do
     exerciseCmd vaultCid Vault_Mint with
       shares = 10.0
       receiver = f.alice
@@ -47,7 +44,7 @@ pauseStopsEntriesNotExits = script do
   poolDs <- poolDisclosures f
   pool <- query @MockHolding f.custodian
   aliceShares <- map fst <$> query @ShareHolding f.alice
-  _ <- submitWithDisclosures f.alice (ds <> poolDs) do
+  _ <- submit (actAs f.alice <> discloseMany (ds <> poolDs)) do
     exerciseCmd vaultCid Vault_Redeem with
       shares = 100.0
       owner = f.alice
@@ -82,7 +79,7 @@ actionsAfterTheCloseAreRefused = script do
   ds <- disclosuresFor f f.vaultTemplateCid
   funds <- fund f f.alice 100.0
   _ <- closePeriod f f.vaultTemplateCid
-  submitWithDisclosuresMustFail f.alice ds do
+  submitMustFail (actAs f.alice <> discloseMany ds) do
     exerciseCmd f.vaultCid Vault_Deposit with
       assets = 100.0
       receiver = f.alice

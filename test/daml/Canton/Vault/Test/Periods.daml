@@ -1,8 +1,8 @@
 -- | Fees, accrual and pricing across rate periods.
 module Canton.Vault.Test.Periods where
 
-import DA.Assert ((===), assertMsg)
-import DA.Time (addRelTime, hours, minutes)
+import DA.Assert ((===))
+import DA.Time (addRelTime, hours)
 import Daml.Script
 
 import Canton.Vault.V1
@@ -10,9 +10,6 @@ import Canton.Vault.Reference.V1
 import Canton.Vault.Reference.Share
 import Canton.Vault.Test.Deposit
 import Canton.Vault.Test.MockToken
-
-import Splice.Api.Token.HoldingV2 qualified as V2
-import Splice.TokenStandard.Utils
 
 -- | Roll the period, measuring the pool from the custodian's holdings.
 rollPeriod : Fixture -> ContractId ReferenceVault -> Script (ContractId ReferenceVault)
@@ -54,7 +51,7 @@ deposit : Fixture -> ContractId ReferenceVault -> Party -> Decimal -> Script Vau
 deposit f vaultCid party amount = do
   funds <- fund f party amount
   ds <- disclosuresFor f vaultCid
-  submitWithDisclosures party ds do
+  submit (actAs party <> discloseMany ds) do
     exerciseCmd (toInterfaceContractId vaultCid : ContractId Vault) Vault_Deposit with
       assets = amount
       receiver = party
@@ -185,7 +182,7 @@ manyDepositorsInOnePeriod = script do
       None -> abort "pool holding disclosure not available"
   ds <- disclosuresFor f rolled
   bobShares <- query @ShareHolding bob
-  redeemed <- submitWithDisclosures bob (ds <> poolDisclosures) do
+  redeemed <- submit (actAs bob <> discloseMany (ds <> poolDisclosures)) do
     exerciseCmd (toInterfaceContractId rolled : ContractId Vault) Vault_Redeem with
       shares = 250.0
       owner = bob
@@ -214,7 +211,7 @@ pendingLegMintsNothing = script do
   funds <- fund f f.alice 100.0
   let args = depositArgs f [funds]
 
-  submitWithDisclosuresMustFail f.alice ds do
+  submitMustFail (actAs f.alice <> discloseMany ds) do
     exerciseCmd f.vaultCid Vault_Deposit with
       assets = 100.0
       receiver = f.alice
@@ -253,7 +250,7 @@ redeemFeeStaysInThePool = script do
   ds <- disclosuresFor f rolled
   aliceShares <- query @ShareHolding f.alice
 
-  redeemed <- submitWithDisclosures f.alice (ds <> poolDisclosures) do
+  redeemed <- submit (actAs f.alice <> discloseMany (ds <> poolDisclosures)) do
     exerciseCmd (toInterfaceContractId rolled : ContractId Vault) Vault_Redeem with
       shares = alice.shares
       owner = f.alice
@@ -297,7 +294,7 @@ depositCannotIssueToAnAbsentParty = script do
   stranger <- allocateParty "stranger"
   ds <- disclosuresFor f f.vaultTemplateCid
   funds <- fund f f.alice 100.0
-  submitWithDisclosuresMustFail f.alice ds do
+  submitMustFail (actAs f.alice <> discloseMany ds) do
     exerciseCmd (toInterfaceContractId f.vaultTemplateCid : ContractId Vault) Vault_Deposit with
       assets = 100.0
       receiver = stranger
@@ -327,9 +324,9 @@ feesOutsideRangeAreRejected = script do
         paused = False
         underlyingTransferFactory = f.registryCid
         priceLimits = wideLimits
-  _ <- submitMulti [f.registrar, f.custodian] [] (mk 100)
-  submitMultiMustFail [f.registrar, f.custodian] [] (mk (-100))
-  submitMultiMustFail [f.registrar, f.custodian] [] (mk 10001)
+  _ <- submit (actAs [f.registrar, f.custodian]) (mk 100)
+  submitMustFail (actAs [f.registrar, f.custodian]) (mk (-100))
+  submitMustFail (actAs [f.registrar, f.custodian]) (mk 10001)
 
 -- | Each vault issues its own shares, named by its id.
 shareInstrumentIsTheVaults : Script ()
@@ -354,8 +351,8 @@ shareInstrumentIsTheVaults = script do
         paused = False
         underlyingTransferFactory = f.registryCid
         priceLimits = wideLimits
-  _ <- submitMulti [f.registrar, f.custodian] [] (mk (f.shares with id = "second"))
+  _ <- submit (actAs [f.registrar, f.custodian]) (mk (f.shares with id = "second"))
   -- Another vault's shares.
-  submitMultiMustFail [f.registrar, f.custodian] [] (mk f.shares)
+  submitMustFail (actAs [f.registrar, f.custodian]) (mk f.shares)
   -- Shares administered by someone else.
-  submitMultiMustFail [f.registrar, f.custodian] [] (mk (f.shares with admin = stranger; id = "second"))
+  submitMustFail (actAs [f.registrar, f.custodian]) (mk (f.shares with admin = stranger; id = "second"))

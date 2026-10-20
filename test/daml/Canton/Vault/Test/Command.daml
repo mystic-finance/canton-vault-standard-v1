@@ -81,7 +81,7 @@ commandForAnotherVaultIsRefused = script do
   f <- setupVault
   venue <- allocateParty "venue"
   now <- getTime
-  sibling <- submitMulti [f.registrar, f.custodian] [] do
+  sibling <- submit (actAs [f.registrar, f.custodian]) do
     createCmd ReferenceVault with
       vaultId = "reference-2"
       vaultRegistrar = f.registrar
