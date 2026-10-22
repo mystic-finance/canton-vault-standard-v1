@@ -2,10 +2,12 @@
 module Canton.Vault.Test.Attested where
 
 import DA.Assert ((===))
+import DA.Foldable (forA_)
 import DA.Time (addRelTime, hours, microseconds)
 import Daml.Script
 
 import Canton.Vault.V1
+import Canton.Vault.Reference.Math (mulDivDown)
 import Canton.Vault.Reference.V1
 import Canton.Vault.Reference.Share
 import Canton.Vault.Test.Deposit
@@ -72,6 +74,40 @@ attestedRollPricesTheVault = script do
     pricePerShare = 1.5; authority = oracle; effectiveAt = now; attestationId = "nav-1"; accrual = None
   v.totalShares === 101.0
   v.totalAssets === 151.5
+
+-- | Reads the vault's on-ledger conversions, which only its stakeholders can call.
+template ConvertProbe
+  with
+    registrar : Party
+  where
+    signatory registrar
+
+    choice ConvertProbe_Convert : (Decimal, Decimal)
+      with
+        vaultCid : ContractId Vault
+        shares : Decimal
+        assets : Decimal
+      controller registrar
+      do
+        vault <- fetch vaultCid
+        (,) <$> convertToAssets vault shares <*> convertToShares vault assets
+
+-- | A wallet pricing an attested vault from its view's totals gets what the vault computes on-ledger, whatever
+-- the attested price rounds to.
+viewPricesAsTheVaultDoes : Script ()
+viewPricesAsTheVaultDoes = script do
+  forA_ [1.2345678901, 0.9999999999, 3.0000000007] $ \price -> do
+    (f, oracle) <- setupOracleVault
+    _ <- deposit f f.vaultTemplateCid f.alice 101.0
+    now <- getTime
+    Right rolled <- rollAttested f f.vaultTemplateCid =<< attest f oracle price now "nav-1"
+    Some vault <- queryContractId f.registrar rolled
+    let v = view (toInterface @Vault vault)
+    forA_ [1.0, 33.3333333333, 101.0] $ \x -> do
+      (onAssets, onShares) <- submit f.registrar do
+        createAndExerciseCmd (ConvertProbe with registrar = f.registrar) ConvertProbe_Convert with
+          vaultCid = toInterfaceContractId rolled; shares = x; assets = x
+      (onAssets, onShares) === (mulDivDown x v.totalAssets v.totalShares, mulDivDown x v.totalShares v.totalAssets)
 
 -- | Assets outside the pool are priced but not paid out: redemptions are paid while the pool lasts.
 instantRedemptionsArePaidWhileThePoolLasts : Script ()
