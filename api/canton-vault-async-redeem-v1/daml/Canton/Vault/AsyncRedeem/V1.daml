@@ -7,32 +7,31 @@ import Splice.Api.Token.MetadataV1
 import Canton.Vault.V1
 
 -- | An interface for queuing redemptions. A vault implements it alongside
--- `Vault` when redemptions are fulfilled later rather than at once; its
--- `Vault_Withdraw`, `Vault_Redeem`, `previewWithdraw` and `previewRedeem` then
--- fail, and its `maxWithdraw` and `maxRedeem` return zero.
+-- `Vault` when it takes redemptions as requests filled later. It may still
+-- take redemptions instantly through `Vault_Withdraw` and `Vault_Redeem`, up to
+-- what `maxWithdraw` and `maxRedeem` return, with the previews describing that
+-- instant path. A vault that takes no redemptions instantly returns zero from
+-- those methods and fails `previewWithdraw` and `previewRedeem`.
 --
 -- A request names its terms, and the vault publishes the allocations it needs
--- as the token standard's `AllocationRequest`: the holder's escrow, sending
--- `shares` to the registrar's `redemptionAccount` with the leg id
--- `requestLegId`, and the receiver's authorization to be paid the underlying by
--- the custodian, with no legs. Both carry the request's own settlement, with
--- the id `requestSettlementId` and a contract id naming the request, so an
--- allocation made for one request settles no other; both are committed until
--- the end of the request's period plus the vault's `settlementDeadlineWindow`.
--- Wallets allocate exactly as requested, and the executors bind the allocations
--- before the request's period ends, so none is made knowing the price; a
--- request unfunded by then is dropped. The executors fulfil a request at the
--- rate its `RequestId` says, settling the escrow before its deadline; how they
--- do so is the vault's own. A vault may fill a request in parts over several
--- periods, holding the rest of its shares in the redemption account meanwhile.
+-- to fund it as the token standard's `AllocationRequest`. The escrow pays an
+-- account of the vault's `custodian` or `vaultRegistrar`, and an allocation
+-- made for one request settles no other. The escrow stays committed until the
+-- end of the request's period plus the vault's `settlementDeadlineWindow`,
+-- after which the requester can withdraw it.
+--
+-- A vault may fill a request in parts. No part is filled at a rate below the
+-- requester's minimum, and the unfilled rest is recoverable by the requester
+-- alone by the request's deadline. How and when the executors fill requests is
+-- the vault's own; its `AsyncView` says when they are priced.
 interface VaultAsyncRedeem requires Vault where
   viewtype AsyncView
 
   -- | Shares the party has queued for redemption under the request id, as the
   -- contracts named in `extraArgs` show. A vault cannot look them up, so one not
   -- named does not count, and one named twice counts once; naming one that is
-  -- gone fails. A request counts once its allocations are bound, until it is
-  -- fulfilled, rejected or expires; the unfilled rest of one filled in part
+  -- gone fails. A request counts from when the vault accepts its funding until
+  -- it is filled, rejected or expires; the unfilled rest of one filled in part
   -- counts until it is filled or returned.
   pendingRedeemRequest : RequestId -> Party -> ExtraArgs -> Update Decimal
 
@@ -40,19 +39,18 @@ interface VaultAsyncRedeem requires Vault where
   vault_requestRedeemExtraObservers : Vault_RequestRedeem -> [Party]
 
   nonconsuming choice Vault_RequestRedeem : RequestId
-    -- ^ Queue a redemption of `shares`, paying `receiver` the underlying at a
-    -- rate struck after the request is made, so not known when it is.
+    -- ^ Queue a redemption of `shares`, paying `receiver` the underlying at the
+    -- rate the vault's request pricing gives it.
     with
       label : Text
-        -- ^ The holder's label for the request, in its leg ids. Requests that
-        -- share a label cannot be fulfilled together.
+        -- ^ The holder's label for the request, telling their requests apart.
       shares : Decimal
         -- ^ Shares to redeem.
       receiver : Party
         -- ^ The party to be paid the underlying.
       minAssetsOut : Optional Decimal
-        -- ^ The least underlying the receiver accepts; a fulfilment that would
-        -- pay less fails rather than fill.
+        -- ^ The least underlying the receiver accepts for the whole request; a
+        -- fill, or part of one, at a lower rate fails rather than fill.
       actors : [Party]
         -- ^ Parties executing the request: the parties of the account the
         -- escrow is funded from.

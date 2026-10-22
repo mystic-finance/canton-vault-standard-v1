@@ -8,12 +8,31 @@ import DA.Optional (isSome)
 import DA.TextMap qualified as TextMap
 import DA.Time (isLedgerTimeGE)
 
+import Canton.Vault.V1 (requestPricingKey)
+
 import Splice.Api.Token.MetadataV1
 import Splice.Api.Token.HoldingV2 qualified as V2
 import Splice.Api.Token.AllocationV2 qualified as V2
 import Splice.Api.Token.AllocationInstructionV2 qualified as V2
 import Splice.Api.Token.AllocationRequestV2 qualified as AR
 import Splice.TokenStandard.Utils
+
+-- | The settlement id every allocation for a request to the vault carries, beside a contract id naming the request.
+requestSettlementId : Text -> Text
+requestSettlementId vaultId = vaultId <> "/requests"
+
+-- | The transfer leg id for one leg of one request: its requester, their label, and which leg it is.
+requestLegId : Party -> Text -> Text -> Text
+requestLegId requester label leg =
+  partyToText requester <> "/" <> label <> "/" <> leg
+
+-- | The registrar's account a redemption escrows its shares to, holding them until they are burned or returned.
+redemptionAccount : Party -> V2.Account
+redemptionAccount registrar = V2.Account with owner = Some registrar; provider = None; id = "redemptions"
+
+-- | When the queued vaults strike a request's rate: once its period has closed.
+requestPolicies : Metadata
+requestPolicies = Metadata with values = TextMap.fromList [(requestPricingKey, "period-close")]
 
 -- | A registry's allocation and settlement factories.
 data Factories = Factories with

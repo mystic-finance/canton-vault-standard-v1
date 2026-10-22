@@ -57,7 +57,7 @@ heldShares : Env -> Script [(ContractId Token, Decimal)]
 heldShares env = do
   held <- query @Token env.registrar
   pure [ (cid, h.holding.amount) | (cid, h) <- held, h.holding.instrumentId == sharesId env
-       , h.holding.account == redemptionAccount env.registrar ]
+       , h.holding.account == R.redemptionAccount env.registrar ]
 
 -- | Fills the requests in the period now open, naming the redemption account's holdings for those filled before.
 fillTree : Env -> [Req] -> Script (Either SubmitError TransactionTree)
@@ -287,7 +287,7 @@ executorsCannotMoveTheEscrowElsewhere = script do
   Some recorded <- queryContractId env.alice req.requestCid
   let settlement = (settlementOf env) with cid = Some (toAnyContractId recorded.anchor)
   let leg = V2.TransferLeg with
-        transferLegId = requestLegId env.alice "r1" "shares"; sender = basicAccount env.alice
+        transferLegId = R.requestLegId env.alice "r1" "shares"; sender = basicAccount env.alice
         receiver = basicAccount env.venue; amount = 40.0; instrumentId = env.vaultId; meta = emptyMetadata
   mine <- allocateWith env.shares env.venue (V2.AllocationSpecification with
       admin = env.registrar; authorizer = basicAccount env.venue

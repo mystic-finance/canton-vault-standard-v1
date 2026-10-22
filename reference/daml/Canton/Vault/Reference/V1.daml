@@ -245,6 +245,8 @@ template ReferenceVault
         totalAssets = totalAssets + virtualOffset
         rate = rateOf this
         depositFeeBps
+        mintFeeBps = depositFeeBps
+        withdrawFeeBps = redeemFeeBps
         redeemFeeBps
         rateValidFrom
         rateValidUntil
@@ -458,15 +460,15 @@ recordEvent vault action actors receiver assets shares = do
     observers = dedup (receiver :: actors)
   archive log
 
+-- | The view's rate: an oracle-priced vault names the attestation its totals rest on.
 rateOf : ReferenceVault -> Rate
-rateOf vault = case vault.pricing of
-  OraclePricing {oracle, latest = Some a} -> Attested AttestedRate with
-    pricePerShare = a.pricePerShare
-    authority = oracle
-    effectiveAt = a.effectiveAt
-    attestationId = a.attestationId
-    accrual = vault.accrual
-  _ -> Computed ComputedRate with asOf = vault.rateValidFrom; accrual = vault.accrual
+rateOf vault = Rate with
+  asOf = vault.rateValidFrom
+  accrual = vault.accrual
+  inputs = case vault.pricing of
+    OraclePricing {oracle, latest = Some a} ->
+      [PriceInput with authority = oracle; subject = vault.vaultId; effectiveAt = a.effectiveAt; attestationId = a.attestationId]
+    _ -> []
 
 -- | The totals for the next period: this one's flows folded in, the value priced from the evidence.
 rollTotals : ReferenceVault -> [ContractId PeriodFlow] -> PriceEvidence -> Time -> Update (Decimal, Decimal, Pricing, Time)

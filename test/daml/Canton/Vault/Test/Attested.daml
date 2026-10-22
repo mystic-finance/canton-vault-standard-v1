@@ -63,15 +63,16 @@ attestedRollPricesTheVault : Script ()
 attestedRollPricesTheVault = script do
   (f, oracle) <- setupOracleVault
   Some before <- queryContractId f.registrar f.vaultTemplateCid
-  (view (toInterface @Vault before)).rate === Computed ComputedRate with asOf = before.rateValidFrom; accrual = None
+  (view (toInterface @Vault before)).rate === Rate with asOf = before.rateValidFrom; accrual = None; inputs = []
   _ <- deposit f f.vaultTemplateCid f.alice 100.0
   now <- getTime
   a <- attest f oracle 1.5 now "nav-1"
   Right rolled <- rollAttested f f.vaultTemplateCid a
   Some vault <- queryContractId f.registrar rolled
   let v = view (toInterface @Vault vault)
-  v.rate === Attested AttestedRate with
-    pricePerShare = 1.5; authority = oracle; effectiveAt = now; attestationId = "nav-1"; accrual = None
+  v.rate === Rate with
+    asOf = vault.rateValidFrom; accrual = None
+    inputs = [PriceInput with authority = oracle; subject = "reference-1"; effectiveAt = now; attestationId = "nav-1"]
   v.totalShares === 101.0
   v.totalAssets === 151.5
 

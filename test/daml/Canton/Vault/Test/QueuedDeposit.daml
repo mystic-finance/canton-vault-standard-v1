@@ -97,7 +97,7 @@ usdOf env party amount = do
 settlementOf : Env -> V2.SettlementInfo
 settlementOf env = V2.SettlementInfo with
   executors = [env.venue]
-  id = requestSettlementId env.vaultId
+  id = Q.requestSettlementId env.vaultId
   cid = None
   meta = emptyMetadata
 
@@ -1133,7 +1133,7 @@ requestPublishesTheAllocationsItNeeds = script do
     [ V2.AllocationSpecification with
         admin = env.usd.admin; authorizer = basicAccount env.alice
         transferLegSides = [V2.TransferLegSide with
-          transferLegId = requestLegId env.alice "r1" "underlying"; side = V2.SenderSide
+          transferLegId = Q.requestLegId env.alice "r1" "underlying"; side = V2.SenderSide
           otherside = basicAccount env.custodian; amount = 10.0; instrumentId = "USD"; meta = emptyMetadata]
         settlementDeadline = deadline; nextIterationFunding = None; committed = True; meta = emptyMetadata
     , V2.AllocationSpecification with
@@ -1251,3 +1251,10 @@ allocationsAreNotBoundAfterAnEarlyRoll = script do
   receiving <- authorizationAsRequested env r
   next <- nextPeriod env
   failsWith "allocations are bound in the request's own period" =<< bindAs next env.venue cid escrowed receiving
+
+-- | The vault says on its view when it prices requests.
+viewSaysWhenRequestsArePriced : Script ()
+viewSaysWhenRequestsArePriced = script do
+  env <- setup
+  Some vault <- queryContractId env.registrar env.vaultCid
+  TextMap.lookup requestPricingKey (view (toInterface @VaultAsyncDeposit vault)).meta.values === Some "period-close"

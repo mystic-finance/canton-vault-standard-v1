@@ -28,37 +28,29 @@ data Accrual
         -- ^ Continuously-compounding accrual (APY).
   deriving (Show, Eq, Serializable)
 
--- | Share price, derived on-ledger from the vault's own totals.
-data ComputedRate = ComputedRate with
+-- | A price from outside the ledger that a vault's value depends on.
+data PriceInput = PriceInput with
+    authority : Party
+      -- ^ The party that published the price.
+    subject : Text
+      -- ^ What it prices: an instrument, a position, or the vault as a whole.
+    effectiveAt : Time
+      -- ^ The time the price was taken.
+    attestationId : Text
+      -- ^ The authority's identifier for the price.
+  deriving (Show, Eq, Serializable)
+
+-- | Share price: `VaultView.totalAssets` over `VaultView.totalShares`, fixed
+-- for the period on the view except as the accrual moves it.
+data Rate = Rate with
     asOf : Time
-      -- ^ When the totals this rate prices were taken. Equal to
-      -- `VaultView.rateValidFrom` for a vault that prices per period.
+      -- ^ When the totals this rate prices were taken.
     accrual : Optional Accrual
       -- ^ The model by which assets accrue after `asOf`. Both the vault and
       -- off-ledger readers accrue `VaultView.totalAssets` forwards using it.
-      -- When absent, the rate moves only when a transaction touches the vault.
-  deriving (Show, Eq, Serializable)
-
--- | Share price, attested by an authority outside the vault, for value the
--- vault cannot sum from holdings on the ledger.
-data AttestedRate = AttestedRate with
-    pricePerShare : Decimal
-      -- ^ The price of one share in units of the underlying, as attested.
-    authority : Party
-      -- ^ The party that attested the price.
-    effectiveAt : Time
-      -- ^ The time the attested price was taken.
-    attestationId : Text
-      -- ^ The authority's identifier for the attestation.
-    accrual : Optional Accrual
-      -- ^ The model by which the price accrues from `VaultView.rateValidFrom`.
-  deriving (Show, Eq, Serializable)
-
--- | Share price: computed from the vault's own totals, or attested by an
--- authority.
-data Rate
-  = Computed ComputedRate
-  | Attested AttestedRate
+    inputs : [PriceInput]
+      -- ^ The prices from outside the ledger the totals depend on. Empty when
+      -- they are derived entirely from on-ledger state.
   deriving (Show, Eq, Serializable)
 
 -- | Everything a wallet needs to quote a vault and decide whether to transact.
@@ -74,10 +66,8 @@ data VaultView = VaultView with
     vaultRegistrar : Party
       -- ^ Admin of the share instrument, and the party that operates the vault.
     custodian : Party
-      -- ^ The party holding the pooled underlying. A contract cannot own
-      -- holdings, so a vault names a party for them. Every unlocked holding of
-      -- the underlying it owns counts as the vault's pool, so no two vaults
-      -- share a custodian.
+      -- ^ The party holding the vault's assets. A contract cannot own holdings,
+      -- so a vault names a party for them.
     underlyingInstrument : InstrumentId
       -- ^ The instrument the vault accepts. There is exactly one per vault.
     shareInstrument : InstrumentId
@@ -86,18 +76,23 @@ data VaultView = VaultView with
       -- ^ Shares in issue as of `rateValidFrom`. A snapshot rather than a live
       -- total, since actions are nonconsuming and do not rewrite the vault.
     totalAssets : Decimal
-      -- ^ Value of the vault as of `rateValidFrom`, with the same staleness:
-      -- the pool for a computed rate, the attested price times the shares for
-      -- an attested one. Includes the virtual offset, so that off-ledger math
-      -- matches on-ledger.
+      -- ^ Value of the vault's assets in the underlying as of `rateValidFrom`,
+      -- with the same staleness, counting only assets that belong to this
+      -- vault. Includes any virtual offset, so that off-ledger math matches
+      -- on-ledger.
     rate : Rate
       -- ^ Share price, fixed for the period below. A rate with an accrual still
       -- moves within the period, but its parameters do not.
     depositFeeBps : Int
-      -- ^ The fee on deposits and mints, in basis points of the assets paid in.
+      -- ^ The fee on `Vault_Deposit`, in basis points of the assets paid in.
+    mintFeeBps : Int
+      -- ^ The fee on `Vault_Mint`, in basis points of the assets paid in.
+    withdrawFeeBps : Int
+      -- ^ The fee on `Vault_Withdraw`, in basis points of what the shares are
+      -- worth.
     redeemFeeBps : Int
-      -- ^ The fee on redemptions and withdrawals, in basis points of what the
-      -- shares are worth. Both paths out pay the same fee.
+      -- ^ The fee on `Vault_Redeem`, in basis points of what the shares are
+      -- worth.
     rateValidFrom : Time
       -- ^ Start of the period this rate applies to.
     rateValidUntil : Time
@@ -134,10 +129,11 @@ vaultSlippageExceeded = "VAULT_SLIPPAGE_EXCEEDED"
 
 -- | Identifies a queued deposit or redemption, together with its requester.
 --
--- The vault chooses its ids. `0` means requests are told apart only by their
--- requester, each fulfilled at the rate when it is struck. Requests sharing any
--- other id are priced together: at one rate struck after the last of them was
--- made, or a worse rate current when one is filled late.
+-- The vault chooses its ids. Requests sharing an id other than `0` are
+-- fungible: they are filled at the same time, at the same rate, and when filled
+-- in part, in the same proportion. `0` means requests are told apart only by
+-- their requester. When and how a request is priced is the vault's own, and it
+-- says so on its `AsyncView`.
 type RequestId = Int
 
 -- | What a wallet needs to decide whether to queue a request with a vault.
@@ -147,35 +143,29 @@ type RequestId = Int
 -- deposits and redemptions.
 data AsyncView = AsyncView with
     executors : [Party]
-      -- ^ The parties who fulfil and cancel requests, acting together: settling
-      -- or cancelling a pending escrow needs all of them.
+      -- ^ The parties who settle and cancel requests: the executors of the
+      -- token standard settlement every request's allocations carry.
     settlementDeadlineWindow : RelTime
       -- ^ How long after the end of its period a request's escrow stays
       -- committed: the time the executors have to fill it. Until the deadline
       -- only the executors can settle or cancel it; after it, the requester can
       -- withdraw it.
     meta : Metadata
-      -- ^ Additional metadata specific to the vault, used for extensibility.
+      -- ^ The vault's request policies, under `requestPricingKey` and
+      -- `instantPriorityKey`, and any extensions specific to the vault.
   deriving (Show, Eq, Serializable)
 
--- | The settlement id every allocation for a request to the vault carries. The
--- rest of the settlement is the vault's `executors`, a contract id naming the
--- request and no metadata, so an allocation made for one request settles no
--- other. Wallets take it from the request's allocation request.
-requestSettlementId : Text -> Text
-requestSettlementId vaultId = vaultId <> "/requests"
+-- | The `AsyncView` metadata key saying when a request's rate is struck. Free
+-- text; recommended values are `"period-close"`, `"fulfilment"` and `"request"`.
+requestPricingKey : Text
+requestPricingKey = "canton-vault/request-pricing"
 
--- | The transfer leg id for one leg of one request: its requester, their label
--- for the request, and which leg it is, `"underlying"` or `"shares"`.
-requestLegId : Party -> Text -> Text -> Text
-requestLegId requester label leg =
-  partyToText requester <> "/" <> label <> "/" <> leg
-
--- | The account a queued redemption's escrow sends its shares to: the
--- registrar's account for shares it holds for redeemers until they are burned
--- or returned. Wallets compute it before allocating.
-redemptionAccount : Party -> Account
-redemptionAccount registrar = Account with owner = Some registrar; provider = None; id = "redemptions"
+-- | The `AsyncView` metadata key saying whether instant actions in a queued
+-- direction may go ahead of unfilled requests. Free text; recommended values
+-- are `"queue-first"` and `"independent"`. A vault that takes no instant
+-- actions in that direction omits it.
+instantPriorityKey : Text
+instantPriorityKey = "canton-vault/instant-priority"
 
 --
 -- Vault

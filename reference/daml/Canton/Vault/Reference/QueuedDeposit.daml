@@ -98,7 +98,7 @@ template ReferenceQueuedDepositVault
       view = AsyncView with
         executors
         settlementDeadlineWindow
-        meta = emptyMetadata
+        meta = requestPolicies
 
       -- A request's id is the period it was made in.
       pendingDepositRequest requestId party extraArgs = do

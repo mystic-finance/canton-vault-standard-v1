@@ -7,6 +7,7 @@ import DA.Text qualified as T
 import Daml.Script
 
 import Canton.Vault.V1
+import Canton.Vault.Reference.Math (deductFeeBps, grossUpFeeBps, mulDivDown, mulDivUp)
 import Canton.Vault.Reference.Share
 import Canton.Vault.Reference.V1
 import Canton.Vault.Test.Deposit
@@ -231,6 +232,25 @@ entryAndExitPathsAgree = script do
     q2 <- quote st alice q.mintPreview q.redeemPreview
     assertMsg "depositing what a mint costs buys no fewer shares" (q2.depositPreview >= shares)
     assertMsg "withdrawing what a redemption pays burns no fewer shares" (q2.withdrawPreview >= shares)
+
+-- | A wallet quotes every path from the view alone: its totals and that path's fee give what the preview gives.
+viewQuotesEveryPath : Script ()
+viewQuotesEveryPath = script do
+  forA_ [(30, 250), (250, 30), (999, 1)] $ \(depositFee, redeemFee) -> do
+    f <- setupVaultFees depositFee redeemFee None None
+    bob <- allocateParty "bob"
+    _ <- deposit f f.vaultTemplateCid bob 1234.567
+    rolled <- rollPeriod f f.vaultTemplateCid
+    Some vault <- queryContractId f.registrar rolled
+    let v = view (toInterface @Vault vault)
+        st = State with f; vaultCid = rolled; seed = 0
+    alice <- allocateParty "alice"
+    forA_ [1.0, 33.3333333333, 777.777] $ \x -> do
+      q <- quote st alice x x
+      q.depositPreview === mulDivDown (deductFeeBps v.depositFeeBps x) v.totalShares v.totalAssets
+      q.mintPreview === grossUpFeeBps v.mintFeeBps (mulDivUp x v.totalAssets v.totalShares)
+      q.withdrawPreview === mulDivUp (grossUpFeeBps v.withdrawFeeBps x) v.totalShares v.totalAssets
+      q.redeemPreview === deductFeeBps v.redeemFeeBps (mulDivDown x v.totalAssets v.totalShares)
 
 -- | A full fee leaves nothing to take, so mint and withdraw are refused as deposit and redeem are.
 fullFeesRefuseEveryPath : Script ()

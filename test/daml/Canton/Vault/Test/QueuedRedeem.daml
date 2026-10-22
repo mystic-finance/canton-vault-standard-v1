@@ -107,7 +107,7 @@ sharesId env = V2.InstrumentId with admin = env.registrar; id = env.vaultId
 settlementOf : Env -> V2.SettlementInfo
 settlementOf env = V2.SettlementInfo with
   executors = [env.venue]
-  id = requestSettlementId env.vaultId
+  id = R.requestSettlementId env.vaultId
   cid = None
   meta = emptyMetadata
 
@@ -143,9 +143,9 @@ escrowSpec env party label amount now = V2.AllocationSpecification with
   admin = env.registrar
   authorizer = basicAccount party
   transferLegSides = [V2.TransferLegSide with
-    transferLegId = requestLegId party label "shares"
+    transferLegId = R.requestLegId party label "shares"
     side = V2.SenderSide
-    otherside = redemptionAccount env.registrar
+    otherside = R.redemptionAccount env.registrar
     amount
     instrumentId = env.vaultId
     meta = emptyMetadata]
@@ -1229,8 +1229,8 @@ requestPublishesTheAllocationsItNeeds = script do
     [ V2.AllocationSpecification with
         admin = env.registrar; authorizer = basicAccount env.alice
         transferLegSides = [V2.TransferLegSide with
-          transferLegId = requestLegId env.alice "r1" "shares"; side = V2.SenderSide
-          otherside = redemptionAccount env.registrar; amount = 10.0; instrumentId = env.vaultId; meta = emptyMetadata]
+          transferLegId = R.requestLegId env.alice "r1" "shares"; side = V2.SenderSide
+          otherside = R.redemptionAccount env.registrar; amount = 10.0; instrumentId = env.vaultId; meta = emptyMetadata]
         settlementDeadline = deadline; nextIterationFunding = None; committed = True; meta = emptyMetadata
     , V2.AllocationSpecification with
         admin = env.usd.admin; authorizer = basicAccount bob; transferLegSides = []
@@ -1288,3 +1288,10 @@ allocationsAreNotBoundAfterAnEarlyRoll = script do
   receiving <- receiptAsRequested env r
   next <- nextPeriod env
   failsWith "allocations are bound in the request's own period" =<< bindAs next env.venue cid escrowed receiving
+
+-- | The vault says on its view when it prices requests.
+viewSaysWhenRequestsArePriced : Script ()
+viewSaysWhenRequestsArePriced = script do
+  env <- setup
+  Some vault <- queryContractId env.registrar env.vaultCid
+  TextMap.lookup requestPricingKey (view (toInterface @VaultAsyncRedeem vault)).meta.values === Some "period-close"
