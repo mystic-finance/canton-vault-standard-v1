@@ -99,8 +99,18 @@ data VaultView = VaultView with
       -- ^ End of the period. Actions fail at or after this time; the registrar
       -- rolls the period, and bears that cost.
     meta : Metadata
-      -- ^ Additional metadata specific to the vault, used for extensibility.
+      -- ^ Additional metadata specific to the vault, used for extensibility,
+      -- and, for a vault open only to some parties, the evidence it accepts
+      -- under `eligibilityKey`.
   deriving (Show, Eq, Serializable)
+
+-- | The key for eligibility: in the `VaultView` metadata, the evidence a vault
+-- open only to some parties accepts, such as a credential from an issuer it
+-- names or an access contract of its own, as free text; in `extraArgs`, the
+-- contracts presented as the receiver's evidence. A vault open to every party
+-- omits it.
+eligibilityKey : Text
+eligibilityKey = "canton-vault/eligibility"
 
 -- | The result of an instant deposit, mint, withdrawal or redemption.
 data VaultActionResult = VaultActionResult with
@@ -171,6 +181,13 @@ requestPricingKey = "canton-vault/request-pricing"
 -- The read methods run on-ledger, and agree with the published view. Every
 -- quantity rounds in the vault's favour, in the direction given per method
 -- below, and a deposit that would mint zero shares is rejected.
+--
+-- A vault open only to some parties checks the evidence named in `extraArgs`
+-- under `eligibilityKey` before letting a party in: `maxDeposit` and `maxMint`
+-- return zero for a receiver without evidence it accepts, and `Vault_Deposit`,
+-- `Vault_Mint` and `Vault_RequestDeposit` fail for one. Whether a party without
+-- it may still withdraw or redeem is the vault's own, and its max methods say
+-- so.
 --
 -- Choices a vault adds for its own roles, such as filling requests or
 -- publishing a price, take their controllers from the vault contract rather

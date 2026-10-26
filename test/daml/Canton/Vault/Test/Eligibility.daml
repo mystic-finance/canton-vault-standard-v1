@@ -1,0 +1,267 @@
+-- | Vaults open only to some parties: either form of evidence, named under the standard's key, gates them.
+module Canton.Vault.Test.Eligibility where
+
+import DA.Assert ((===))
+import DA.Optional (fromSome)
+import DA.TextMap qualified as TextMap
+import DA.Time (addRelTime, days, isLedgerTimeLT, minutes)
+import Daml.Script hiding (AnyContractId)
+
+import Canton.Vault.V1
+import Canton.Vault.Reference.Queue (getContractIds)
+import Canton.Vault.Reference.V1
+import Canton.Vault.Test.Deposit
+import Canton.Vault.Test.Limits (failsWith)
+
+import Splice.Api.Token.MetadataV1
+import Splice.TokenStandard.Utils
+
+-- | A credential an issuer gives a holder, as ERC-3643's claims are.
+template Credential
+  with
+    issuer : Party
+    holder : Party
+    claim : Text
+    expiresAt : Time
+  where
+    signatory issuer
+    observer holder
+
+-- | A vault's own grant of access to one party, through which that party alone deposits.
+template VaultAccess
+  with
+    vaultRegistrar : Party
+    vaultId : Text
+    holder : Party
+  where
+    signatory vaultRegistrar
+    observer holder
+
+    nonconsuming choice VaultAccess_Deposit : VaultActionResult
+      with
+        vaultCid : ContractId Vault
+        assets : Decimal
+        minSharesOut : Optional Decimal
+        extraArgs : ExtraArgs
+      controller holder
+      do exercise vaultCid Vault_Deposit with
+           assets; receiver = holder; minSharesOut; actors = [holder]
+           extraArgs = withEvidence [toAnyContractId self] extraArgs
+
+-- | What a gated vault accepts.
+data Gate
+  = Credentials with
+      issuers : [Party]
+      claim : Text
+  | Access
+  deriving (Eq, Show, Serializable)
+
+-- | A reference vault that takes deposits and mints only from parties with evidence it accepts.
+template GatedVault
+  with
+    vault : ReferenceVault
+    gate : Gate
+  where
+    signatory vault.vaultRegistrar, vault.custodian
+
+    interface instance Vault for GatedVault where
+      view = let v = view (inner this) in v with
+        meta = Metadata with values = TextMap.insert eligibilityKey (accepted gate) v.meta.values
+      convertToShares = convertToShares (inner this)
+      convertToAssets = convertToAssets (inner this)
+      maxDeposit party extraArgs = do
+        ok <- eligible this party extraArgs
+        if ok then maxDeposit (inner this) party extraArgs else pure 0.0
+      maxMint party extraArgs = do
+        ok <- eligible this party extraArgs
+        if ok then maxMint (inner this) party extraArgs else pure 0.0
+      maxWithdraw = maxWithdraw (inner this)
+      maxRedeem = maxRedeem (inner this)
+      previewDeposit = previewDeposit (inner this)
+      previewMint = previewMint (inner this)
+      previewWithdraw = previewWithdraw (inner this)
+      previewRedeem = previewRedeem (inner this)
+
+      vault_depositExtraObservers _arg = []
+      vault_mintExtraObservers _arg = []
+      vault_withdrawExtraObservers _arg = []
+      vault_redeemExtraObservers _arg = []
+
+      vault_depositImpl self arg = do
+        requireEligible this arg.receiver arg.extraArgs
+        vault_depositImpl (inner this) self arg
+      vault_mintImpl self arg = do
+        requireEligible this arg.receiver arg.extraArgs
+        vault_mintImpl (inner this) self arg
+      vault_withdrawImpl = vault_withdrawImpl (inner this)
+      vault_redeemImpl = vault_redeemImpl (inner this)
+      vault_publicFetchImpl _self _arg = pure (view (toInterface @Vault this))
+      vault_publicConvertToAssetsImpl _self arg = convertToAssets (toInterface @Vault this) arg.shares
+
+inner : GatedVault -> Vault
+inner = toInterface . (.vault)
+
+accepted : Gate -> Text
+accepted (Credentials _ claim) = "credential: " <> claim
+accepted Access = "access contract"
+
+-- | Whether the evidence named under the eligibility key shows the party may deposit.
+eligible : GatedVault -> Party -> ExtraArgs -> Update Bool
+eligible v party extraArgs = case v.gate of
+  Credentials issuers claim -> do
+    cids <- getContractIds eligibilityKey extraArgs.context
+    oks <- forA cids $ \cid -> do
+      c <- fetch @Credential cid
+      live <- isLedgerTimeLT c.expiresAt
+      pure (c.issuer `elem` issuers && c.holder == party && c.claim == claim && live)
+    pure (or oks)
+  Access -> do
+    cids <- getContractIds eligibilityKey extraArgs.context
+    oks <- forA cids $ \cid -> do
+      a <- fetch @VaultAccess cid
+      pure (a.vaultRegistrar == v.vault.vaultRegistrar && a.vaultId == v.vault.vaultId && a.holder == party)
+    pure (or oks)
+
+requireEligible : GatedVault -> Party -> ExtraArgs -> Update ()
+requireEligible v party extraArgs = do
+  ok <- eligible v party extraArgs
+  assertMsg "the party is not eligible" ok
+
+withEvidence : [AnyContractId] -> ExtraArgs -> ExtraArgs
+withEvidence cids args = args with
+  context = args.context with
+    values = TextMap.insert eligibilityKey (AV_List (map AV_ContractId cids)) args.context.values
+
+-- | Reads a vault's maxDeposit with the authority of the vault's registrar and the party.
+template MaxDepositReader
+  with
+    readers : [Party]
+  where
+    signatory readers
+    choice MaxDepositReader_Read : Decimal
+      with
+        vaultCid : ContractId Vault
+        party : Party
+        extraArgs : ExtraArgs
+      controller readers
+      do
+        vault <- fetch vaultCid
+        maxDeposit vault party extraArgs
+
+-- Helpers
+-----------
+
+-- | The fixture's vault, re-created behind the gate.
+gated : Fixture -> Gate -> Script (ContractId GatedVault)
+gated f gate = do
+  Some vault <- queryContractId f.registrar f.vaultTemplateCid
+  submit (actAs [f.registrar, f.custodian]) $
+    archiveCmd f.vaultTemplateCid *> createCmd GatedVault with vault; gate
+
+disclosed : Fixture -> ContractId GatedVault -> Script [Disclosure]
+disclosed f g = do
+  vd <- fromSome <$> queryDisclosure f.registrar g
+  rd <- fromSome <$> queryDisclosure f.underlyingAdmin f.registryTemplateCid
+  pure [vd, rd]
+
+maxDepositOf : Fixture -> ContractId GatedVault -> Party -> [AnyContractId] -> Script Decimal
+maxDepositOf f g party = maxDepositSeenBy [f.registrar, party] g party
+
+-- | maxDeposit read with the authority of the given readers, who must include a stakeholder of the vault.
+maxDepositSeenBy : [Party] -> ContractId GatedVault -> Party -> [AnyContractId] -> Script Decimal
+maxDepositSeenBy readers g party evidence =
+  submit (actAs readers) do
+    createAndExerciseCmd (MaxDepositReader with readers) MaxDepositReader_Read with
+      vaultCid = toInterfaceContractId g; party
+      extraArgs = withEvidence evidence (ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata)
+
+depositInto : Fixture -> ContractId GatedVault -> Party -> Decimal -> [AnyContractId] -> [Disclosure] -> Script (Either SubmitError VaultActionResult)
+depositInto f g party amount evidence extra = do
+  funds <- fund f party amount
+  ds <- disclosed f g
+  trySubmit (actAs party <> discloseMany (ds <> extra)) do
+    exerciseCmd (toInterfaceContractId @Vault g) Vault_Deposit with
+      assets = amount; receiver = party; minSharesOut = None; actors = [party]
+      extraArgs = withEvidence evidence (depositArgs f [funds])
+
+credential : Party -> Party -> Text -> Script (ContractId Credential)
+credential issuer holder claim = do
+  now <- getTime
+  submit issuer $ createCmd Credential with issuer; holder; claim; expiresAt = addRelTime now (days 30)
+
+-- Tests
+---------
+
+-- | A party with a credential from an issuer the vault names deposits; without one, its max is zero and it cannot.
+aCredentialedPartyDeposits : Script ()
+aCredentialedPartyDeposits = script do
+  f <- setupVault
+  kyc <- allocateParty "kyc"
+  g <- gated f (Credentials with issuers = [kyc]; claim = "accredited")
+  cred <- credential kyc f.alice "accredited"
+  maxDepositOf f g f.alice [toAnyContractId cred] >>= \m -> assertMsg "an eligible party may deposit" (m > 0.0)
+  maxDepositOf f g f.alice [] >>= (=== 0.0)
+  Right result <- depositInto f g f.alice 10.0 [toAnyContractId cred] []
+  result.shares === 10.0
+  failsWith "the party is not eligible" =<< depositInto f g f.alice 10.0 [] []
+
+-- | A credential from an issuer the vault does not name, for another claim, held by another party or expired is no
+-- evidence.
+onlyAnAcceptedCredentialCounts : Script ()
+onlyAnAcceptedCredentialCounts = script do
+  f <- setupVault
+  kyc <- allocateParty "kyc"
+  rogue <- allocateParty "rogue"
+  bob <- allocateParty "bob"
+  g <- gated f (Credentials with issuers = [kyc]; claim = "accredited")
+  let refused evidence extra = do
+        maxDepositOf f g f.alice evidence >>= (=== 0.0)
+        failsWith "the party is not eligible" =<< depositInto f g f.alice 10.0 evidence extra
+  forged <- credential rogue f.alice "accredited"
+  refused [toAnyContractId forged] []
+  other <- credential kyc f.alice "retail"
+  refused [toAnyContractId other] []
+  bobs <- credential kyc bob "accredited"
+  maxDepositSeenBy [f.registrar, f.alice, bob] g f.alice [toAnyContractId bobs] >>= (=== 0.0)
+  bobsD <- fromSome <$> queryDisclosure kyc bobs
+  failsWith "requires one of the stakeholders" =<< depositInto f g f.alice 10.0 [toAnyContractId bobs] [bobsD]
+  now <- getTime
+  expiring <- submit kyc $ createCmd Credential with
+    issuer = kyc; holder = f.alice; claim = "accredited"; expiresAt = addRelTime now (minutes 1)
+  passTime (minutes 1)
+  refused [toAnyContractId expiring] []
+
+-- | A party the vault granted access deposits through that grant, which no other party can use; a party without one,
+-- or with a grant for another vault, cannot deposit.
+anAccessHolderDepositsThroughItsGrant : Script ()
+anAccessHolderDepositsThroughItsGrant = script do
+  f <- setupVault
+  bob <- allocateParty "bob"
+  g <- gated f Access
+  access <- submit f.registrar $ createCmd VaultAccess with vaultRegistrar = f.registrar; vaultId = "reference-1"; holder = f.alice
+  maxDepositOf f g f.alice [toAnyContractId access] >>= \m -> assertMsg "a party with access may deposit" (m > 0.0)
+  ds <- disclosed f g
+  funds <- fund f f.alice 10.0
+  result <- submit (actAs f.alice <> discloseMany ds) do
+    exerciseCmd access VaultAccess_Deposit with
+      vaultCid = toInterfaceContractId g; assets = 10.0; minSharesOut = None; extraArgs = depositArgs f [funds]
+  result.shares === 10.0
+  failsWith "the party is not eligible" =<< depositInto f g bob 10.0 [] []
+  accessD <- fromSome <$> queryDisclosure f.registrar access
+  bobFunds <- fund f bob 10.0
+  failsWith "requires authorizers" =<< trySubmit (actAs bob <> discloseMany (accessD :: ds)) do
+    exerciseCmd access VaultAccess_Deposit with
+      vaultCid = toInterfaceContractId g; assets = 10.0; minSharesOut = None; extraArgs = depositArgs f [bobFunds]
+  maxDepositSeenBy [f.registrar, bob] g bob [toAnyContractId access] >>= (=== 0.0)
+  elsewhere <- submit f.registrar $ createCmd VaultAccess with vaultRegistrar = f.registrar; vaultId = "reference-2"; holder = bob
+  maxDepositOf f g bob [toAnyContractId elsewhere] >>= (=== 0.0)
+
+-- | A gated vault says on its view what evidence it accepts; an open one says nothing.
+theViewSaysWhatEvidenceIsAccepted : Script ()
+theViewSaysWhatEvidenceIsAccepted = script do
+  f <- setupVault
+  Some open <- queryContractId f.registrar f.vaultTemplateCid
+  TextMap.lookup eligibilityKey (view (toInterface @Vault open)).meta.values === None
+  g <- gated f (Credentials with issuers = []; claim = "accredited")
+  Some v <- queryContractId f.registrar g
+  TextMap.lookup eligibilityKey (view (toInterface @Vault v)).meta.values === Some "credential: accredited"
