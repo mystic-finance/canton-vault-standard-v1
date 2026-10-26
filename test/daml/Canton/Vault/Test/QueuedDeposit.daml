@@ -1163,6 +1163,24 @@ withAPendingDeposit = do
   next <- nextPeriod env
   pure (next, r1)
 
+-- | Bob holds 100 shares of a vault worth 100, Alice requests 100 at that rate, and the pool doubles before her period
+-- closes. She takes the risen rate, 100 × 101 / 201 with the virtual offset, and Bob keeps the rise.
+theRequesterBearsARiseBeforeTheirPeriodCloses : Script ()
+theRequesterBearsARiseBeforeTheirPeriodCloses = script do
+  env <- setup
+  bob <- allocateParty "bob"
+  (_, r0) <- request env bob "r0" 100.0
+  Right () <- fulfilAs env env.venue [r0]
+  opened <- nextPeriod env
+  (_, r1) <- request opened env.alice "r1" 100.0
+  moveUsdPool env 100.0
+  next <- nextPeriod opened
+  Right () <- fulfilNow next env.venue [r1]
+  counted <- nextPeriod next
+  Some vault <- queryContractId env.registrar counted.vaultCid
+  tokens env (sharesId env) env.alice >>= (=== 50.2487562189)
+  (vault.totalShares, vault.totalAssets) === (150.2487562189, 300.0)
+
 -- | Filled a period late after the price rose, a deposit gets the current price, not the cheaper struck one.
 aLateFillAfterARiseGetsTheCurrentPrice : Script ()
 aLateFillAfterARiseGetsTheCurrentPrice = script do

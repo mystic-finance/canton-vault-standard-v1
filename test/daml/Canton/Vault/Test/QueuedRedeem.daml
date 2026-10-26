@@ -1181,6 +1181,26 @@ moveUsdPool env delta
       forA_ pool $ \(cid, _) -> submit (actAs [env.custodian, env.usd.admin]) (archiveCmd cid)
       void (holdingOf env.custodian env.usd.admin (usdId env) (sum (map snd pool) + delta))
 
+-- | Alice and Bob hold 50 shares each of a vault worth 100, Alice requests to redeem hers, and the pool falls to 80
+-- before her period closes. She takes the fallen rate, and Bob keeps his share of the pool.
+theRequesterBearsAFallBeforeTheirPeriodCloses : Script ()
+theRequesterBearsAFallBeforeTheirPeriodCloses = script do
+  env <- setup
+  bob <- allocateParty "bob"
+  held <- heldBy env (sharesId env) env.alice
+  forA_ held $ \(cid, _) -> submit (actAs [env.alice, env.registrar]) (archiveCmd cid)
+  _ <- holdingOf env.alice env.registrar (sharesId env) 50.0
+  _ <- holdingOf bob env.registrar (sharesId env) 50.0
+  (_, req) <- request env env.alice "r1" 50.0
+  moveUsdPool env (-20.0)
+  next <- nextPeriod env
+  Right () <- fulfilAs next env.venue [req]
+  counted <- nextPeriod next
+  Some vault <- queryContractId env.registrar counted.vaultCid
+  let paid = sharesToAssets 100.0 80.0 50.0
+  unlocked env (usdId env) env.alice >>= (=== paid)
+  (vault.totalShares, vault.totalAssets) === (50.0, 80.0 - paid)
+
 -- | Requests from one period fill at one price, however the executors order them and whatever lands in between.
 requestsFromOnePeriodShareOnePrice : Script ()
 requestsFromOnePeriodShareOnePrice = script do
