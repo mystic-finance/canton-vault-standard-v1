@@ -7,11 +7,9 @@ import Splice.Api.Token.MetadataV1
 import Canton.Vault.V1
 
 -- | An interface for queuing deposits. A vault implements it alongside `Vault`
--- when it takes deposits as requests filled later. It may still take deposits
--- instantly through `Vault_Deposit` and `Vault_Mint`, up to what `maxDeposit`
--- and `maxMint` return, with the previews describing that instant path. A vault
--- that takes no deposits instantly returns zero from those methods and fails
--- `previewDeposit` and `previewMint`.
+-- when deposits are fulfilled later rather than at once; its `Vault_Deposit`,
+-- `Vault_Mint`, `previewDeposit` and `previewMint` then fail, and its
+-- `maxDeposit` and `maxMint` return zero.
 --
 -- A request names its terms, and the vault publishes the allocations it needs
 -- to fund it as the token standard's `AllocationRequest`. The escrow pays an

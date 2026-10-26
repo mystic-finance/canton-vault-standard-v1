@@ -345,6 +345,21 @@ instantDepositIsRefused = script do
       actors = [env.alice]
       extraArgs = ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata
 
+-- | A queued direction has no instant path: its max methods are zero and its previews fail, while redemptions still quote.
+queuedDepositsHaveNoInstantPath : Script ()
+queuedDepositsHaveNoInstantPath = script do
+  env <- setup
+  let call method amount = createAndExerciseCmd (PathProbe with caller = env.registrar) Probe_Path with
+        vaultCid = toInterfaceContractId env.vaultCid; method; amount; party = env.alice
+        extraArgs = ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata
+      reads method amount = submit env.registrar (call method amount)
+      refused method = failsWith "deposits are queued" =<< trySubmit env.registrar (call method 10.0)
+  reads "previewRedeem" 10.0 >>= \a -> assertMsg "redemptions still quote" (a > 0.0)
+  reads "maxDeposit" 0.0 >>= (=== 0.0)
+  reads "maxMint" 0.0 >>= (=== 0.0)
+  refused "previewDeposit"
+  refused "previewMint"
+
 fulfilmentByAnotherPartyIsRefused : Script ()
 fulfilmentByAnotherPartyIsRefused = script do
   env <- setup

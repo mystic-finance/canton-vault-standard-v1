@@ -151,21 +151,14 @@ data AsyncView = AsyncView with
       -- only the executors can settle or cancel it; after it, the requester can
       -- withdraw it.
     meta : Metadata
-      -- ^ The vault's request policies, under `requestPricingKey` and
-      -- `instantPriorityKey`, and any extensions specific to the vault.
+      -- ^ The vault's request pricing, under `requestPricingKey`, and any
+      -- extensions specific to the vault.
   deriving (Show, Eq, Serializable)
 
 -- | The `AsyncView` metadata key saying when a request's rate is struck. Free
 -- text; recommended values are `"period-close"`, `"fulfilment"` and `"request"`.
 requestPricingKey : Text
 requestPricingKey = "canton-vault/request-pricing"
-
--- | The `AsyncView` metadata key saying whether instant actions in a queued
--- direction may go ahead of unfilled requests. Free text; recommended values
--- are `"queue-first"` and `"independent"`. A vault that takes no instant
--- actions in that direction omits it.
-instantPriorityKey : Text
-instantPriorityKey = "canton-vault/instant-priority"
 
 --
 -- Vault

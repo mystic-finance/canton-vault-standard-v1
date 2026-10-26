@@ -7,11 +7,9 @@ import Splice.Api.Token.MetadataV1
 import Canton.Vault.V1
 
 -- | An interface for queuing redemptions. A vault implements it alongside
--- `Vault` when it takes redemptions as requests filled later. It may still
--- take redemptions instantly through `Vault_Withdraw` and `Vault_Redeem`, up to
--- what `maxWithdraw` and `maxRedeem` return, with the previews describing that
--- instant path. A vault that takes no redemptions instantly returns zero from
--- those methods and fails `previewWithdraw` and `previewRedeem`.
+-- `Vault` when redemptions are fulfilled later rather than at once; its
+-- `Vault_Withdraw`, `Vault_Redeem`, `previewWithdraw` and `previewRedeem` then
+-- fail, and its `maxWithdraw` and `maxRedeem` return zero.
 --
 -- A request names its terms, and the vault publishes the allocations it needs
 -- to fund it as the token standard's `AllocationRequest`. The escrow pays an

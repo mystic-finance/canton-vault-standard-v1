@@ -475,6 +475,28 @@ instantRedemptionIsRefused = script do
       shares = 10.0; owner = env.alice; receiver = env.alice; minAssetsOut = None
       actors = [env.alice]; extraArgs = args
 
+-- | A queued direction has no instant path: its max methods are zero and its previews fail, while deposits still quote.
+queuedRedemptionsHaveNoInstantPath : Script ()
+queuedRedemptionsHaveNoInstantPath = script do
+  env <- setup
+  pool <- map fst <$> heldBy env (usdId env) env.custodian
+  shares <- map fst <$> heldBy env (sharesId env) env.alice
+  poolDs <- forA pool $ \cid -> fromSome <$> queryDisclosure env.custodian cid
+  let ids cids = AV_List [AV_ContractId (toAnyContractId c) | c <- cids]
+      args = (tokenArgs env.usd) with
+        context = (tokenArgs env.usd).context with
+          values = TextMap.union (TextMap.fromList [(underlyingHoldingsKey, ids pool), (shareHoldingsKey, ids shares)])
+            (tokenArgs env.usd).context.values
+      call method amount = createAndExerciseCmd (PathProbe with caller = env.registrar) Probe_Path with
+        vaultCid = toInterfaceContractId env.vaultCid; method; amount; party = env.alice; extraArgs = args
+      reads method amount = submit (actAs env.registrar <> discloseMany poolDs) (call method amount)
+      refused method = failsWith "redemptions are queued" =<< trySubmit (actAs env.registrar <> discloseMany poolDs) (call method 10.0)
+  reads "previewDeposit" 10.0 >>= \s -> assertMsg "deposits still quote" (s > 0.0)
+  reads "maxWithdraw" 0.0 >>= (=== 0.0)
+  reads "maxRedeem" 0.0 >>= (=== 0.0)
+  refused "previewWithdraw"
+  refused "previewRedeem"
+
 -- | The funding account is Alice's, so only Alice may request from it, not Alice and a stranger.
 requestWithAStrangerIsRefused : Script ()
 requestWithAStrangerIsRefused = script do
