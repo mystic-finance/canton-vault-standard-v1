@@ -166,7 +166,8 @@ data AsyncView = AsyncView with
   deriving (Show, Eq, Serializable)
 
 -- | The `AsyncView` metadata key saying when a request's rate is struck. Free
--- text; recommended values are `"period-close"`, `"fulfilment"` and `"request"`.
+-- text; recommended values are `"period-close"` and `"fulfilment"`. A vault
+-- MUST NOT strike a request's rate when it is made.
 requestPricingKey : Text
 requestPricingKey = "canton-vault/request-pricing"
 
