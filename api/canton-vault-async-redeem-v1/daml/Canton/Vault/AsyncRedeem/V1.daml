@@ -35,6 +35,7 @@ interface VaultAsyncRedeem requires Vault where
 
   vault_requestRedeemImpl : ContractId VaultAsyncRedeem -> Vault_RequestRedeem -> Update RequestId
   vault_requestRedeemExtraObservers : Vault_RequestRedeem -> [Party]
+  vault_publicPendingRedeemRequestImpl : ContractId VaultAsyncRedeem -> Vault_PublicPendingRedeemRequest -> Update Decimal
 
   nonconsuming choice Vault_RequestRedeem : RequestId
     -- ^ Queue a redemption of `shares`, paying `receiver` the underlying at the
@@ -58,3 +59,22 @@ interface VaultAsyncRedeem requires Vault where
     observer vault_requestRedeemExtraObservers this arg
     controller actors
     do vault_requestRedeemImpl this self arg
+
+  nonconsuming choice Vault_PublicPendingRedeemRequest : Decimal
+    -- ^ `pendingRedeemRequest`, for a party the vault is disclosed to.
+    --
+    -- Fetching a vault needs the authority of one of its stakeholders, so a
+    -- contract of another party, such as a vault with a request queued here,
+    -- reads it through this choice. The vault may refuse actors it has not
+    -- chosen to serve.
+    with
+      requestId : RequestId
+        -- ^ The request id to read.
+      party : Party
+        -- ^ The party whose queued shares is read.
+      actors : [Party]
+        -- ^ Parties executing the read.
+      extraArgs : ExtraArgs
+        -- ^ The requests to count, as `pendingRedeemRequest` takes them.
+    controller actors
+    do vault_publicPendingRedeemRequestImpl this self arg

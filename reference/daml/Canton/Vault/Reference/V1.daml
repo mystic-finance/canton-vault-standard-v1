@@ -396,6 +396,9 @@ template ReferenceVault
           holdingCids
           meta = emptyMetadata
 
+      vault_publicFetchImpl _self _arg = pure (view (toInterface @Vault this))
+      vault_publicConvertToAssetsImpl _self arg = convertToAssets (toInterface @Vault this) arg.shares
+
     choice ReferenceVault_ClosePeriod : ContractId ClosedPeriod
       -- ^ End the period; actions against this vault fail from here on.
       controller vaultRegistrar

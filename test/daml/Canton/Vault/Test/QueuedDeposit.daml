@@ -285,11 +285,7 @@ template PendingProbe
       controller caller
       do
         vault <- fetch vaultCid
-        pendingDepositRequest vault requestId party ExtraArgs with
-          context = ChoiceContext with
-            values = TextMap.fromList
-              [(Q.depositRequestsKey, AV_List (map (AV_ContractId . toAnyContractId) requests))]
-          meta = emptyMetadata
+        pendingDepositRequest vault requestId party (requestArgs requests)
 
 pending : Env -> RequestId -> Party -> [ContractId Q.QueuedDepositRequest] -> Script Decimal
 pending env rid party requests = do
@@ -300,6 +296,47 @@ pending env rid party requests = do
       requestId = rid
       party
       requests
+
+-- | The requests named for `pendingDepositRequest` to count.
+requestArgs : [ContractId Q.QueuedDepositRequest] -> ExtraArgs
+requestArgs requests = ExtraArgs with
+  context = ChoiceContext with
+    values = TextMap.fromList [(Q.depositRequestsKey, AV_List (map (AV_ContractId . toAnyContractId) requests))]
+  meta = emptyMetadata
+
+-- | Reads pending requests from a contract of the reader's own.
+template PendingReader
+  with
+    reader : Party
+  where
+    signatory reader
+    choice PendingReader_Public : Decimal
+      with
+        vaultCid : ContractId VaultAsyncDeposit
+        requestId : RequestId
+        party : Party
+        requests : [ContractId Q.QueuedDepositRequest]
+      controller reader
+      do exercise vaultCid Vault_PublicPendingDepositRequest with
+           requestId; party; actors = [reader]; extraArgs = requestArgs requests
+    choice PendingReader_Fetch : Decimal
+      with
+        vaultCid : ContractId VaultAsyncDeposit
+        requestId : RequestId
+        party : Party
+        requests : [ContractId Q.QueuedDepositRequest]
+      controller reader
+      do
+        vault <- fetch vaultCid
+        pendingDepositRequest vault requestId party (requestArgs requests)
+
+readPending : Env -> Party -> Party -> RequestId -> [ContractId Q.QueuedDepositRequest] -> Script (Either SubmitError Decimal)
+readPending env reader party requestId requests = do
+  now <- current env
+  vd <- vaultDisclosure now
+  trySubmit (actAs reader <> discloseMany [vd]) do
+    createAndExerciseCmd (PendingReader with reader) PendingReader_Public with
+      vaultCid = toInterfaceContractId now.vaultCid; requestId; party; requests
 
 -- Requests and fulfilment
 ---------------------------
@@ -328,6 +365,22 @@ requestsAggregateUnderOneId = script do
   pending env 1 env.alice [a.requestCid, b.requestCid] >>= (=== 0.0)
   Right () <- fulfilAs env env.venue [a, b]
   tokens env (sharesId env) env.alice >>= (=== 150.0)
+
+-- | A requester that is no stakeholder of the vault reads its pending request from a contract of its own, which a
+-- plain fetch cannot; another party cannot read it.
+requesterReadsItsPendingRequestFromItsOwnContract : Script ()
+requesterReadsItsPendingRequestFromItsOwnContract = script do
+  env <- setup
+  stranger <- allocateParty "stranger"
+  (rid, req) <- request env env.alice "r1" 100.0
+  Right got <- readPending env env.alice env.alice rid [req.requestCid]
+  got === 100.0
+  failsWith "a party reads only its own requests" =<< readPending env stranger env.alice rid [req.requestCid]
+  now <- current env
+  vd <- vaultDisclosure now
+  failsWith "requires one of the stakeholders" =<< trySubmit (actAs env.alice <> discloseMany [vd]) do
+    createAndExerciseCmd (PendingReader with reader = env.alice) PendingReader_Fetch with
+      vaultCid = toInterfaceContractId now.vaultCid; requestId = rid; party = env.alice; requests = [req.requestCid]
 
 -- What a queued-deposit vault refuses
 ---------------------------------------

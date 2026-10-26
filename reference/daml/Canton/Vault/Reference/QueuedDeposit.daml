@@ -93,6 +93,8 @@ template ReferenceQueuedDepositVault
       vault_mintImpl _self _arg = fail "deposits are queued: use Vault_RequestDeposit"
       vault_withdrawImpl = vault_withdrawImpl (instantOf this)
       vault_redeemImpl = vault_redeemImpl (instantOf this)
+      vault_publicFetchImpl _self _arg = pure (view (toInterface @Vault this))
+      vault_publicConvertToAssetsImpl _self arg = convertToAssets (toInterface @Vault this) arg.shares
 
     interface instance VaultAsyncDeposit for ReferenceQueuedDepositVault where
       view = AsyncView with
@@ -112,6 +114,9 @@ template ReferenceQueuedDepositVault
         pure (sum amounts)
 
       vault_requestDepositExtraObservers _arg = []
+      vault_publicPendingDepositRequestImpl _self arg = do
+        require "a party reads only its own requests" (arg.party `elem` arg.actors)
+        pendingDepositRequest (toInterface @VaultAsyncDeposit this) arg.requestId arg.party arg.extraArgs
 
       vault_requestDepositImpl _self arg = do
         requirePeriodOpen (instantOf' this)

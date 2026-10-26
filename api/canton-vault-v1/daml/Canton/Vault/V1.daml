@@ -228,6 +228,8 @@ interface Vault where
   vault_mintImpl : ContractId Vault -> Vault_Mint -> Update VaultActionResult
   vault_withdrawImpl : ContractId Vault -> Vault_Withdraw -> Update VaultActionResult
   vault_redeemImpl : ContractId Vault -> Vault_Redeem -> Update VaultActionResult
+  vault_publicFetchImpl : ContractId Vault -> Vault_PublicFetch -> Update VaultView
+  vault_publicConvertToAssetsImpl : ContractId Vault -> Vault_PublicConvertToAssets -> Update Decimal
 
   vault_depositExtraObservers : Vault_Deposit -> [Party]
   vault_mintExtraObservers : Vault_Mint -> [Party]
@@ -320,3 +322,26 @@ interface Vault where
     observer vault_redeemExtraObservers this arg
     controller actors
     do vault_redeemImpl this self arg
+
+  nonconsuming choice Vault_PublicFetch : VaultView
+    -- ^ The vault's view, for a party it is disclosed to.
+    --
+    -- Fetching a vault needs the authority of one of its stakeholders, so a
+    -- contract of another party reads it through this choice. The vault may
+    -- refuse actors it has not chosen to serve; what it returns is its view.
+    with
+      actors : [Party]
+        -- ^ Parties executing the fetch.
+    controller actors
+    do vault_publicFetchImpl this self arg
+
+  nonconsuming choice Vault_PublicConvertToAssets : Decimal
+    -- ^ `convertToAssets` of `shares`, for a party the vault is disclosed to.
+    -- Refused as for `Vault_PublicFetch`. Rounds down.
+    with
+      shares : Decimal
+        -- ^ Shares to convert.
+      actors : [Party]
+        -- ^ Parties executing the conversion.
+    controller actors
+    do vault_publicConvertToAssetsImpl this self arg

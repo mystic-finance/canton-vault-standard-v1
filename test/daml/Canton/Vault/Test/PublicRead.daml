@@ -1,0 +1,132 @@
+-- | A party with no stake in a vault reads it through the public choices, and only if the vault serves it.
+module Canton.Vault.Test.PublicRead where
+
+import DA.Assert ((===))
+import Daml.Script
+
+import Canton.Vault.V1
+import Canton.Vault.Reference.Math (mulDivDown)
+import Canton.Vault.Reference.V1
+import Canton.Vault.Test.Deposit
+import Canton.Vault.Test.Limits (failsWith)
+import Canton.Vault.Test.Periods
+
+-- | Reads a vault from a contract of the reader's own.
+template VaultReader
+  with reader : Party
+  where
+    signatory reader
+    choice VaultReader_View : VaultView
+      with vaultCid : ContractId Vault
+      controller reader
+      do exercise vaultCid Vault_PublicFetch with actors = [reader]
+    choice VaultReader_Convert : Decimal
+      with vaultCid : ContractId Vault; shares : Decimal
+      controller reader
+      do exercise vaultCid Vault_PublicConvertToAssets with shares; actors = [reader]
+    choice VaultReader_Fetch : Decimal
+      with vaultCid : ContractId Vault; shares : Decimal
+      controller reader
+      do
+        vault <- fetch vaultCid
+        convertToAssets vault shares
+
+-- | A reference vault that serves its public reads to the readers it names alone.
+template SelectiveVault
+  with
+    vault : ReferenceVault
+    readers : [Party]
+  where
+    signatory vault.vaultRegistrar, vault.custodian
+
+    interface instance Vault for SelectiveVault where
+      view = view (inner this)
+      convertToShares = convertToShares (inner this)
+      convertToAssets = convertToAssets (inner this)
+      maxDeposit = maxDeposit (inner this)
+      maxMint = maxMint (inner this)
+      maxWithdraw = maxWithdraw (inner this)
+      maxRedeem = maxRedeem (inner this)
+      previewDeposit = previewDeposit (inner this)
+      previewMint = previewMint (inner this)
+      previewWithdraw = previewWithdraw (inner this)
+      previewRedeem = previewRedeem (inner this)
+
+      vault_depositExtraObservers _arg = []
+      vault_mintExtraObservers _arg = []
+      vault_withdrawExtraObservers _arg = []
+      vault_redeemExtraObservers _arg = []
+
+      vault_depositImpl = vault_depositImpl (inner this)
+      vault_mintImpl = vault_mintImpl (inner this)
+      vault_withdrawImpl = vault_withdrawImpl (inner this)
+      vault_redeemImpl = vault_redeemImpl (inner this)
+      vault_publicFetchImpl _self arg = do
+        servesReader readers arg.actors
+        pure (view (toInterface @Vault this))
+      vault_publicConvertToAssetsImpl _self arg = do
+        servesReader readers arg.actors
+        convertToAssets (toInterface @Vault this) arg.shares
+
+inner : SelectiveVault -> Vault
+inner = toInterface . (.vault)
+
+servesReader : [Party] -> [Party] -> Update ()
+servesReader readers actors = assertMsg "the vault does not serve this reader" (any (`elem` readers) actors)
+
+-- | A vault of 100 that earned 10, so a share is worth more than one unit.
+setupEarned : Script (Fixture, ContractId ReferenceVault)
+setupEarned = do
+  f <- setupVault
+  _ <- deposit f f.vaultTemplateCid f.alice 100.0
+  _ <- fund f f.custodian 10.0
+  rolled <- rollPeriod f f.vaultTemplateCid
+  pure (f, rolled)
+
+viewVault : Party -> Disclosure -> ContractId Vault -> Script (Either SubmitError VaultView)
+viewVault reader d vaultCid = trySubmit (actAs reader <> discloseMany [d]) do
+  createAndExerciseCmd (VaultReader with reader) VaultReader_View with vaultCid
+
+convertAt : Party -> Disclosure -> ContractId Vault -> Script (Either SubmitError Decimal)
+convertAt reader d vaultCid = trySubmit (actAs reader <> discloseMany [d]) do
+  createAndExerciseCmd (VaultReader with reader) VaultReader_Convert with vaultCid; shares = 40.0
+
+-- Tests
+---------
+
+-- | A party the reference vault is disclosed to reads its view and conversion, which a plain fetch cannot.
+anyDisclosedPartyReadsTheReferenceVault : Script ()
+anyDisclosedPartyReadsTheReferenceVault = script do
+  (f, rolled) <- setupEarned
+  reader <- allocateParty "reader"
+  Some d <- queryDisclosure f.registrar rolled
+  Some vault <- queryContractId f.registrar rolled
+  let v = view (toInterface @Vault vault)
+      vaultCid = toInterfaceContractId rolled
+  Right got <- viewVault reader d vaultCid
+  Right assets <- convertAt reader d vaultCid
+  got === v
+  assets === mulDivDown 40.0 v.totalAssets v.totalShares
+  assertMsg "a share is worth more than one unit" (assets > 40.0)
+  failsWith "requires one of the stakeholders" =<< trySubmit (actAs reader <> discloseMany [d]) do
+    createAndExerciseCmd (VaultReader with reader) VaultReader_Fetch with vaultCid; shares = 40.0
+
+-- | A vault that names its readers serves them, and refuses a party it has not named though the vault is disclosed
+-- to it.
+aVaultServesOnlyTheReadersItNames : Script ()
+aVaultServesOnlyTheReadersItNames = script do
+  (f, rolled) <- setupEarned
+  allocator <- allocateParty "allocator"
+  stranger <- allocateParty "stranger"
+  Some vault <- queryContractId f.registrar rolled
+  selective <- submit (actAs [f.registrar, f.custodian]) $
+    archiveCmd rolled *> createCmd SelectiveVault with vault; readers = [allocator]
+  Some d <- queryDisclosure f.registrar selective
+  let v = view (toInterface @Vault vault)
+      vaultCid = toInterfaceContractId selective
+  Right got <- viewVault allocator d vaultCid
+  Right assets <- convertAt allocator d vaultCid
+  got === v
+  assets === mulDivDown 40.0 v.totalAssets v.totalShares
+  failsWith "the vault does not serve this reader" =<< viewVault stranger d vaultCid
+  failsWith "the vault does not serve this reader" =<< convertAt stranger d vaultCid

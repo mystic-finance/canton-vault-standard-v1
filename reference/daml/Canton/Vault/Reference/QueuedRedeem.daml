@@ -98,6 +98,8 @@ template ReferenceQueuedRedeemVault
       vault_mintImpl = vault_mintImpl (instantOf this)
       vault_withdrawImpl _self _arg = fail "redemptions are queued: use Vault_RequestRedeem"
       vault_redeemImpl _self _arg = fail "redemptions are queued: use Vault_RequestRedeem"
+      vault_publicFetchImpl _self _arg = pure (view (toInterface @Vault this))
+      vault_publicConvertToAssetsImpl _self arg = convertToAssets (toInterface @Vault this) arg.shares
 
     interface instance VaultAsyncRedeem for ReferenceQueuedRedeemVault where
       view = AsyncView with
@@ -117,6 +119,9 @@ template ReferenceQueuedRedeemVault
         pure (sum amounts)
 
       vault_requestRedeemExtraObservers _arg = []
+      vault_publicPendingRedeemRequestImpl _self arg = do
+        require "a party reads only its own requests" (arg.party `elem` arg.actors)
+        pendingRedeemRequest (toInterface @VaultAsyncRedeem this) arg.requestId arg.party arg.extraArgs
 
       vault_requestRedeemImpl _self arg = do
         requirePeriodOpen (instantOf' this)

@@ -35,6 +35,7 @@ interface VaultAsyncDeposit requires Vault where
 
   vault_requestDepositImpl : ContractId VaultAsyncDeposit -> Vault_RequestDeposit -> Update RequestId
   vault_requestDepositExtraObservers : Vault_RequestDeposit -> [Party]
+  vault_publicPendingDepositRequestImpl : ContractId VaultAsyncDeposit -> Vault_PublicPendingDepositRequest -> Update Decimal
 
   nonconsuming choice Vault_RequestDeposit : RequestId
     -- ^ Queue a deposit of `assets`, for shares issued to `receiver` at the rate
@@ -59,3 +60,22 @@ interface VaultAsyncDeposit requires Vault where
     observer vault_requestDepositExtraObservers this arg
     controller actors
     do vault_requestDepositImpl this self arg
+
+  nonconsuming choice Vault_PublicPendingDepositRequest : Decimal
+    -- ^ `pendingDepositRequest`, for a party the vault is disclosed to.
+    --
+    -- Fetching a vault needs the authority of one of its stakeholders, so a
+    -- contract of another party, such as a vault with a request queued here,
+    -- reads it through this choice. The vault may refuse actors it has not
+    -- chosen to serve.
+    with
+      requestId : RequestId
+        -- ^ The request id to read.
+      party : Party
+        -- ^ The party whose queued underlying is read.
+      actors : [Party]
+        -- ^ Parties executing the read.
+      extraArgs : ExtraArgs
+        -- ^ The requests to count, as `pendingDepositRequest` takes them.
+    controller actors
+    do vault_publicPendingDepositRequestImpl this self arg
