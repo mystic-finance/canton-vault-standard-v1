@@ -22,6 +22,10 @@ data-dependencies:
   - ../dependencies/splice-api-token-transfer-events-v2-1.0.0.dar
   - ../dependencies/splice-token-standard-utils-2.0.0.dar
   - ../dependencies/splice-test-token-v2-1.0.1.dar
+  - ../dependencies/splice-api-token-holding-v1-1.0.0.dar
+  - ../dependencies/splice-api-token-transfer-instruction-v1-1.0.0.dar
+  - ../dependencies/splice-api-token-allocation-v1-1.0.0.dar
+  - ../dependencies/splice-api-token-allocation-instruction-v1-1.0.0.dar
 build-options:
   - --explicit-serializable=yes
   - --target=2.1
