@@ -12,6 +12,8 @@ import Daml.Script
 
 import Canton.Vault.V1
 import Canton.Vault.AsyncRedeem.V1
+import Canton.Vault.EventLog.V1
+import Canton.Vault.Reference.Log (VaultLog)
 import Canton.Vault.Reference.Math (sharesToAssets, deductFeeBps)
 import Canton.Vault.Reference.QueuedRedeem qualified as R
 import Canton.Vault.Reference.Queue qualified as R
@@ -320,8 +322,8 @@ fulfilAs env party requests = do
   fulfilWith env party pool requests
 
 -- | What a transaction reported about queued requests.
-reported : TransactionTree -> [R.QueuedEvent]
-reported tree = map (.event) (exercisesOf @R.QueueLog @R.QueueLog_Report tree)
+reported : TransactionTree -> [VaultEvent]
+reported tree = map (.event) (vaultReports tree)
 
 -- | Reads what is still queued, as a party able to see the escrow.
 template PendingRedeemProbe
@@ -460,6 +462,22 @@ requesterReadsItsPendingRequestFromItsOwnContract = script do
     createAndExerciseCmd (PendingReader with reader = env.alice) PendingReader_Fetch with
       vaultCid = toInterfaceContractId now.vaultCid; requestId = rid; party = env.alice; requests = [req.requestCid]
 
+-- | Accepting a request's funding reports it under its id to its owner, its receiver and the executors.
+acceptedFundingIsReported : Script ()
+acceptedFundingIsReported = script do
+  env <- setup
+  bob <- allocateParty "bob"
+  Right rid <- requestTerms env env.alice "r1" 40.0 bob None
+  (cid, r) <- published env env.alice "r1"
+  escrowed <- escrowAsRequested env r
+  receiving <- receiptAsRequested env r
+  vd <- vaultDisclosure env
+  tree <- submitTree (actAs env.venue <> discloseMany [vd, env.usd.disclosure, env.shares.disclosure]) do
+    exerciseCmd env.vaultCid R.ReferenceQueuedRedeemVault_Bind with
+      requestCid = cid; shareAllocation = escrowed; underlyingAllocation = receiving
+  reported tree === [RedeemRequested with requestId = rid; label = "r1"; shares = 40.0]
+  map (.observers) (vaultReports tree) === [[env.alice, bob, env.venue]]
+
 -- | A request is recorded while pending; its fulfilment is reported and leaves nothing behind.
 requestIsRecordedAndItsFulfilmentReported : Script ()
 requestIsRecordedAndItsFulfilmentReported = script do
@@ -470,9 +488,9 @@ requestIsRecordedAndItsFulfilmentReported = script do
   ready <- readyToFill env [req]
   Right tree <- fulfilNowTree ready env.venue [req]
   query @R.QueuedRedeemRequest env.alice >>= (=== []) . map snd
-  map (\e -> (e.label, e.requested, e.outcome)) (reported tree) === [("r1", 40.0, R.Fulfilled with received = 40.0)]
-  map (.observers) (exercisesOf @R.QueueLog @R.QueueLog_Report tree) === [[env.alice]]
-  query @R.QueueLog env.registrar >>= (=== []) . map snd
+  reported tree === [Withdrew with assets = 40.0; shares = 40.0; fromRequest = Some 0]
+  map (.observers) (vaultReports tree) === [[env.alice, env.venue]]
+  query @VaultLog env.registrar >>= (=== []) . map snd
 
 -- | The payout is priced when struck: yield folded in after the request raises it.
 payoutIsPricedWhenStruck : Script ()
@@ -1101,7 +1119,7 @@ rejectReturnsTheEscrow = script do
   Right tree <- rejectTreeAs env env.venue [req] "receiver blocked"
   unlocked env (sharesId env) env.alice >>= (=== 100.0)
   query @R.QueuedRedeemRequest env.alice >>= (=== []) . map snd
-  map (\e -> (e.label, e.requested, e.outcome)) (reported tree) === [("r1", 40.0, R.Rejected with reason = "receiver blocked")]
+  reported tree === [RequestClosed with requestId = 0; label = "r1"; amount = 40.0; reason = "receiver blocked"]
 
 rejectionByAnotherPartyIsRefused : Script ()
 rejectionByAnotherPartyIsRefused = script do
@@ -1281,7 +1299,7 @@ aThirdPartyReceiverIsPaid = script do
   (_, req) <- requestFor env env.alice bob "r1" 40.0 None
   next <- nextPeriod env
   Right tree <- fulfilNowTree next env.venue [req]
-  map (.observers) (exercisesOf @R.QueueLog @R.QueueLog_Report tree) === [[env.alice, bob]]
+  map (.observers) (vaultReports tree) === [[env.alice, bob, env.venue]]
   unlocked env (usdId env) bob >>= (=== 40.0)
 
 

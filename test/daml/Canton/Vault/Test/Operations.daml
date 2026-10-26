@@ -6,6 +6,8 @@ import DA.Time (addRelTime, hours)
 import Daml.Script
 
 import Canton.Vault.V1
+import Canton.Vault.EventLog.V1
+import Canton.Vault.Reference.Log (VaultLog)
 import Canton.Vault.Reference.V1
 import Canton.Vault.Reference.Share
 import Canton.Vault.Test.Deposit
@@ -131,8 +133,7 @@ actionsReportEventsToTheirParties = script do
   rolled <- rollPeriod f f.vaultTemplateCid
   ds <- disclosuresFor f rolled
   let vaultCid : ContractId Vault = toInterfaceContractId rolled
-      reported tree = [ (r.event.action, r.event.receiver, r.event.assets, r.event.shares, r.observers)
-                      | r <- exercisesOf @VaultLog @VaultLog_Report tree ]
+      reported tree = [(r.event, r.owner, r.receiver, r.observers) | r <- vaultReports tree]
 
   funds <- fund f f.alice 100.0
   minted <- submitTree (actAs f.alice <> discloseMany ds) do
@@ -142,7 +143,7 @@ actionsReportEventsToTheirParties = script do
       maxAssetsIn = None
       actors = [f.alice]
       extraArgs = depositArgs f [funds]
-  reported minted === [(Minted, f.alice, 10.0, 10.0, [f.alice])]
+  reported minted === [((Deposited with assets = 10.0; shares = 10.0; fromRequest = None), f.alice, f.alice, [f.alice])]
 
   pool <- query @MockHolding f.custodian
   poolDs <- poolDisclosures f
@@ -155,7 +156,7 @@ actionsReportEventsToTheirParties = script do
       maxSharesIn = None
       actors = [f.alice]
       extraArgs = redeemArgs f (map (toInterfaceContractId . fst) pool) aliceShares
-  reported withdrew === [(Withdrew, f.alice, 5.0, 5.0, [f.alice])]
+  reported withdrew === [((Withdrew with assets = 5.0; shares = 5.0; fromRequest = None), f.alice, f.alice, [f.alice])]
 
   pool' <- query @MockHolding f.custodian
   poolDs' <- poolDisclosures f
@@ -168,7 +169,7 @@ actionsReportEventsToTheirParties = script do
       minAssetsOut = None
       actors = [f.alice]
       extraArgs = redeemArgs f (map (toInterfaceContractId . fst) pool') aliceShares'
-  reported redeemed === [(Redeemed, bob, 5.0, 5.0, [bob, f.alice])]
+  reported redeemed === [((Withdrew with assets = 5.0; shares = 5.0; fromRequest = None), f.alice, bob, [f.alice, bob])]
 
   query @VaultLog f.registrar >>= (=== []) . map snd
 

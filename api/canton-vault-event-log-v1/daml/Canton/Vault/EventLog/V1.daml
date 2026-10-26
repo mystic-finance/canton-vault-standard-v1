@@ -1,0 +1,97 @@
+-- | Reporting what a vault did, as the token standard's `EventLog` reports
+-- transfers.
+module Canton.Vault.EventLog.V1 where
+
+import Splice.Api.Token.MetadataV1
+
+import Canton.Vault.V1 (RequestId)
+
+-- | What a vault did.
+data VaultEvent
+  = Deposited with
+      assets : Decimal
+        -- ^ The units of the underlying paid in.
+      shares : Decimal
+        -- ^ The shares issued.
+      fromRequest : Optional RequestId
+        -- ^ The id of the request filled, when the deposit was queued.
+  | Withdrew with
+      assets : Decimal
+        -- ^ The units of the underlying paid out.
+      shares : Decimal
+        -- ^ The shares burned.
+      fromRequest : Optional RequestId
+        -- ^ The id of the request filled, when the redemption was queued. A
+        -- request filled in part keeps the rest queued.
+  | DepositRequested with
+      requestId : RequestId
+        -- ^ The id the request is queued under.
+      label : Text
+        -- ^ The requester's label for the request.
+      assets : Decimal
+        -- ^ The units of the underlying queued.
+  | RedeemRequested with
+      requestId : RequestId
+        -- ^ The id the request is queued under.
+      label : Text
+        -- ^ The requester's label for the request.
+      shares : Decimal
+        -- ^ The shares queued.
+  | RequestClosed with
+      requestId : RequestId
+        -- ^ The id the request was queued under.
+      label : Text
+        -- ^ The requester's label for the request.
+      amount : Decimal
+        -- ^ The underlying or shares that left the queue unfilled.
+      reason : Text
+        -- ^ Why: rejected, withdrawn or reclaimed.
+  deriving (Show, Eq, Serializable)
+
+-- | An interface for reporting a vault's events.
+--
+-- A vault exercises its choice in the transaction the event happens in. Only
+-- events reported by a vault's `vaultRegistrar` are that vault's events.
+interface VaultEventLog where
+  viewtype VaultEventLogView
+
+  vaultEventLog_reportImpl : ContractId VaultEventLog -> VaultEventLog_Report -> Update VaultEventLog_ReportResult
+
+  nonconsuming choice VaultEventLog_Report : VaultEventLog_ReportResult
+    -- ^ Show an event to its observers.
+    --
+    -- A vault MUST report every instant action, every request it accepts the
+    -- funding of, every fill, and every request that leaves its queue unfilled
+    -- through the vault.
+    with
+      vaultRegistrar : Party
+        -- ^ The registrar of the vault reporting the event.
+      vaultId : Text
+        -- ^ The vault the event happened in.
+      owner : Party
+        -- ^ The party whose underlying or shares were paid in.
+      receiver : Party
+        -- ^ The party paid the shares or the underlying.
+      actors : [Party]
+        -- ^ The parties that took the action.
+      event : VaultEvent
+        -- ^ What happened.
+      observers : [Party]
+        -- ^ The parties shown the event. MUST include `owner` and `receiver`.
+      extraArgs : ExtraArgs
+        -- ^ Additional context and metadata about the event.
+    observer observers
+    controller vaultRegistrar
+    do vaultEventLog_reportImpl this self arg
+
+-- | View of a `VaultEventLog`.
+data VaultEventLogView = VaultEventLogView with
+    vaultRegistrar : Party
+      -- ^ The registrar reporting through the log.
+    meta : Metadata
+      -- ^ Additional metadata about the log, used for extensibility.
+  deriving (Show, Eq, Serializable)
+
+-- | The result of reporting an event, for extensibility.
+data VaultEventLog_ReportResult = VaultEventLog_ReportResult {}
+  deriving (Show, Eq, Serializable)

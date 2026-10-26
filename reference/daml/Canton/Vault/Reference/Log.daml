@@ -1,0 +1,39 @@
+-- | Reports a vault's events through the standard's event log.
+module Canton.Vault.Reference.Log where
+
+import DA.Foldable (forA_)
+import DA.List (dedup)
+
+import Canton.Vault.EventLog.V1
+
+import Splice.Api.Token.MetadataV1
+
+-- | Reports events in the transaction they happen in. Created and archived within that transaction, so nothing
+-- stays on the ledger.
+template VaultLog
+  with
+    vaultRegistrar : Party
+  where
+    signatory vaultRegistrar
+
+    interface instance VaultEventLog for VaultLog where
+      view = VaultEventLogView with vaultRegistrar; meta = emptyMetadata
+      vaultEventLog_reportImpl _self _arg = pure VaultEventLog_ReportResult
+
+-- | One event, with the parties it concerns.
+data Report = Report with
+    owner : Party
+    receiver : Party
+    actors : [Party]
+    event : VaultEvent
+
+-- | Shows each event to its owner, receiver and actors.
+report : Party -> Text -> [Report] -> Update ()
+report vaultRegistrar vaultId reports = do
+  log <- create VaultLog with vaultRegistrar
+  forA_ reports $ \r -> exercise (toInterfaceContractId @VaultEventLog log) VaultEventLog_Report with
+    vaultRegistrar; vaultId
+    owner = r.owner; receiver = r.receiver; actors = r.actors; event = r.event
+    observers = dedup (r.owner :: r.receiver :: r.actors)
+    extraArgs = ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata
+  archive log

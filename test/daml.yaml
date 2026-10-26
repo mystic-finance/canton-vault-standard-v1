@@ -10,6 +10,7 @@ data-dependencies:
   - ../api/canton-vault-v1/.daml/dist/canton-vault-v1-0.1.0.dar
   - ../api/canton-vault-async-deposit-v1/.daml/dist/canton-vault-async-deposit-v1-0.1.0.dar
   - ../api/canton-vault-async-redeem-v1/.daml/dist/canton-vault-async-redeem-v1-0.1.0.dar
+  - ../api/canton-vault-event-log-v1/.daml/dist/canton-vault-event-log-v1-0.1.0.dar
   - ../reference/.daml/dist/canton-vault-reference-v1-0.1.0.dar
   - ../dependencies/splice-api-token-metadata-v1-1.0.0.dar
   - ../dependencies/splice-api-token-holding-v2-1.0.0.dar

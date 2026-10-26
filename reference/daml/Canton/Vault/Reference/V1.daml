@@ -8,6 +8,8 @@ import DA.TextMap qualified as TextMap
 import DA.Time (isLedgerTimeLT)
 
 import Canton.Vault.V1
+import Canton.Vault.EventLog.V1
+import Canton.Vault.Reference.Log
 import Canton.Vault.Reference.Math
 import Canton.Vault.Reference.Share
 
@@ -63,37 +65,6 @@ template PeriodFlow
         create this with
           assetsDelta = assetsDelta + sum (map (.assetsDelta) flows)
           sharesDelta = sharesDelta + sum (map (.sharesDelta) flows)
-
--- | One action, as reported to the parties who took it and the receiver.
-data VaultEvent = VaultEvent with
-    vaultId : Text
-    action : VaultAction
-    actors : [Party]
-    receiver : Party
-    assets : Decimal
-    shares : Decimal
-    periodStart : Time
-  deriving (Eq, Show, Serializable)
-
--- | Reports events in the transaction they happen in, as the token standard's `EventLog` does. Created and
--- archived within that transaction, so nothing stays on the ledger.
-template VaultLog
-  with
-    vaultRegistrar : Party
-  where
-    signatory vaultRegistrar
-
-    nonconsuming choice VaultLog_Report : ()
-      -- ^ Show the event to its observers.
-      with
-        event : VaultEvent
-        observers : [Party]
-      observer observers
-      controller vaultRegistrar
-      do pure ()
-
-data VaultAction = Deposited | Minted | Withdrew | Redeemed
-  deriving (Eq, Show, Serializable)
 
 -- | Where a vault's price comes from at each roll.
 data Pricing
@@ -327,7 +298,8 @@ template ReferenceVault
         pullUnderlying this arg.extraArgs sender arg.assets
         holdingCid <- mintShares shareInstrument (basicAccount arg.receiver) shares
         recordFlow this arg.assets shares
-        recordEvent this Deposited arg.actors arg.receiver arg.assets shares
+        recordEvent this (regularAccountOwner sender) arg.actors arg.receiver
+          Deposited with assets = arg.assets; shares; fromRequest = None
         pure VaultActionResult with
           vaultCid = None
           assets = arg.assets
@@ -349,7 +321,8 @@ template ReferenceVault
         pullUnderlying this arg.extraArgs sender assets
         holdingCid <- mintShares shareInstrument (basicAccount arg.receiver) arg.shares
         recordFlow this assets arg.shares
-        recordEvent this Minted arg.actors arg.receiver assets arg.shares
+        recordEvent this (regularAccountOwner sender) arg.actors arg.receiver
+          Deposited with assets; shares = arg.shares; fromRequest = None
         pure VaultActionResult with
           vaultCid = None
           assets
@@ -368,7 +341,8 @@ template ReferenceVault
         burnFrom this arg.extraArgs arg.owner shares
         holdingCids <- pushUnderlying this arg.extraArgs arg.actors arg.receiver arg.assets
         recordFlow this (negate arg.assets) (negate shares)
-        recordEvent this Withdrew arg.actors arg.receiver arg.assets shares
+        recordEvent this arg.owner arg.actors arg.receiver
+          Withdrew with assets = arg.assets; shares; fromRequest = None
         pure VaultActionResult with
           vaultCid = None
           assets = arg.assets
@@ -388,7 +362,8 @@ template ReferenceVault
         burnFrom this arg.extraArgs arg.owner arg.shares
         holdingCids <- pushUnderlying this arg.extraArgs arg.actors arg.receiver assets
         recordFlow this (negate assets) (negate arg.shares)
-        recordEvent this Redeemed arg.actors arg.receiver assets arg.shares
+        recordEvent this arg.owner arg.actors arg.receiver
+          Withdrew with assets; shares = arg.shares; fromRequest = None
         pure VaultActionResult with
           vaultCid = None
           assets
@@ -448,20 +423,8 @@ template ReferenceVault
 -- Helpers
 -----------
 
-recordEvent : ReferenceVault -> VaultAction -> [Party] -> Party -> Decimal -> Decimal -> Update ()
-recordEvent vault action actors receiver assets shares = do
-  log <- create VaultLog with vaultRegistrar = vault.vaultRegistrar
-  exercise log VaultLog_Report with
-    event = VaultEvent with
-      vaultId = vault.vaultId
-      action
-      actors
-      receiver
-      assets
-      shares
-      periodStart = vault.rateValidFrom
-    observers = dedup (receiver :: actors)
-  archive log
+recordEvent : ReferenceVault -> Party -> [Party] -> Party -> VaultEvent -> Update ()
+recordEvent vault owner actors receiver event = report vault.vaultRegistrar vault.vaultId [Report with owner; receiver; actors; event]
 
 -- | The view's rate: an oracle-priced vault names the attestation its totals rest on.
 rateOf : ReferenceVault -> Rate

@@ -1,7 +1,6 @@
 -- | What the queued vaults share: pinned factories, allocation checks, struck prices and reports.
 module Canton.Vault.Reference.Queue where
 
-import DA.Foldable (forA_)
 import DA.List (dedup, sort, unique)
 import DA.Map qualified as Map
 import DA.Optional (isSome)
@@ -9,6 +8,8 @@ import DA.TextMap qualified as TextMap
 import DA.Time (isLedgerTimeGE)
 
 import Canton.Vault.V1 (requestPricingKey)
+import Canton.Vault.EventLog.V1
+import Canton.Vault.Reference.Log
 
 import Splice.Api.Token.MetadataV1
 import Splice.Api.Token.HoldingV2 qualified as V2
@@ -84,7 +85,7 @@ template RequestAllocations
       do
         over <- isLedgerTimeGE fundBy
         require "the request's period has ended" over
-        endUnfunded this "not funded in its period"
+        endUnfunded this [vaultRegistrar] "not funded in its period"
 
     interface instance AR.AllocationRequest for RequestAllocations where
       view = AR.AllocationRequestView with
@@ -100,24 +101,24 @@ template RequestAllocations
       allocationRequest_rejectImpl self arg = do
         require "the requester or the receiver declines" (arg.actors `elem` [[requester], [receiver]])
         archive (fromInterfaceContractId @RequestAllocations self)
-        endUnfunded this "declined"
+        endUnfunded this arg.actors "declined"
         pure AR.AllocationRequest_RejectResult with meta = emptyMetadata
       allocationRequest_withdrawImpl self arg = do
         require "the executors withdraw" (sort arg.actors == sort executors)
         archive (fromInterfaceContractId @RequestAllocations self)
-        endUnfunded this "withdrawn by the executors"
+        endUnfunded this arg.actors "withdrawn by the executors"
         pure AR.AllocationRequest_WithdrawResult with meta = emptyMetadata
       allocationRequest_acceptExtraObservers _arg = []
       allocationRequest_rejectExtraObservers _arg = []
       allocationRequest_withdrawExtraObservers _arg = []
 
 -- | Ends a request no allocation was bound to, reporting why.
-endUnfunded : RequestAllocations -> Text -> Update ()
-endUnfunded r reason = do
+endUnfunded : RequestAllocations -> [Party] -> Text -> Update ()
+endUnfunded r actors reason = do
   archive r.anchor
-  reportQueued r.vaultRegistrar [QueuedEvent with
-    vaultId = r.vaultId; requester = r.requester; receiver = r.receiver; label = r.label
-    requestId = r.epoch; requested = r.amount; outcome = Rejected with reason]
+  report r.vaultRegistrar r.vaultId [Report with
+    owner = r.requester; receiver = r.receiver; actors
+    event = RequestClosed with requestId = r.epoch; label = r.label; amount = r.amount; reason]
 
 -- | Refuses an allocation that is not exactly the one requested, under the request's own settlement.
 requireRequested : Text -> Party -> V2.SettlementInfo -> V2.AllocationSpecification -> ContractId V2.Allocation -> Update ()
@@ -207,58 +208,6 @@ template PeriodPrice
   where
     signatory vaultRegistrar
     observer executors
-
--- | One queued request's outcome, as reported to its requester and receiver.
-data QueuedEvent = QueuedEvent with
-    vaultId : Text
-    requester : Party
-    receiver : Party
-    label : Text
-    requestId : Int
-      -- ^ The period the request was made in.
-    requested : Decimal
-      -- ^ The underlying deposited, or the shares redeemed.
-    outcome : Outcome
-  deriving (Eq, Show, Serializable)
-
-data Outcome
-  = Fulfilled with
-      received : Decimal
-        -- ^ The shares issued, or the underlying paid.
-  | PartlyFilled with
-      received : Decimal
-        -- ^ The underlying paid for the part filled.
-      filled : Decimal
-        -- ^ The shares filled; the rest stay queued.
-  | Rejected with
-      reason : Text
-        -- ^ Why the request could not settle.
-  | Reclaimed
-      -- ^ The owner took back the shares not yet filled.
-  deriving (Eq, Show, Serializable)
-
--- | Reports queued requests' outcomes in the transaction they happen in, as the token standard's `EventLog` does.
--- Created and archived within that transaction, so nothing stays on the ledger.
-template QueueLog
-  with
-    vaultRegistrar : Party
-  where
-    signatory vaultRegistrar
-
-    nonconsuming choice QueueLog_Report : ()
-      -- ^ Show the event to its observers.
-      with
-        event : QueuedEvent
-        observers : [Party]
-      observer observers
-      controller vaultRegistrar
-      do pure ()
-
-reportQueued : Party -> [QueuedEvent] -> Update ()
-reportQueued registrar events = do
-  log <- create QueueLog with vaultRegistrar = registrar
-  forA_ events $ \event -> exercise log QueueLog_Report with event; observers = dedup [event.requester, event.receiver]
-  archive log
 
 -- | The opening totals of the first period after a request's that could fill it: one that allotted its period a share,
 -- or the one right after for a vault that fills every request whole. Those stored for an earlier one, or the current.

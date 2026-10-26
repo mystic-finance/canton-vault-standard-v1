@@ -10,6 +10,8 @@ import DA.Time (RelTime, addRelTime, isLedgerTimeGE, isLedgerTimeLT)
 
 import Canton.Vault.V1
 import Canton.Vault.AsyncRedeem.V1
+import Canton.Vault.EventLog.V1
+import Canton.Vault.Reference.Log
 import Canton.Vault.Reference.Math
 import Canton.Vault.Reference.V1
 import Canton.Vault.Reference.Queue
@@ -188,6 +190,9 @@ template ReferenceQueuedRedeemVault
         requireRequested "escrow" vaultRegistrar r.settlement r.escrow shareAllocation
         requireRequested "receipt authorization" underlyingInstrument.admin r.settlement r.authorization underlyingAllocation
         archive requestCid
+        report vaultRegistrar vaultId [Report with
+          owner = r.requester; receiver = r.receiver; actors = executors
+          event = RedeemRequested with requestId = r.epoch; label = r.label; shares = r.amount]
         create QueuedRedeemRequest with
           vaultId; vaultRegistrar; executors
           owner = r.requester
@@ -335,9 +340,8 @@ template ReferenceQueuedRedeemVault
             pure (drop (length used) pool <> change, drop (length burnInputs) available <> heldChange))
           (poolHoldingCids, heldHoldingCids) fills
         recordFlow (instantOf' this) (negate payout) (negate burned)
-        reportQueued vaultRegistrar
-          [ eventOf f.request (if partial f then PartlyFilled with received = f.assets; filled = f.filled
-                               else Fulfilled with received = f.assets)
+        report vaultRegistrar vaultId
+          [ reportOf f.request executors (Withdrew with assets = f.assets; shares = f.filled; fromRequest = Some f.request.epoch)
           | f <- fills ]
 
     nonconsuming choice ReferenceQueuedRedeemVault_Reject : ()
@@ -351,15 +355,15 @@ template ReferenceQueuedRedeemVault
           -- ^ The share registry's context for cancelling the escrows.
       controller executors
       do
-        events <- forA requestCids $ \cid -> do
+        reports <- forA requestCids $ \cid -> do
           request <- fetch cid
           require' ("request.vaultRegistrar", request.vaultRegistrar) isEqualR ("vaultRegistrar", vaultRegistrar)
           require "a request filled in part is returned by its owner's reclaim" (isNone request.filledIn)
           archive cid
           archive request.anchor
           _ <- exercise request.shareAllocation V2.Allocation_Cancel with actors = executors; extraArgs = shareExtraArgs
-          pure (eventOf request (Rejected with reason))
-        reportQueued vaultRegistrar events
+          pure (reportOf request executors (closed request reason))
+        report vaultRegistrar vaultId reports
 
     choice ReferenceQueuedRedeemVault_SetPriceLimits : ContractId ReferenceQueuedRedeemVault
       -- ^ Change the price limits, which the custodian must agree to.
@@ -476,6 +480,7 @@ template QueuedRedeemRequest
           require "the owner or an executor drops a request, or the registrar once it has expired"
             (actor == vaultRegistrar && expired)
         archive anchor
+        report vaultRegistrar vaultId [reportOf this [actor] (closed this "dropped")]
 
     choice QueuedRedeemRequest_Reclaim : ()
       -- ^ Return the shares not yet filled of a request filled in part to its owner, ending the request.
@@ -512,7 +517,7 @@ template QueuedRedeemRequest
           allocations = [finalized from [], finalized to []]
           actors = [vaultRegistrar]
           extraArgs = shareExtraArgs
-        reportQueued vaultRegistrar [eventOf this Reclaimed]
+        report vaultRegistrar vaultId [reportOf this [owner] (closed this "reclaimed")]
 
 -- | The same vault as an instant one, for everything but redemptions.
 instantOf' : ReferenceQueuedRedeemVault -> ReferenceVault
@@ -602,12 +607,8 @@ receivedHoldings instrumentId result = case result.allocationSettleResults of
   first :: _ -> fromOptional [] (TextMap.lookup instrumentId first.authorizerHoldingCids)
   [] -> []
 
-eventOf : QueuedRedeemRequest -> Outcome -> QueuedEvent
-eventOf r outcome = QueuedEvent with
-  vaultId = r.vaultId
-  requester = r.owner
-  receiver = r.receiver
-  label = r.label
-  requestId = r.epoch
-  requested = r.shares
-  outcome
+reportOf : QueuedRedeemRequest -> [Party] -> VaultEvent -> Report
+reportOf r actors event = Report with owner = r.owner; receiver = r.receiver; actors; event
+
+closed : QueuedRedeemRequest -> Text -> VaultEvent
+closed r reason = RequestClosed with requestId = r.epoch; label = r.label; amount = r.shares; reason

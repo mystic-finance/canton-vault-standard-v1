@@ -8,6 +8,7 @@ import DA.Time (addRelTime, days, hours, seconds)
 import Daml.Script
 
 import Canton.Vault.V1
+import Canton.Vault.EventLog.V1
 import Canton.Vault.Reference.QueuedRedeem qualified as R
 import Canton.Vault.Reference.Queue qualified as R
 import Canton.Vault.Reference.V1 (PeriodFlow(..), PriceEvidence(..), Pricing(..), RateAttestation(..))
@@ -83,13 +84,13 @@ fillTree env requests = do
 requestNow : Env -> Text -> Script Req
 requestNow env = requestOf env env.alice
 
-reclaimAs : Env -> Party -> Req -> Script (Either SubmitError ())
+reclaimAs : Env -> Party -> Req -> Script (Either SubmitError TransactionTree)
 reclaimAs env party req = do
   now <- current env
   held <- map fst <$> heldShares env
   heldDs <- forA held $ \cid -> fromSome <$> queryDisclosure env.registrar cid
   vd <- queryDisclosure env.registrar now.vaultCid
-  trySubmit (actAs party <> discloseMany (optionalToList vd <> [env.shares.disclosure] <> heldDs)) do
+  trySubmitTree (actAs party <> discloseMany (optionalToList vd <> [env.shares.disclosure] <> heldDs)) do
     exerciseCmd req.requestCid R.QueuedRedeemRequest_Reclaim with
       vaultCid = now.vaultCid
       heldHoldingCids = map toInterfaceContractId held
@@ -112,7 +113,7 @@ partFillHoldsTheRestAndFillsItLater = script do
   (_, req) <- request env env.alice "r1" 100.0
   Right env <- rollAt env oracle 1.0 [(0, 0.4)]
   Right tree <- fillTree env [req]
-  map (.outcome) (reported tree) === [R.PartlyFilled with received = 40.0; filled = 40.0]
+  reported tree === [Withdrew with assets = 40.0; shares = 40.0; fromRequest = Some 0]
   unlocked env (usdId env) env.alice >>= (=== 40.0)
   map snd <$> heldShares env >>= (=== [60.0])
   rest <- requestNow env "r1"
@@ -123,7 +124,7 @@ partFillHoldsTheRestAndFillsItLater = script do
   Some vault <- queryContractId env.registrar env.vaultCid
   vault.totalShares === 60.0
   Right tree <- fillTree env [rest]
-  map (.outcome) (reported tree) === [R.Fulfilled with received = 60.0]
+  reported tree === [Withdrew with assets = 60.0; shares = 60.0; fromRequest = Some 0]
   unlocked env (usdId env) env.alice >>= (=== 100.0)
   heldShares env >>= (=== []) . map snd
   query @R.QueuedRedeemRequest env.alice >>= (=== []) . map snd
@@ -145,7 +146,7 @@ theRestTakesThePriceOfThePeriodThatFillsIt = script do
     _ <- holdingOf env.custodian env.usd.admin (usdId env) 10.0
     Right env <- rollAt env oracle price [(0, 1.0)]
     Right tree <- fillTree env [rest]
-    map (.outcome) (reported tree) === [R.Fulfilled with received = paid]
+    reported tree === [Withdrew with assets = paid; shares = 60.0; fromRequest = Some 0]
 
 -- | A period with nothing allotted is the vault's wait, so a first fill is priced from the first period that allotted
 -- the request's period; a fill the executors put off after that still takes the worse price.
@@ -157,7 +158,7 @@ aFirstFillIsPricedFromTheFirstAllottingPeriod = script do
   Right env <- rollAt env oracle 1.0 []
   Right env <- rollAt env oracle 1.1 [(0, 1.0)]
   Right tree <- fillTree env [req]
-  map (.outcome) (reported tree) === [R.Fulfilled with received = 110.0]
+  reported tree === [Withdrew with assets = 110.0; shares = 100.0; fromRequest = Some 0]
 
   (env, oracle) <- setupOracle
   _ <- holdingOf env.custodian env.usd.admin (usdId env) 10.0
@@ -165,7 +166,7 @@ aFirstFillIsPricedFromTheFirstAllottingPeriod = script do
   Right env <- rollAt env oracle 1.0 [(0, 1.0)]
   Right env <- rollAt env oracle 1.1 [(0, 1.0)]
   Right tree <- fillTree env [req]
-  map (.outcome) (reported tree) === [R.Fulfilled with received = 100.0]
+  reported tree === [Withdrew with assets = 100.0; shares = 100.0; fromRequest = Some 0]
 
 -- | A vault priced from its pool can always pay, so it takes no allotments.
 poolPricedVaultTakesNoAllotments : Script ()
@@ -216,11 +217,12 @@ pendingCountsTheHeldRest = script do
   passTime (window + days 1)
   pending env 0 env.alice [rest.requestCid] >>= (=== 60.0)
 
--- | The owner takes back the held rest, and the request ends.
+-- | The owner takes back the held rest, and the request ends, reported as closed.
 ownerReclaimsTheHeldRest : Script ()
 ownerReclaimsTheHeldRest = script do
   (env, _, rest) <- partlyFilled
-  Right () <- reclaimAs env env.alice rest
+  Right tree <- reclaimAs env env.alice rest
+  reported tree === [RequestClosed with requestId = 0; label = "r1"; amount = 60.0; reason = "reclaimed"]
   unlocked env (sharesId env) env.alice >>= (=== 60.0)
   heldShares env >>= (=== []) . map snd
   query @R.QueuedRedeemRequest env.alice >>= (=== []) . map snd

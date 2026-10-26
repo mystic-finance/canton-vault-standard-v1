@@ -10,6 +10,8 @@ import DA.Time (RelTime, addRelTime, isLedgerTimeGE, isLedgerTimeLT)
 
 import Canton.Vault.V1
 import Canton.Vault.AsyncDeposit.V1
+import Canton.Vault.EventLog.V1
+import Canton.Vault.Reference.Log
 import Canton.Vault.Reference.Math
 import Canton.Vault.Reference.V1
 import Canton.Vault.Reference.Queue
@@ -183,6 +185,9 @@ template ReferenceQueuedDepositVault
         requireRequested "escrow" underlyingInstrument.admin r.settlement r.escrow underlyingAllocation
         requireRequested "share authorization" vaultRegistrar r.settlement r.authorization shareAllocation
         archive requestCid
+        report vaultRegistrar vaultId [Report with
+          owner = r.requester; receiver = r.receiver; actors = executors
+          event = DepositRequested with requestId = r.epoch; label = r.label; assets = r.amount]
         create QueuedDepositRequest with
           vaultId; vaultRegistrar; executors
           requester = r.requester
@@ -275,7 +280,8 @@ template ReferenceQueuedDepositVault
           archive r.anchor
 
         recordFlow (instantOf' this) (sum (map (.assets) requests)) (sum [s | (_, _, _, s) <- priced])
-        reportQueued vaultRegistrar [ eventOf r (Fulfilled with received = s) | (r, _, _, s) <- priced ]
+        report vaultRegistrar vaultId
+          [ reportOf r executors (Deposited with assets = r.assets; shares = s; fromRequest = Some r.epoch) | (r, _, _, s) <- priced ]
 
     nonconsuming choice ReferenceQueuedDepositVault_Reject : ()
       -- ^ End requests that cannot settle, returning each escrow and recording why. A request that
@@ -288,14 +294,14 @@ template ReferenceQueuedDepositVault
           -- ^ The underlying registry's context for cancelling the escrows.
       controller executors
       do
-        events <- forA requestCids $ \cid -> do
+        reports <- forA requestCids $ \cid -> do
           request <- fetch cid
           require' ("request.vaultRegistrar", request.vaultRegistrar) isEqualR ("vaultRegistrar", vaultRegistrar)
           archive cid
           archive request.anchor
           _ <- exercise request.underlyingAllocation V2.Allocation_Cancel with actors = executors; extraArgs = underlyingExtraArgs
-          pure (eventOf request (Rejected with reason))
-        reportQueued vaultRegistrar events
+          pure (reportOf request executors (closed request reason))
+        report vaultRegistrar vaultId reports
 
     choice ReferenceQueuedDepositVault_SetPriceLimits : ContractId ReferenceQueuedDepositVault
       -- ^ Change the price limits, which the custodian must agree to.
@@ -406,6 +412,7 @@ template QueuedDepositRequest
           require "the requester or an executor drops a request, or the registrar once it has expired"
             (actor == vaultRegistrar && expired)
         archive anchor
+        report vaultRegistrar vaultId [reportOf this [actor] (closed this "dropped")]
 
 -- | The same vault as an instant one, for everything but deposits.
 instantOf' : ReferenceQueuedDepositVault -> ReferenceVault
@@ -462,12 +469,8 @@ openNext v shares assets pricing now validUntil = do
     rateValidUntil = validUntil
     epoch = next
 
-eventOf : QueuedDepositRequest -> Outcome -> QueuedEvent
-eventOf r outcome = QueuedEvent with
-  vaultId = r.vaultId
-  requester = r.requester
-  receiver = r.receiver
-  label = r.label
-  requestId = r.epoch
-  requested = r.assets
-  outcome
+reportOf : QueuedDepositRequest -> [Party] -> VaultEvent -> Report
+reportOf r actors event = Report with owner = r.requester; receiver = r.receiver; actors; event
+
+closed : QueuedDepositRequest -> Text -> VaultEvent
+closed r reason = RequestClosed with requestId = r.epoch; label = r.label; amount = r.assets; reason
