@@ -52,7 +52,8 @@ interface VaultAsyncRedeem requires Vault where
         -- fill, or part of one, at a lower rate fails rather than fill.
       actors : [Party]
         -- ^ Parties executing the request: the parties of the account the
-        -- escrow is funded from.
+        -- escrow is funded from. Implementations MUST check them, as for
+        -- `Vault_Deposit`.
       extraArgs : ExtraArgs
         -- ^ The funding account, as the instant deposit takes it, and the
         -- receiver's account under `receiver`, both in `meta`.

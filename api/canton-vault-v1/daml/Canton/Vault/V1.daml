@@ -171,6 +171,10 @@ requestPricingKey = "canton-vault/request-pricing"
 -- The read methods run on-ledger, and agree with the published view. Every
 -- quantity rounds in the vault's favour, in the direction given per method
 -- below, and a deposit that would mint zero shares is rejected.
+--
+-- Choices a vault adds for its own roles, such as filling requests or
+-- publishing a price, take their controllers from the vault contract rather
+-- than from an argument.
 interface Vault where
   viewtype VaultView
 
@@ -252,7 +256,9 @@ interface Vault where
       actors : [Party]
         -- ^ Parties executing the deposit.
         --
-        -- Checked against the party whose funds or shares move.
+        -- Implementations MUST check these parties against the account whose
+        -- underlying or shares the action moves, to avoid unauthorized
+        -- actions.
       extraArgs : ExtraArgs
         -- ^ Additional context required in order to exercise the choice.
     observer vault_depositExtraObservers this arg

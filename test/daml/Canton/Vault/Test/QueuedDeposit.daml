@@ -562,6 +562,70 @@ reopenRestoresTheQueuedVault = script do
   Right () <- fulfilAs env' env.venue [first, second]
   tokens env (sharesId env) env.alice >>= (=== 150.0)
 
+-- | The executors cannot settle a request's escrow at the registry on their own, which would pay the custodian
+-- without issuing shares: the registry also needs the custodian's side, which only the vault's fill allocates.
+executorsCannotSettleAnEscrowOutsideTheVault : Script ()
+executorsCannotSettleAnEscrowOutsideTheVault = script do
+  env <- setup
+  (_, req) <- request env env.alice "r1" 100.0
+  Some escrow <- queryInterfaceContractId env.venue req.underlyingAllocation
+  let leg = V2.TransferLeg with
+        transferLegId = Q.requestLegId env.alice "r1" "underlying"
+        sender = basicAccount env.alice
+        receiver = basicAccount env.custodian
+        amount = 100.0
+        instrumentId = "USD"
+        meta = emptyMetadata
+  locked <- lockedTokens env.usd [req.underlyingAllocation]
+  failsWith "missing authorizations" =<< trySubmit (actAs env.venue <> discloseMany (env.usd.disclosure :: locked)) do
+    exerciseCmd (toInterfaceContractId @V2.SettlementFactory env.usd.rulesCid) V2.SettlementFactory_SettleBatch with
+      settlement = escrow.settlement
+      transferLegs = [leg]
+      allocations = [Q.finalized req.underlyingAllocation []]
+      actors = [env.venue]
+      extraArgs = tokenArgs env.usd
+  tokens env (usdId env) env.custodian >>= (=== 0.0)
+  pending env 0 env.alice [req.requestCid] >>= (=== 100.0)
+  Right () <- fulfilAs env env.venue [req]
+  tokens env (sharesId env) env.alice >>= (=== 100.0)
+
+-- | Where the custodian's side is already authorized, the executors can settle an escrow on their own: the requester
+-- pays the pool and is issued nothing. Which registries authorize a receiver standing is what the trust rests on.
+executorsSettleAnEscrowAloneOnceTheCustodiansSideIsAuthorized : Script ()
+executorsSettleAnEscrowAloneOnceTheCustodiansSideIsAuthorized = script do
+  env <- setup
+  (_, req) <- request env env.alice "r1" 100.0
+  Some escrow <- queryInterfaceContractId env.venue req.underlyingAllocation
+  let leg = V2.TransferLeg with
+        transferLegId = Q.requestLegId env.alice "r1" "underlying"
+        sender = basicAccount env.alice
+        receiver = basicAccount env.custodian
+        amount = 100.0
+        instrumentId = "USD"
+        meta = emptyMetadata
+  now <- getTime
+  receiving <- allocateWith env.usd env.custodian V2.AllocationSpecification with
+      admin = env.usd.admin
+      authorizer = basicAccount env.custodian
+      transferLegSides = [V2.TransferLegSide with
+        transferLegId = leg.transferLegId; side = V2.ReceiverSide; otherside = leg.sender
+        amount = 100.0; instrumentId = "USD"; meta = emptyMetadata]
+      settlementDeadline = Some (addRelTime now (days 1))
+      nextIterationFunding = None
+      committed = False
+      meta = emptyMetadata
+    escrow.settlement []
+  locked <- lockedTokens env.usd [req.underlyingAllocation]
+  submit (actAs env.venue <> discloseMany (env.usd.disclosure :: locked)) do
+    exerciseCmd (toInterfaceContractId @V2.SettlementFactory env.usd.rulesCid) V2.SettlementFactory_SettleBatch with
+      settlement = escrow.settlement
+      transferLegs = [leg]
+      allocations = [Q.finalized req.underlyingAllocation [], Q.finalized receiving []]
+      actors = [env.venue]
+      extraArgs = tokenArgs env.usd
+  tokens env (usdId env) env.custodian >>= (=== 100.0)
+  tokens env (sharesId env) env.alice >>= (=== 0.0)
+
 -- | A request is recorded for its requester while pending, and its fulfilment once fulfilled.
 requestIsRecordedAndItsFulfilmentReported : Script ()
 requestIsRecordedAndItsFulfilmentReported = script do
