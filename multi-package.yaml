@@ -3,5 +3,6 @@ packages:
   - api/canton-vault-async-deposit-v1
   - api/canton-vault-async-redeem-v1
   - api/canton-vault-event-log-v1
+  - api/canton-vault-delegation-v1
   - reference
   - test

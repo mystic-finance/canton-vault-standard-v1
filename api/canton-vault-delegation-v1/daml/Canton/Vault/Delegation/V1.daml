@@ -1,0 +1,157 @@
+-- | Delegated access: an owner lets a delegate act for them in one vault,
+-- within allowances and until an expiry.
+module Canton.Vault.Delegation.V1 where
+
+import DA.Optional (optionalToList)
+import DA.Time (isLedgerTimeLT)
+
+import Splice.Api.Token.MetadataV1
+
+import Canton.Vault.V1
+import Canton.Vault.AsyncDeposit.V1
+import Canton.Vault.AsyncRedeem.V1
+
+-- | An owner's authorization for a delegate to act for them in one vault.
+--
+-- The delegate's actions reach the vault as the owner's, with `actors` set to
+-- the owner, so a vault needs nothing to support it. Each allowance is spent by
+-- every action it covers. The owner revokes it by archiving it, which takes
+-- effect at once.
+template VaultDelegateAuth
+  with
+    owner : Party
+      -- ^ The party the delegate acts for.
+    delegate : Party
+      -- ^ The party acting.
+    vaultRegistrar : Party
+      -- ^ The registrar of the vault the authorization is for.
+    vaultId : Text
+      -- ^ The vault the authorization is for.
+    depositAllowance : Optional Decimal
+      -- ^ The underlying the delegate may still pay in, across deposits, mints
+      -- and deposit requests; `None` if it may not deposit.
+    redeemAllowance : Optional Decimal
+      -- ^ The shares the delegate may still pay out, across withdrawals,
+      -- redemptions and redeem requests; `None` if it may not redeem.
+    expiresAt : Time
+      -- ^ When the authorization stops working.
+    meta : Metadata
+      -- ^ Additional metadata, used for extensibility.
+  where
+    signatory owner
+    observer delegate
+    ensure all (>= 0.0) (optionalToList depositAllowance <> optionalToList redeemAllowance)
+
+    choice VaultDelegateAuth_Deposit : (ContractId VaultDelegateAuth, VaultActionResult)
+      -- ^ `Vault_Deposit` for the owner.
+      with
+        vaultCid : ContractId Vault
+        assets : Decimal
+        receiver : Party
+        minSharesOut : Optional Decimal
+        extraArgs : ExtraArgs
+      controller delegate
+      do
+        requireVault this vaultCid
+        result <- exercise vaultCid Vault_Deposit with assets; receiver; minSharesOut; actors = [owner]; extraArgs
+        left <- spend "deposit" depositAllowance result.assets
+        next <- create this with depositAllowance = left
+        pure (next, result)
+
+    choice VaultDelegateAuth_Mint : (ContractId VaultDelegateAuth, VaultActionResult)
+      -- ^ `Vault_Mint` for the owner.
+      with
+        vaultCid : ContractId Vault
+        shares : Decimal
+        receiver : Party
+        maxAssetsIn : Optional Decimal
+        extraArgs : ExtraArgs
+      controller delegate
+      do
+        requireVault this vaultCid
+        result <- exercise vaultCid Vault_Mint with shares; receiver; maxAssetsIn; actors = [owner]; extraArgs
+        left <- spend "deposit" depositAllowance result.assets
+        next <- create this with depositAllowance = left
+        pure (next, result)
+
+    choice VaultDelegateAuth_Withdraw : (ContractId VaultDelegateAuth, VaultActionResult)
+      -- ^ `Vault_Withdraw` of the owner's shares.
+      with
+        vaultCid : ContractId Vault
+        assets : Decimal
+        receiver : Party
+        maxSharesIn : Optional Decimal
+        extraArgs : ExtraArgs
+      controller delegate
+      do
+        requireVault this vaultCid
+        result <- exercise vaultCid Vault_Withdraw with assets; owner; receiver; maxSharesIn; actors = [owner]; extraArgs
+        left <- spend "redeem" redeemAllowance result.shares
+        next <- create this with redeemAllowance = left
+        pure (next, result)
+
+    choice VaultDelegateAuth_Redeem : (ContractId VaultDelegateAuth, VaultActionResult)
+      -- ^ `Vault_Redeem` of the owner's shares.
+      with
+        vaultCid : ContractId Vault
+        shares : Decimal
+        receiver : Party
+        minAssetsOut : Optional Decimal
+        extraArgs : ExtraArgs
+      controller delegate
+      do
+        requireVault this vaultCid
+        result <- exercise vaultCid Vault_Redeem with shares; owner; receiver; minAssetsOut; actors = [owner]; extraArgs
+        left <- spend "redeem" redeemAllowance result.shares
+        next <- create this with redeemAllowance = left
+        pure (next, result)
+
+    choice VaultDelegateAuth_RequestDeposit : (ContractId VaultDelegateAuth, RequestId)
+      -- ^ `Vault_RequestDeposit` for the owner.
+      with
+        vaultCid : ContractId VaultAsyncDeposit
+        label : Text
+        assets : Decimal
+        receiver : Party
+        minSharesOut : Optional Decimal
+        extraArgs : ExtraArgs
+      controller delegate
+      do
+        requireVault this (toInterfaceContractId vaultCid)
+        left <- spend "deposit" depositAllowance assets
+        requestId <- exercise vaultCid Vault_RequestDeposit with label; assets; receiver; minSharesOut; actors = [owner]; extraArgs
+        next <- create this with depositAllowance = left
+        pure (next, requestId)
+
+    choice VaultDelegateAuth_RequestRedeem : (ContractId VaultDelegateAuth, RequestId)
+      -- ^ `Vault_RequestRedeem` of the owner's shares.
+      with
+        vaultCid : ContractId VaultAsyncRedeem
+        label : Text
+        shares : Decimal
+        receiver : Party
+        minAssetsOut : Optional Decimal
+        extraArgs : ExtraArgs
+      controller delegate
+      do
+        requireVault this (toInterfaceContractId vaultCid)
+        left <- spend "redeem" redeemAllowance shares
+        requestId <- exercise vaultCid Vault_RequestRedeem with label; shares; receiver; minAssetsOut; actors = [owner]; extraArgs
+        next <- create this with redeemAllowance = left
+        pure (next, requestId)
+
+-- | Fails unless the authorization is live and names the vault.
+requireVault : VaultDelegateAuth -> ContractId Vault -> Update ()
+requireVault auth vaultCid = do
+  live <- isLedgerTimeLT auth.expiresAt
+  assertMsg "the authorization has expired" live
+  v <- exercise vaultCid Vault_PublicFetch with actors = [auth.owner]
+  assertMsg "the authorization is for another vault" (v.vaultId == auth.vaultId && v.vaultRegistrar == auth.vaultRegistrar)
+
+-- | What is left of an allowance after spending `amount` of it.
+spend : Text -> Optional Decimal -> Decimal -> Update (Optional Decimal)
+spend what allowance amount = case allowance of
+  None -> fail ("the delegate may not " <> what)
+  Some left -> do
+    assertMsg ("the " <> what <> " allowance is exceeded") (amount <= left)
+    pure (Some (left - amount))

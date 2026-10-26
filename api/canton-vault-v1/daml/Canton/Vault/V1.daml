@@ -4,8 +4,8 @@
 -- holdings against them. Shares are ordinary token standard holdings.
 --
 -- Every vault implements `Vault`. Queued deposits and redemptions are in their
--- own packages, and the types they share are defined here. The event log and
--- delegated access are not defined yet.
+-- own packages, as are the event log and delegated access, and the types they
+-- share are defined here.
 module Canton.Vault.V1 where
 
 import DA.Time (RelTime)
