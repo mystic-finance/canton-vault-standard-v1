@@ -72,8 +72,8 @@ queuedDirectionsHaveNoInstantPath h = eachQueuedDirection h $ \d _ deposits -> d
     refused "an instant withdrawal" =<< perform d [alice] (Withdraw 1.0 me me None)
     refused "an instant redemption" =<< perform d [alice] (Redeem 1.0 me me None)
 
--- | A request publishes allocation requests under the vault's executors, committed no later than the end of its
--- period plus the window, and the vault says when requests are priced.
+-- | A request publishes allocation requests under the vault's executors, committed until the end of its period
+-- plus the window, and the vault says when requests are priced.
 requestsPublishTheirTerms : Harness -> Script ()
 requestsPublishTheirTerms h = eachQueuedDirection h $ \d _ deposits -> do
   alice <- allocateParty "alice"
@@ -83,11 +83,11 @@ requestsPublishTheirTerms h = eachQueuedDirection h $ \d _ deposits -> do
   assertMsg "the async view says when requests are priced" (TextMap.member requestPricingKey async.meta.values)
   r <- succeeded "a request" =<< requestIn d deposits alice alice "terms" 50.0 None
   assertMsg "the request publishes an allocation request" (r.allocationRequests /= [])
-  let latest = addRelTime v.rateValidUntil async.settlementDeadlineWindow
+  let deadline = addRelTime v.rateValidUntil async.settlementDeadlineWindow
   forA_ r.allocationRequests $ \(_, ar) -> do
     assertMsg "the settlement's executors are the vault's" (sameParties ar.settlement.executors async.executors)
     forA_ ar.allocations $ \spec -> case spec.settlementDeadline of
-      Some t -> assertMsg ("committed no later than " <> show latest <> ", not " <> show t) (t <= latest)
+      Some t -> assertMsg ("committed until " <> show deadline <> ", not " <> show t) (t == deadline)
       None -> abort "an allocation is requested with no deadline"
 
 -- | The requester and the receiver each decline through the allocation request, and the executors withdraw it;

@@ -18,8 +18,8 @@ import Canton.Vault.V1
 -- MUST each be able to reject it, and the executors to withdraw it. The escrow
 -- MUST pay the vault's `custodian` account or an account of its
 -- `vaultRegistrar`, an allocation made for one request MUST settle no other,
--- and the escrow's settlement deadline MUST be no later than the end of the
--- request's period plus the vault's `settlementDeadlineWindow`, after which the
+-- and the escrow's settlement deadline MUST be the end of the request's
+-- period plus the vault's `settlementDeadlineWindow`, after which the
 -- requester can withdraw it. A vault SHOULD settle only allocations created by
 -- the underlying's registry.
 --

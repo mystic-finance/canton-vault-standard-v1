@@ -177,7 +177,7 @@ data AsyncView = AsyncView with
       -- ^ The parties who settle and cancel requests: the executors of the
       -- token standard settlement every request's allocations carry.
     settlementDeadlineWindow : RelTime
-      -- ^ The longest a request's escrow stays committed after the end of its
+      -- ^ How long a request's escrow stays committed after the end of its
       -- period: the time the executors have to fill it. Until the deadline
       -- only the executors can settle or cancel it; after it, the requester can
       -- withdraw it.
