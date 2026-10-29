@@ -3,7 +3,7 @@ module Canton.Vault.Test.Guards where
 
 import DA.Assert ((===))
 import DA.Foldable (forA_)
-import DA.Time (addRelTime, hours, seconds)
+import DA.Time (addRelTime, hours, microseconds, seconds)
 import Daml.Script
 
 import Canton.Vault.V1
@@ -11,6 +11,7 @@ import Canton.Vault.Reference.V1
 import Canton.Vault.Reference.Share
 import Splice.Testing.Tokens.TestTokenV2.Holding (Token(..))
 import Canton.Vault.Test.Deposit
+import Canton.Vault.Test.Limits (failsWith)
 import Canton.Vault.Test.MockToken
 import Canton.Vault.Test.Periods
 
@@ -31,8 +32,9 @@ rollRejectsDuplicatePoolHoldings = script do
   flows <- query @PeriodFlow f.registrar
   now <- getTime
   let dup = map (toInterfaceContractId . fst) pool
+  closed2 <- closePeriod f f.vaultTemplateCid
   submitMustFail (actAs f.registrar <> discloseMany ds) do
-    exerciseCmd f.vaultTemplateCid ReferenceVault_OpenPeriod with
+    exerciseCmd closed2 ClosedPeriod_Open with
       flowCids = map fst flows
       poolHoldingCids = dup <> dup
       validUntil = addRelTime now (hours 2)
@@ -42,7 +44,7 @@ rollRejectsFlowsFromAnotherVault : Script ()
 rollRejectsFlowsFromAnotherVault = script do
   f <- setupVault
   now <- getTime
-  sibling <- submitMulti [f.registrar, f.custodian] [] do
+  sibling <- submit (actAs [f.registrar, f.custodian]) do
     createCmd ReferenceVault with
       vaultId = "reference-2"
       vaultRegistrar = f.registrar
@@ -57,6 +59,9 @@ rollRejectsFlowsFromAnotherVault = script do
       rateValidFrom = now
       rateValidUntil = addRelTime now (hours 1)
       depositCap = None
+      paused = False
+      underlyingTransferFactory = f.registryCid
+      priceLimits = wideLimits
 
   _ <- deposit f f.vaultTemplateCid f.alice 100.0
   _ <- deposit f sibling f.alice 500.0
@@ -64,35 +69,40 @@ rollRejectsFlowsFromAnotherVault = script do
   flows <- query @PeriodFlow f.registrar
   pool <- query @MockHolding f.custodian
   ds <- poolDisclosures f
+  closed3 <- closePeriod f f.vaultTemplateCid
   submitMustFail (actAs f.registrar <> discloseMany ds) do
-    exerciseCmd f.vaultTemplateCid ReferenceVault_OpenPeriod with
+    exerciseCmd closed3 ClosedPeriod_Open with
       flowCids = map fst flows
       poolHoldingCids = map (toInterfaceContractId . fst) pool
       validUntil = addRelTime now (hours 2)
 
--- | Flows left open by a roll cannot be replayed in the next period.
-rollRejectsFlowsFromAnEarlierPeriod : Script ()
-rollRejectsFlowsFromAnEarlierPeriod = script do
+-- | A flow a roll left out is still uncounted, so the next roll folds it in.
+aFlowLeftOutOfARollCountsInTheNext : Script ()
+aFlowLeftOutOfARollCountsInTheNext = script do
   f <- setupVault
   _ <- deposit f f.vaultTemplateCid f.alice 100.0
   stale <- query @PeriodFlow f.registrar
-
   pool <- query @MockHolding f.custodian
   ds <- poolDisclosures f
-  -- The next period must start later than the flows above, or they still match.
   passTime (seconds 1)
   now <- getTime
+  closed4 <- closePeriod f f.vaultTemplateCid
   rolled <- submit (actAs f.registrar <> discloseMany ds) do
-    exerciseCmd f.vaultTemplateCid ReferenceVault_OpenPeriod with
+    exerciseCmd closed4 ClosedPeriod_Open with
       flowCids = []
       poolHoldingCids = map (toInterfaceContractId . fst) pool
       validUntil = addRelTime now (hours 2)
+  Some missed <- queryContractId f.registrar rolled
+  missed.totalShares === 0.0
 
-  submitMustFail (actAs f.registrar <> discloseMany ds) do
-    exerciseCmd rolled ReferenceVault_OpenPeriod with
+  closed5 <- closePeriod f rolled
+  caught <- submit (actAs f.registrar <> discloseMany ds) do
+    exerciseCmd closed5 ClosedPeriod_Open with
       flowCids = map fst stale
       poolHoldingCids = map (toInterfaceContractId . fst) pool
       validUntil = addRelTime now (hours 3)
+  Some vault <- queryContractId f.registrar caught
+  vault.totalShares === 100.0
 
 -- | A period must end in the future, or the vault opens already closed.
 rollRejectsAPeriodEndingInThePast : Script ()
@@ -101,8 +111,9 @@ rollRejectsAPeriodEndingInThePast = script do
   pool <- query @MockHolding f.custodian
   ds <- poolDisclosures f
   now <- getTime
+  closed6 <- closePeriod f f.vaultTemplateCid
   submitMustFail (actAs f.registrar <> discloseMany ds) do
-    exerciseCmd f.vaultTemplateCid ReferenceVault_OpenPeriod with
+    exerciseCmd closed6 ClosedPeriod_Open with
       flowCids = []
       poolHoldingCids = map (toInterfaceContractId . fst) pool
       validUntil = addRelTime now (seconds (-1))
@@ -110,14 +121,17 @@ rollRejectsAPeriodEndingInThePast = script do
 -- Period expiry
 -----------------
 
--- | Once the period has ended the vault refuses to transact at a stale rate.
+-- | The period is open up to, not at, its end; past it the vault refuses to transact at a stale rate.
 actionsFailAfterThePeriodEnds : Script ()
 actionsFailAfterThePeriodEnds = script do
   f <- setupVault
+  Some vault <- queryContractId f.registrar f.vaultTemplateCid
+  setTime (addRelTime vault.rateValidUntil (microseconds (-1)))
+  _ <- deposit f f.vaultTemplateCid f.alice 100.0
   ds <- disclosuresFor f f.vaultTemplateCid
   funds <- fund f f.alice 100.0
-  passTime (hours 2)
-  submitWithDisclosuresMustFail f.alice ds do
+  setTime vault.rateValidUntil
+  failsWith "rate period is still open" =<< trySubmit (actAs f.alice <> discloseMany ds) do
     exerciseCmd (toInterfaceContractId f.vaultTemplateCid : ContractId Vault) Vault_Deposit with
       assets = 100.0
       receiver = f.alice
@@ -134,7 +148,7 @@ depositOverTheCapIsRejected = script do
   f <- setupCappedVault 50.0
   ds <- disclosuresFor f f.vaultTemplateCid
   funds <- fund f f.alice 100.0
-  submitWithDisclosuresMustFail f.alice ds do
+  submitMustFail (actAs f.alice <> discloseMany ds) do
     exerciseCmd (toInterfaceContractId f.vaultTemplateCid : ContractId Vault) Vault_Deposit with
       assets = 100.0
       receiver = f.alice
@@ -150,7 +164,7 @@ nonPositiveAmountsAreRejected = script do
   funds <- fund f f.alice 100.0
   let vaultCid : ContractId Vault = toInterfaceContractId f.vaultTemplateCid
 
-  submitWithDisclosuresMustFail f.alice ds do
+  submitMustFail (actAs f.alice <> discloseMany ds) do
     exerciseCmd vaultCid Vault_Mint with
       shares = 0.0
       receiver = f.alice
@@ -158,7 +172,7 @@ nonPositiveAmountsAreRejected = script do
       actors = [f.alice]
       extraArgs = depositArgs f [funds]
 
-  submitWithDisclosuresMustFail f.alice ds do
+  submitMustFail (actAs f.alice <> discloseMany ds) do
     exerciseCmd vaultCid Vault_Withdraw with
       assets = 0.0
       owner = f.alice
@@ -167,7 +181,7 @@ nonPositiveAmountsAreRejected = script do
       actors = [f.alice]
       extraArgs = depositArgs f [funds]
 
-  submitWithDisclosuresMustFail f.alice ds do
+  submitMustFail (actAs f.alice <> discloseMany ds) do
     exerciseCmd vaultCid Vault_Redeem with
       shares = 0.0
       owner = f.alice
@@ -186,7 +200,7 @@ depositMintingZeroSharesIsRejected = script do
   rolled <- rollPeriod f f.vaultTemplateCid
   ds <- disclosuresFor f rolled
   funds <- fund f f.alice 0.0000000001
-  submitWithDisclosuresMustFail f.alice ds do
+  submitMustFail (actAs f.alice <> discloseMany ds) do
     exerciseCmd (toInterfaceContractId rolled : ContractId Vault) Vault_Deposit with
       assets = 0.0000000001
       receiver = f.alice
@@ -214,7 +228,7 @@ withdrawRequiresTheOwner = script do
       Some d' -> pure d'
       None -> abort "share disclosure not available"
 
-  submitWithDisclosuresMustFail mallory (ds <> poolDs <> shareDs) do
+  submitMustFail (actAs mallory <> discloseMany (ds <> poolDs <> shareDs)) do
     exerciseCmd (toInterfaceContractId rolled : ContractId Vault) Vault_Withdraw with
       assets = 50.0
       owner = f.alice
@@ -239,7 +253,7 @@ redeemBeyondTheNamedHoldingsIsRejected = script do
   poolDs <- poolDisclosures f
   aliceShares <- query @ShareHolding f.alice
 
-  submitWithDisclosuresMustFail f.alice (ds <> poolDs) do
+  submitMustFail (actAs f.alice <> discloseMany (ds <> poolDs)) do
     exerciseCmd (toInterfaceContractId rolled : ContractId Vault) Vault_Redeem with
       shares = first.shares
       owner = f.alice
@@ -261,8 +275,8 @@ lockedSharesCannotBeRedeemed = script do
 
   -- Re-issue Alice's shares locked.
   aliceShares <- query @ShareHolding f.alice
-  forA_ aliceShares $ \(cid, _) -> submitMulti [f.alice, f.registrar] [] (archiveCmd cid)
-  lockedCid <- submitMulti [f.alice, f.registrar] [] do
+  forA_ aliceShares $ \(cid, _) -> submit (actAs [f.alice, f.registrar]) (archiveCmd cid)
+  lockedCid <- submit (actAs [f.alice, f.registrar]) do
     createCmd Token with
       holding = V2.HoldingView with
         account = basicAccount f.alice
@@ -275,7 +289,7 @@ lockedSharesCannotBeRedeemed = script do
           context = None
         meta = emptyMetadata
 
-  submitWithDisclosuresMustFail f.alice (ds <> poolDs) do
+  submitMustFail (actAs f.alice <> discloseMany (ds <> poolDs)) do
     exerciseCmd (toInterfaceContractId rolled : ContractId Vault) Vault_Redeem with
       shares = first.shares
       owner = f.alice
@@ -290,7 +304,7 @@ mintOverTheCapIsRejected = script do
   f <- setupCappedVault 50.0
   ds <- disclosuresFor f f.vaultTemplateCid
   funds <- fund f f.alice 100.0
-  submitWithDisclosuresMustFail f.alice ds do
+  submitMustFail (actAs f.alice <> discloseMany ds) do
     exerciseCmd (toInterfaceContractId f.vaultTemplateCid : ContractId Vault) Vault_Mint with
       shares = 100.0
       receiver = f.alice
@@ -306,7 +320,7 @@ rollRejectsLockedPoolHoldings = script do
 
   -- Re-issue the pool locked.
   pool <- query @MockHolding f.custodian
-  forA_ pool $ \(cid, _) -> submitMulti [f.underlyingAdmin, f.custodian] [] (archiveCmd cid)
+  forA_ pool $ \(cid, _) -> submit (actAs [f.underlyingAdmin, f.custodian]) (archiveCmd cid)
   lockedCid <- submit f.underlyingAdmin do
     createCmd MockHolding with
       holding = V2.HoldingView with
@@ -323,10 +337,11 @@ rollRejectsLockedPoolHoldings = script do
   lockedDs <- queryDisclosure f.custodian lockedCid
   flows <- query @PeriodFlow f.registrar
   now <- getTime
+  closed7 <- closePeriod f f.vaultTemplateCid
   case lockedDs of
     None -> abort "disclosure not available"
     Some d -> submitMustFail (actAs f.registrar <> discloseMany [d]) do
-      exerciseCmd f.vaultTemplateCid ReferenceVault_OpenPeriod with
+      exerciseCmd closed7 ClosedPeriod_Open with
         flowCids = map fst flows
         poolHoldingCids = [toInterfaceContractId lockedCid]
         validUntil = addRelTime now (hours 2)
@@ -343,7 +358,7 @@ burningTheWrongInstrumentIsRejected = script do
 
   -- Shares of a different instrument, in Alice's own account.
   let other = V2.InstrumentId with admin = f.registrar; id = "vEUR"
-  otherCid <- submitMulti [f.alice, f.registrar] [] do
+  otherCid <- submit (actAs [f.alice, f.registrar]) do
     createCmd Token with
       holding = V2.HoldingView with
         account = basicAccount f.alice
@@ -352,7 +367,7 @@ burningTheWrongInstrumentIsRejected = script do
         lock = None
         meta = emptyMetadata
 
-  submitWithDisclosuresMustFail f.alice (ds <> poolDs) do
+  submitMustFail (actAs f.alice <> discloseMany (ds <> poolDs)) do
     exerciseCmd (toInterfaceContractId rolled : ContractId Vault) Vault_Redeem with
       shares = first.shares
       owner = f.alice
@@ -369,7 +384,7 @@ redemptionReturningNothingIsRejected = script do
 
   -- The pool loses almost everything, so the next roll prices it far below par.
   pool <- query @MockHolding f.custodian
-  forA_ pool $ \(cid, _) -> submitMulti [f.underlyingAdmin, f.custodian] [] (archiveCmd cid)
+  forA_ pool $ \(cid, _) -> submit (actAs [f.underlyingAdmin, f.custodian]) (archiveCmd cid)
   _ <- submit f.underlyingAdmin do
     createCmd MockHolding with
       holding = V2.HoldingView with
@@ -385,7 +400,7 @@ redemptionReturningNothingIsRejected = script do
   shrunk <- query @MockHolding f.custodian
   aliceShares <- query @ShareHolding f.alice
 
-  submitWithDisclosuresMustFail f.alice (ds <> poolDs) do
+  submitMustFail (actAs f.alice <> discloseMany (ds <> poolDs)) do
     exerciseCmd (toInterfaceContractId rolled : ContractId Vault) Vault_Redeem with
       shares = 0.0000000001
       owner = f.alice
@@ -431,7 +446,7 @@ maxRedeemRejectsTheWrongInstrument = script do
   f <- setupVault
   _ <- deposit f f.vaultTemplateCid f.alice 100.0
   let other = V2.InstrumentId with admin = f.registrar; id = "vEUR"
-  otherCid <- submitMulti [f.alice, f.registrar] [] do
+  otherCid <- submit (actAs [f.alice, f.registrar]) do
     createCmd Token with
       holding = V2.HoldingView with
         account = basicAccount f.alice
@@ -451,8 +466,8 @@ maxRedeemRejectsALockedShareHolding = script do
   f <- setupVault
   _ <- deposit f f.vaultTemplateCid f.alice 100.0
   aliceShares <- query @ShareHolding f.alice
-  forA_ aliceShares $ \(cid, _) -> submitMulti [f.alice, f.registrar] [] (archiveCmd cid)
-  lockedCid <- submitMulti [f.alice, f.registrar] [] do
+  forA_ aliceShares $ \(cid, _) -> submit (actAs [f.alice, f.registrar]) (archiveCmd cid)
+  lockedCid <- submit (actAs [f.alice, f.registrar]) do
     createCmd Token with
       holding = V2.HoldingView with
         account = basicAccount f.alice
@@ -481,7 +496,7 @@ rollRejectsNegativeShares = script do
   poolDs <- poolDisclosures f
   pool <- query @MockHolding f.custodian
   aliceShares <- map fst <$> query @ShareHolding f.alice
-  _ <- submitWithDisclosures f.alice (ds <> poolDs) do
+  _ <- submit (actAs f.alice <> discloseMany (ds <> poolDs)) do
     exerciseCmd (toInterfaceContractId f.vaultTemplateCid : ContractId Vault) Vault_Redeem with
       shares = first.shares
       owner = f.alice
@@ -495,8 +510,9 @@ rollRejectsNegativeShares = script do
   emptied <- query @MockHolding f.custodian
   ds' <- poolDisclosures f
   now <- getTime
+  closed8 <- closePeriod f f.vaultTemplateCid
   submitMustFail (actAs f.registrar <> discloseMany ds') do
-    exerciseCmd f.vaultTemplateCid ReferenceVault_OpenPeriod with
+    exerciseCmd closed8 ClosedPeriod_Open with
       flowCids = redemptions
       poolHoldingCids = map (toInterfaceContractId . fst) emptied
       validUntil = addRelTime now (hours 2)
@@ -516,7 +532,7 @@ mintWithdrawAndRedeemFailAfterThePeriodEnds = script do
       poolCids = map (toInterfaceContractId . fst) pool
   passTime (hours 2)
 
-  submitWithDisclosuresMustFail f.alice (ds <> poolDs) do
+  submitMustFail (actAs f.alice <> discloseMany (ds <> poolDs)) do
     exerciseCmd vaultCid Vault_Mint with
       shares = 10.0
       receiver = f.alice
@@ -524,7 +540,7 @@ mintWithdrawAndRedeemFailAfterThePeriodEnds = script do
       actors = [f.alice]
       extraArgs = depositArgs f [funds]
 
-  submitWithDisclosuresMustFail f.alice (ds <> poolDs) do
+  submitMustFail (actAs f.alice <> discloseMany (ds <> poolDs)) do
     exerciseCmd vaultCid Vault_Withdraw with
       assets = 10.0
       owner = f.alice
@@ -533,7 +549,7 @@ mintWithdrawAndRedeemFailAfterThePeriodEnds = script do
       actors = [f.alice]
       extraArgs = redeemArgs f poolCids aliceShares
 
-  submitWithDisclosuresMustFail f.alice (ds <> poolDs) do
+  submitMustFail (actAs f.alice <> discloseMany (ds <> poolDs)) do
     exerciseCmd vaultCid Vault_Redeem with
       shares = 10.0
       owner = f.alice
@@ -559,8 +575,9 @@ rollRejectsPoolHoldingsOutsideTheCustodianAccount = script do
   outsideD <- case outsideDs of
     Some d -> pure d
     None -> abort "holding disclosure not available"
+  closed9 <- closePeriod f f.vaultTemplateCid
   submitMustFail (actAs f.registrar <> discloseMany (ds <> [outsideD])) do
-    exerciseCmd f.vaultTemplateCid ReferenceVault_OpenPeriod with
+    exerciseCmd closed9 ClosedPeriod_Open with
       flowCids = map fst flows
       poolHoldingCids = map (toInterfaceContractId . fst) pool <> [outside]
       validUntil = addRelTime now (hours 2)
@@ -571,7 +588,7 @@ burningFromAnotherAccountIsRejected = script do
   f <- setupVault
   first <- deposit f f.vaultTemplateCid f.alice 100.0
   let other = V2.Account with owner = Some f.alice; provider = None; id = "sub"
-  otherCid <- submitMulti [f.alice, f.registrar] [] do
+  otherCid <- submit (actAs [f.alice, f.registrar]) do
     createCmd Token with
       holding = V2.HoldingView with
         account = other
@@ -585,7 +602,7 @@ burningFromAnotherAccountIsRejected = script do
   poolDs <- poolDisclosures f
   pool <- query @MockHolding f.custodian
 
-  submitWithDisclosuresMustFail f.alice (ds <> poolDs) do
+  submitMustFail (actAs f.alice <> discloseMany (ds <> poolDs)) do
     exerciseCmd (toInterfaceContractId rolled : ContractId Vault) Vault_Redeem with
       shares = 10.0
       owner = f.alice
@@ -593,3 +610,120 @@ burningFromAnotherAccountIsRejected = script do
       minAssetsOut = None
       actors = [f.alice]
       extraArgs = redeemArgs f (map (toInterfaceContractId . fst) pool) [otherCid]
+
+-- | A payout takes only the holdings it needs, so a dust redemption leaves the rest of the pool alone.
+payoutTakesOnlyTheHoldingsItNeeds : Script ()
+payoutTakesOnlyTheHoldingsItNeeds = script do
+  f <- setupVault
+  bob <- allocateParty "bob"
+  _ <- deposit f f.vaultTemplateCid f.alice 100.0
+  _ <- deposit f f.vaultTemplateCid bob 100.0
+  pool <- query @MockHolding f.custodian
+  spare <- case pool of
+    [_, (cid, _)] -> pure cid
+    _ -> abort "expected two pool holdings"
+  ds <- disclosuresFor f f.vaultTemplateCid
+  poolDs <- poolDisclosures f
+  bobShares <- map fst <$> query @ShareHolding bob
+  _ <- submit (actAs bob <> discloseMany (ds <> poolDs)) do
+    exerciseCmd (toInterfaceContractId f.vaultTemplateCid : ContractId Vault) Vault_Redeem with
+      shares = 1.0
+      owner = bob
+      receiver = bob
+      minAssetsOut = None
+      actors = [bob]
+      extraArgs = redeemArgs f (map (toInterfaceContractId . fst) pool) bobShares
+  Some _ <- queryContractId f.custodian spare
+  pure ()
+
+-- | A factory the caller names is ignored, so one that reports a transfer it never made mints nothing.
+callerNamedFactoryCannotFakeADeposit : Script ()
+callerNamedFactoryCannotFakeADeposit = script do
+  f <- setupVault
+  mallory <- allocateParty "mallory"
+  ds <- vaultDisclosure f
+  forged <- submit mallory do
+    createCmd ForgedFactory with owner = mallory; claimedAdmin = f.underlyingAdmin; drain = None
+  submitMustFail (actAs mallory <> discloseMany ds) do
+    exerciseCmd f.vaultCid Vault_Deposit with
+      assets = 1000.0
+      receiver = mallory
+      minSharesOut = None
+      actors = [mallory]
+      extraArgs = withFactory (toInterfaceContractId forged) (depositArgs f [])
+
+-- | A factory the caller names is ignored, so a dust redemption cannot lend it the custodian's authority.
+callerNamedFactoryCannotDrainThePool : Script ()
+callerNamedFactoryCannotDrainThePool = script do
+  f <- setupVault
+  mallory <- allocateParty "mallory"
+  _ <- deposit f f.vaultTemplateCid f.alice 10000.0
+  _ <- deposit f f.vaultTemplateCid mallory 1.0
+  pool <- query @MockHolding f.custodian
+  poolDs <- poolDisclosures f
+  let poolCids = map (toInterfaceContractId . fst) pool
+  forged <- submit mallory do
+    createCmd ForgedFactory with
+      owner = mallory
+      claimedAdmin = f.underlyingAdmin
+      drain = Some (f.registryCid, poolCids, 10001.0)
+  ds <- disclosuresFor f f.vaultTemplateCid
+  malloryShares <- map fst <$> query @ShareHolding mallory
+  _ <- submit (actAs mallory <> discloseMany (ds <> poolDs)) do
+    exerciseCmd f.vaultCid Vault_Redeem with
+      shares = 0.5
+      owner = mallory
+      receiver = mallory
+      minAssetsOut = None
+      actors = [mallory]
+      extraArgs = withFactory (toInterfaceContractId forged) (redeemArgs f poolCids malloryShares)
+  left <- map ((.holding.amount) . snd) <$> query @MockHolding f.custodian
+  sum left === 10000.5
+
+
+-- Merging flows
+-----------------
+
+-- | Merged flows roll to the same totals as the flows they replace.
+mergedFlowsRollTheSame : Script ()
+mergedFlowsRollTheSame = script do
+  f <- setupVault
+  forA_ [100.0, 50.0, 25.0] $ \amount -> deposit f f.vaultTemplateCid f.alice amount
+  first :: rest <- map fst <$> query @PeriodFlow f.registrar
+  _ <- submit f.registrar (exerciseCmd first PeriodFlow_Merge with flowCids = rest)
+  merged <- map snd <$> query @PeriodFlow f.registrar
+  map (\flow -> (flow.assetsDelta, flow.sharesDelta)) merged === [(175.0, 175.0)]
+  rolled <- rollPeriod f f.vaultTemplateCid
+  Some vault <- queryContractId f.registrar rolled
+  (vault.totalShares, vault.totalAssets) === (175.0, 175.0)
+
+-- | A sibling vault's flow, readable under a shared registrar, is not merged into this vault's.
+mergeRefusesAnotherVaultsFlow : Script ()
+mergeRefusesAnotherVaultsFlow = script do
+  f <- setupVault
+  now <- getTime
+  sibling <- submit (actAs [f.registrar, f.custodian]) do
+    createCmd ReferenceVault with
+      vaultId = "reference-2"
+      vaultRegistrar = f.registrar
+      custodian = f.custodian
+      underlyingInstrument = f.underlying
+      shareInstrument = f.shares with id = "reference-2"
+      totalShares = 0.0
+      totalAssets = 0.0
+      accrual = None
+      depositFeeBps = 0
+      redeemFeeBps = 0
+      rateValidFrom = now
+      rateValidUntil = addRelTime now (hours 1)
+      depositCap = None
+      paused = False
+      underlyingTransferFactory = f.registryCid
+      priceLimits = wideLimits
+  _ <- deposit f f.vaultTemplateCid f.alice 100.0
+  _ <- deposit f sibling f.alice 500.0
+  flows <- query @PeriodFlow f.registrar
+  [ours] <- pure [cid | (cid, flow) <- flows, flow.vaultId == "reference-1"]
+  let theirs = [cid | (cid, flow) <- flows, flow.vaultId == "reference-2"]
+  submitMustFail f.registrar do
+    exerciseCmd ours PeriodFlow_Merge with flowCids = theirs

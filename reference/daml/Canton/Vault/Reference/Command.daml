@@ -1,0 +1,72 @@
+-- | Actions signed ahead and run later at whichever period is open, for slow signers.
+module Canton.Vault.Reference.Command where
+
+import DA.Time (isLedgerTimeLT)
+
+import Canton.Vault.V1
+import Canton.Vault.Reference.V1
+
+import Splice.Api.Token.MetadataV1
+import Splice.TokenStandard.Utils
+
+data CommandAction
+  = DepositCommand with
+      assets : Decimal
+      receiver : Party
+      minSharesOut : Optional Decimal
+  | MintCommand with
+      shares : Decimal
+      receiver : Party
+      maxAssetsIn : Optional Decimal
+  | WithdrawCommand with
+      assets : Decimal
+      owner : Party
+      receiver : Party
+      maxSharesIn : Optional Decimal
+  | RedeemCommand with
+      shares : Decimal
+      owner : Party
+      receiver : Party
+      minAssetsOut : Optional Decimal
+  deriving (Eq, Show, Serializable)
+
+-- | An action the actors signed, priced only when the executor runs it.
+template VaultCommand
+  with
+    actors : [Party]
+      -- ^ The parties who signed the command and act in the vault action.
+    executor : Party
+      -- ^ The party who runs the command.
+    vaultId : Text
+    vaultRegistrar : Party
+    action : CommandAction
+    expiresAt : Time
+      -- ^ The time after which the command can no longer run.
+  where
+    signatory actors
+    observer executor
+    ensure actors /= []
+
+    choice VaultCommand_Execute : VaultActionResult
+      with
+        vaultCid : ContractId ReferenceVault
+        extraArgs : ExtraArgs
+      controller executor
+      do
+        live <- isLedgerTimeLT expiresAt
+        require "command has not expired" live
+        vault <- exercise vaultCid ReferenceVault_Fetch with caller = executor
+        require' ("vault.vaultId", vault.vaultId) isEqualR ("vaultId", vaultId)
+        require' ("vault.vaultRegistrar", vault.vaultRegistrar) isEqualR ("vaultRegistrar", vaultRegistrar)
+        let cid : ContractId Vault = toInterfaceContractId vaultCid
+        case action of
+          DepositCommand{..} -> exercise cid Vault_Deposit with assets; receiver; minSharesOut; actors; extraArgs
+          MintCommand{..} -> exercise cid Vault_Mint with shares; receiver; maxAssetsIn; actors; extraArgs
+          WithdrawCommand{..} -> exercise cid Vault_Withdraw with assets; owner; receiver; maxSharesIn; actors; extraArgs
+          RedeemCommand{..} -> exercise cid Vault_Redeem with shares; owner; receiver; minAssetsOut; actors; extraArgs
+
+    choice VaultCommand_Cancel : ()
+      with
+        actor : Party
+      controller actor
+      do require' ("actor", actor) isMemberR ("actors", actors)

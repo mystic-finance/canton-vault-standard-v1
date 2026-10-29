@@ -161,7 +161,9 @@ template PendingInstruction
         availableActions = mempty
         meta = emptyMetadata
 
-      transferInstruction_acceptImpl _self _arg = abort "not needed"
+      transferInstruction_acceptImpl _self arg = do
+        require "the receiver accepts" (all (`elem` arg.actors) (regularAccountParties transfer.receiver))
+        settleTransfer transfer
       transferInstruction_rejectImpl _self _arg = abort "not needed"
       transferInstruction_withdrawImpl _self _arg = abort "not needed"
       transferInstruction_acceptExtraObservers _arg = []
@@ -189,6 +191,43 @@ template FreeMintRegistry
           senderChangeCids = []
           meta = emptyMetadata
 
+-- | A factory claiming another's admin: reports a completed transfer, moving nothing or draining through the real one.
+template ForgedFactory
+  with
+    owner : Party
+    claimedAdmin : Party
+    drain : Optional (ContractId V2.TransferFactory, [ContractId V2.Holding], Decimal)
+  where
+    signatory owner
+
+    interface instance V2.TransferFactory for ForgedFactory where
+      view = V2.TransferFactoryView with
+        admin = claimedAdmin
+        meta = emptyMetadata
+
+      transferFactory_publicFetchImpl = publicFetchDefaultImpl this
+      transferFactory_transferExtraObservers _arg = []
+
+      transferFactory_transferImpl _self arg = do
+        case drain of
+          Some (real, pool, amount) -> do
+            _ <- exercise real V2.TransferFactory_Transfer with
+              transfer = arg.transfer with receiver = basicAccount owner; amount; inputHoldingCids = pool
+              actors = arg.actors
+              extraArgs = arg.extraArgs
+            pure ()
+          None -> pure ()
+        pure V2.TransferInstructionResult with
+          output = V2.TransferInstructionResult_Completed with receiverHoldingCids = []
+          senderChangeCids = []
+          meta = emptyMetadata
+
+-- | The arguments with a factory named the way callers once named one.
+withFactory : ContractId V2.TransferFactory -> ExtraArgs -> ExtraArgs
+withFactory factory args = args with
+  context = args.context with
+    values = TextMap.insert "cantonVaultV1/underlyingTransferFactory" (AV_ContractId (toAnyContractId factory)) args.context.values
+
 -- | Reaches the read methods on-ledger, exercised by the registrar.
 template MaxRedeemProbe
   with
@@ -205,6 +244,16 @@ template MaxRedeemProbe
       do
         vault <- fetch vaultCid
         maxMint vault party extraArgs
+
+    choice Probe_MaxWithdraw : Decimal
+      with
+        vaultCid : ContractId Vault
+        party : Party
+        extraArgs : ExtraArgs
+      controller caller
+      do
+        vault <- fetch vaultCid
+        maxWithdraw vault party extraArgs
 
     choice Probe_ConvertToAssets : Decimal
       with

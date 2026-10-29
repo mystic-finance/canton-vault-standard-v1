@@ -4,10 +4,8 @@ module Canton.Vault.Test.Edges where
 import DA.Assert ((===))
 import Daml.Script
 
-import Canton.Vault.Reference.V1
 import Canton.Vault.Test.Conformance
 import Canton.Vault.Test.Deposit
-import Canton.Vault.Test.MockToken
 import Canton.Vault.Test.Periods
 
 fixed : Fixture -> State

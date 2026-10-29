@@ -1,0 +1,126 @@
+-- | How far a roll may move the price on the registrar's word, and how it moves further.
+module Canton.Vault.Test.Limits where
+
+import DA.Assert ((===))
+import DA.Foldable (forA_)
+import DA.Text qualified as T
+import DA.Time (addRelTime, hours)
+import Daml.Script
+
+import Canton.Vault.Reference.V1
+import Canton.Vault.Test.Deposit
+import Canton.Vault.Test.MockToken
+import Canton.Vault.Test.Periods
+
+import Splice.Api.Token.HoldingV2 qualified as V2
+
+-- | Lido's limits: a rise of 10% a year, pro rata, and a one-off fall of 5%.
+lidoLimits : PriceLimits
+lidoLimits = PriceLimits with maxIncreaseBpsPerYear = 1000; maxDecreaseBps = 500
+
+failsWith : Text -> Either SubmitError a -> Script ()
+failsWith reason result = case result of
+  Left e | reason `T.isInfixOf` show e -> pure ()
+  Left e -> abort ("refused for another reason than '" <> reason <> "': " <> show e)
+  Right _ -> abort ("accepted, though it should be refused: " <> reason)
+
+-- | A one-hour vault under Lido's limits holding 100, with 100 shares in issue.
+setupLimited : Script Fixture
+setupLimited = do
+  f <- setupVaultLimited lidoLimits 0 0 None None
+  _ <- deposit f f.vaultTemplateCid f.alice 100.0
+  pure f
+
+-- | A closed period with what its opening will take.
+data Roll = Roll with
+  closed : ContractId ClosedPeriod
+  flowCids : [ContractId PeriodFlow]
+  poolHoldingCids : [ContractId V2.Holding]
+  validUntil : Time
+  ds : [Disclosure]
+
+closeForRoll : Fixture -> ContractId ReferenceVault -> Script Roll
+closeForRoll f vaultCid = do
+  flows <- query @PeriodFlow f.registrar
+  pool <- query @MockHolding f.custodian
+  ds <- poolDisclosures f
+  now <- getTime
+  closed <- closePeriod f vaultCid
+  pure Roll with
+    closed
+    flowCids = map fst flows
+    poolHoldingCids = map (toInterfaceContractId . fst) pool
+    validUntil = addRelTime now (hours 1)
+    ds
+
+openAs : [Party] -> Roll -> Script (Either SubmitError (ContractId ReferenceVault))
+openAs parties r = trySubmit (actAs parties <> discloseMany r.ds) do
+  exerciseCmd r.closed ClosedPeriod_Open with
+    flowCids = r.flowCids; poolHoldingCids = r.poolHoldingCids; validUntil = r.validUntil
+
+openBeyondAs : [Party] -> Roll -> Script (Either SubmitError (ContractId ReferenceVault))
+openBeyondAs parties r = trySubmit (actAs parties <> discloseMany r.ds) do
+  exerciseCmd r.closed ClosedPeriod_OpenBeyondLimits with
+    flowCids = r.flowCids; poolHoldingCids = r.poolHoldingCids; validUntil = r.validUntil
+
+-- | Replaces the pool with the given fraction of it.
+shrinkPoolTo : Fixture -> Decimal -> Script ()
+shrinkPoolTo f fraction = do
+  pool <- query @MockHolding f.custodian
+  let total = sum [h.holding.amount | (_, h) <- pool]
+  forA_ pool $ \(cid, _) -> submit (actAs [f.underlyingAdmin, f.custodian]) (archiveCmd cid)
+  _ <- fund f f.custodian (total * fraction)
+  pure ()
+
+-- | Yield within a year's 10%, pro rata for the hour, rolls on the registrar's word.
+aRollWithinTheLimitsNeedsOnlyTheRegistrar : Script ()
+aRollWithinTheLimitsNeedsOnlyTheRegistrar = script do
+  f <- setupLimited
+  _ <- fund f f.custodian 0.00001
+  Right rolled <- openAs [f.registrar] =<< closeForRoll f f.vaultTemplateCid
+  Some vault <- queryContractId f.registrar rolled
+  vault.totalAssets === 100.00001
+
+-- | A 10% rise in an hour is far beyond 10% a year, so the registrar alone cannot roll it.
+aRiseBeyondTheLimitIsRefused : Script ()
+aRiseBeyondTheLimitIsRefused = script do
+  f <- setupLimited
+  _ <- fund f f.custodian 10.0
+  failsWith "the price rises within the vault's limit" =<< openAs [f.registrar] =<< closeForRoll f f.vaultTemplateCid
+
+aFallBeyondTheLimitIsRefused : Script ()
+aFallBeyondTheLimitIsRefused = script do
+  f <- setupLimited
+  shrinkPoolTo f 0.9
+  failsWith "the price falls within the vault's limit" =<< openAs [f.registrar] =<< closeForRoll f f.vaultTemplateCid
+
+-- | A real move beyond the limits rolls when the custodian agrees too, and not on the registrar's word.
+registrarAndCustodianRollBeyondTheLimits : Script ()
+registrarAndCustodianRollBeyondTheLimits = script do
+  f <- setupLimited
+  shrinkPoolTo f 0.9
+  r <- closeForRoll f f.vaultTemplateCid
+  failsWith "requires authorizers" =<< openBeyondAs [f.registrar] r
+  Right rolled <- openBeyondAs [f.registrar, f.custodian] r
+  Some vault <- queryContractId f.registrar rolled
+  (vault.totalShares, vault.totalAssets) === (100.0, 90.0)
+
+-- | The limits change only with the custodian, and then govern the next roll.
+limitsChangeOnlyWithTheCustodian : Script ()
+limitsChangeOnlyWithTheCustodian = script do
+  f <- setupLimited
+  let wider = lidoLimits with maxDecreaseBps = 2000
+  failsWith "requires authorizers" =<< trySubmit (actAs f.registrar) do
+    exerciseCmd f.vaultTemplateCid ReferenceVault_SetPriceLimits with limits = wider
+  widened <- submit (actAs [f.registrar, f.custodian]) do
+    exerciseCmd f.vaultTemplateCid ReferenceVault_SetPriceLimits with limits = wider
+  shrinkPoolTo f 0.9
+  Right _ <- openAs [f.registrar] =<< closeForRoll f widened
+  pure ()
+
+invalidLimitsAreRefused : Script ()
+invalidLimitsAreRefused = script do
+  f <- setupLimited
+  forA_ [(lidoLimits with maxDecreaseBps = 10001), (lidoLimits with maxIncreaseBpsPerYear = -1)] $ \limits ->
+    submitMustFail (actAs [f.registrar, f.custodian]) do
+      exerciseCmd f.vaultTemplateCid ReferenceVault_SetPriceLimits with limits

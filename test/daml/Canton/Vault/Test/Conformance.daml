@@ -3,6 +3,7 @@ module Canton.Vault.Test.Conformance where
 
 import DA.Assert ((===))
 import DA.Foldable (forA_)
+import DA.Text qualified as T
 import Daml.Script
 
 import Canton.Vault.V1
@@ -11,10 +12,6 @@ import Canton.Vault.Reference.V1
 import Canton.Vault.Test.Deposit
 import Canton.Vault.Test.MockToken
 import Canton.Vault.Test.Periods
-
-import Splice.Api.Token.MetadataV1
-import Splice.Api.Token.HoldingV2 qualified as V2
-import Splice.TokenStandard.Utils
 
 next : Int -> Int
 next s = (s * 1103515245 + 12345) % 2147483648
@@ -41,7 +38,7 @@ randomState seed cap = do
       fee = case s1 % 4 of { 0 -> 0; 1 -> 30; 2 -> 250; _ -> 999 }
   f <- setupVaultFull fee None cap
   bob <- allocateParty "bob"
-  _ <- deposit f f.vaultTemplateCid bob (maybe identity min cap (amountFrom s2))
+  _ <- deposit f f.vaultTemplateCid bob (optional identity min cap (amountFrom s2))
   case s3 % 3 of
     0 -> pure ()
     1 -> do
@@ -55,7 +52,7 @@ shrinkPool : Fixture -> Decimal -> Script ()
 shrinkPool f fraction = do
   pool <- query @MockHolding f.custodian
   let total = sum [h.holding.amount | (_, h) <- pool]
-  forA_ pool $ \(cid, _) -> submitMulti [f.underlyingAdmin, f.custodian] [] (archiveCmd cid)
+  forA_ pool $ \(cid, _) -> submit (actAs [f.underlyingAdmin, f.custodian]) (archiveCmd cid)
   _ <- fund f f.custodian (total * fraction)
   pure ()
 
@@ -137,6 +134,12 @@ refused what result = case result of
   Left _ -> pure ()
   Right r -> abort (what <> " should have been refused, but moved " <> show r.assets)
 
+refusedFor : Text -> Text -> Either SubmitError VaultActionResult -> Script ()
+refusedFor what reason result = case result of
+  Left e | reason `T.isInfixOf` show e -> pure ()
+  Left e -> abort (what <> " was refused for another reason: " <> show e)
+  Right r -> abort (what <> " should have been refused, but moved " <> show r.assets)
+
 seeds : Int -> [Int]
 seeds n = [7919 * i | i <- [1 .. n]]
 
@@ -206,11 +209,62 @@ maxLimitsAreExact = script do
     q <- quote st alice 1.0 1.0
     _ <- succeeded "deposit at maxDeposit" =<< depositAs st alice q.depositMax
     refused "deposit past maxDeposit" =<< depositAs st alice (q.depositMax + ulp)
+    refused "mint past maxMint" =<< mintAs st alice (q.mintMax + ulp) (cap + 1.0)
     _ <- succeeded "mint at maxMint" =<< mintAs st alice q.mintMax (cap + 1.0)
     q2 <- quote st alice 1.0 1.0
+    refused "withdraw past maxWithdraw" =<< withdrawAs st alice (q2.withdrawMax + ulp)
     _ <- succeeded "withdraw at maxWithdraw" =<< withdrawAs st alice q2.withdrawMax
     _ <- succeeded "deposit" =<< depositAs st alice q.depositMax
     q3 <- quote st alice 1.0 1.0
     refused "redeem past maxRedeem" =<< redeemAs st alice (q3.redeemMax + ulp)
     _ <- succeeded "redeem at maxRedeem" =<< redeemAs st alice q3.redeemMax
     pure ()
+
+-- | Both ways in charge the deposit fee and both ways out the redemption fee, so neither is cheaper.
+entryAndExitPathsAgree : Script ()
+entryAndExitPathsAgree = script do
+  forA_ (seeds 10) $ \seed -> do
+    st <- randomState seed None
+    alice <- allocateParty "alice"
+    let shares = amountFrom (next seed)
+    q <- quote st alice 1.0 shares
+    q2 <- quote st alice q.mintPreview q.redeemPreview
+    assertMsg "depositing what a mint costs buys no fewer shares" (q2.depositPreview >= shares)
+    assertMsg "withdrawing what a redemption pays burns no fewer shares" (q2.withdrawPreview >= shares)
+
+-- | A full fee leaves nothing to take, so mint and withdraw are refused as deposit and redeem are.
+fullFeesRefuseEveryPath : Script ()
+fullFeesRefuseEveryPath = script do
+  alice <- allocateParty "alice"
+  entry <- setupVaultFees 10000 0 None None
+  let inSt = State with f = entry; vaultCid = entry.vaultTemplateCid; seed = 0
+  refused "deposit at a full fee" =<< depositAs inSt alice 100.0
+  refusedFor "mint at a full fee" "the deposit fee leaves something to mint" =<< mintAs inSt alice 1.0 100.0
+  mintMax <- submit entry.registrar do
+    createAndExerciseCmd (MaxRedeemProbe with caller = entry.registrar) Probe_MaxMint with
+      vaultCid = toInterfaceContractId entry.vaultTemplateCid; party = alice; extraArgs = depositArgs entry []
+  mintMax === 0.0
+  quoteRefusedFor inSt alice "the deposit fee leaves something to mint"
+  exit <- setupVaultFees 0 10000 None None
+  let outSt = State with f = exit; vaultCid = exit.vaultTemplateCid; seed = 0
+  _ <- succeeded "deposit" =<< depositAs outSt alice 100.0
+  refused "redeem at a full fee" =<< redeemAs outSt alice 50.0
+  refusedFor "withdraw at a full fee" "the redemption fee leaves something to withdraw" =<< withdrawAs outSt alice 10.0
+  held <- sharesOf outSt alice
+  withdrawMax <- submit exit.registrar do
+    createAndExerciseCmd (MaxRedeemProbe with caller = exit.registrar) Probe_MaxWithdraw with
+      vaultCid = toInterfaceContractId exit.vaultTemplateCid; party = alice; extraArgs = redeemArgs exit [] held
+  withdrawMax === 0.0
+  quoteRefusedFor outSt alice "the redemption fee leaves something to withdraw"
+
+-- | Quoting fails for the given reason, which the previews give.
+quoteRefusedFor : State -> Party -> Text -> Script ()
+quoteRefusedFor st party reason = do
+  r <- trySubmit (actAs st.f.registrar) do
+    createAndExerciseCmd (QuoteProbe with caller = st.f.registrar) Probe_Quote with
+      vaultCid = toInterfaceContractId st.vaultCid; party; assets = 1.0; shares = 1.0
+      extraArgs = redeemArgs st.f [] []
+  case r of
+    Left e | reason `T.isInfixOf` show e -> pure ()
+    Left e -> abort ("quote was refused for another reason: " <> show e)
+    Right _ -> abort "quote should have been refused"

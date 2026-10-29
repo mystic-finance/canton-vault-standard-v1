@@ -1,0 +1,100 @@
+-- | Payouts on Splice's test token, where a receiver accepts a transfer as a step of their own.
+module Canton.Vault.Test.SpliceRegistry where
+
+import DA.Assert ((===))
+import DA.Optional (fromSome)
+import DA.TextMap qualified as TextMap
+import DA.Time (addRelTime, hours)
+import Daml.Script
+
+import Canton.Vault.V1
+import Canton.Vault.Reference.V1
+import Canton.Vault.Test.CrossAdminSettlement (Registry(..), setupTokenRegistry, tokenArgs)
+
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.HoldingV2 qualified as V2
+import Splice.TokenStandard.Utils
+import Splice.Testing.Tokens.TestTokenV2.Holding (Token(..))
+
+data Env = Env with
+  usd : Registry
+  registrar : Party
+  custodian : Party
+  alice : Party
+  vaultCid : ContractId ReferenceVault
+  pool : ContractId Token
+  shares : ContractId Token
+
+usdId : Env -> V2.InstrumentId
+usdId env = V2.InstrumentId with admin = env.usd.admin; id = "USD"
+
+holdingOf : Party -> Party -> V2.InstrumentId -> Decimal -> Script (ContractId Token)
+holdingOf owner admin instrumentId amount = submit (actAs [owner, admin]) do
+  createCmd Token with
+    holding = V2.HoldingView with
+      account = basicAccount owner; instrumentId; amount; lock = None; meta = emptyMetadata
+
+-- | A vault holding 100 USD of the test token, with Alice holding all 100 shares.
+setup : Script Env
+setup = do
+  usd <- setupTokenRegistry "usdAdmin"
+  registrar <- allocateParty "registrar"
+  custodian <- allocateParty "custodian"
+  alice <- allocateParty "alice"
+  now <- getTime
+  let shareId = V2.InstrumentId with admin = registrar; id = "test-token-vault"
+  vaultCid <- submit (actAs [registrar, custodian]) do
+    createCmd ReferenceVault with
+      vaultId = "test-token-vault"
+      vaultRegistrar = registrar
+      custodian
+      underlyingInstrument = V2.InstrumentId with admin = usd.admin; id = "USD"
+      shareInstrument = shareId
+      totalShares = 100.0
+      totalAssets = 100.0
+      accrual = None
+      depositFeeBps = 0
+      redeemFeeBps = 0
+      rateValidFrom = now
+      rateValidUntil = addRelTime now (hours 1)
+      depositCap = None
+      paused = False
+      underlyingTransferFactory = toInterfaceContractId usd.rulesCid
+      priceLimits = PriceLimits with maxIncreaseBpsPerYear = 1000000000000000000; maxDecreaseBps = 10000
+  pool <- holdingOf custodian usd.admin (V2.InstrumentId with admin = usd.admin; id = "USD") 100.0
+  shares <- holdingOf alice registrar shareId 100.0
+  pure Env with usd; registrar; custodian; alice; vaultCid; pool; shares
+
+redeemTo : Env -> Party -> Script (Either SubmitError VaultActionResult)
+redeemTo env receiver = do
+  vaultD <- fromSome <$> queryDisclosure env.registrar env.vaultCid
+  poolD <- fromSome <$> queryDisclosure env.custodian env.pool
+  let ids cids = AV_List [AV_ContractId (toAnyContractId c) | c <- cids]
+      args = (tokenArgs env.usd) with
+        context = (tokenArgs env.usd).context with
+          values = TextMap.union
+            (TextMap.fromList [(underlyingHoldingsKey, ids [env.pool]), (shareHoldingsKey, ids [env.shares])])
+            (tokenArgs env.usd).context.values
+  trySubmit (actAs env.alice <> discloseMany [vaultD, poolD, env.usd.disclosure]) do
+    exerciseCmd (toInterfaceContractId env.vaultCid : ContractId Vault) Vault_Redeem with
+      shares = 40.0; owner = env.alice; receiver; minAssetsOut = None; actors = [env.alice]; extraArgs = args
+
+usdHeldBy : Env -> Party -> Script Decimal
+usdHeldBy env party = do
+  held <- query @Token party
+  pure (sum [h.holding.amount | (_, h) <- held, h.holding.instrumentId == usdId env, h.holding.account.owner == Some party])
+
+-- | The registry leaves the payout pending, and the vault accepts it with the redeeming receiver's authority.
+redemptionPaysOutOnTheTestToken : Script ()
+redemptionPaysOutOnTheTestToken = script do
+  env <- setup
+  Right _ <- redeemTo env env.alice
+  usdHeldBy env env.alice >>= (=== 40.0)
+
+-- | A receiver who is not acting cannot be accepted for, so the payout stays pending and nothing moves.
+redemptionToAnAbsentReceiverIsRefused : Script ()
+redemptionToAnAbsentReceiverIsRefused = script do
+  env <- setup
+  bob <- allocateParty "bob"
+  Left _ <- redeemTo env bob
+  usdHeldBy env bob >>= (=== 0.0)

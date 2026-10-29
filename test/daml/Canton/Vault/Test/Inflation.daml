@@ -1,7 +1,7 @@
 -- | The first-depositor inflation attack, and the offset that blunts it.
 module Canton.Vault.Test.Inflation where
 
-import DA.Assert ((===), assertMsg)
+import DA.Assert ((===))
 import DA.Time (addRelTime, hours)
 import Daml.Script
 
@@ -9,9 +9,6 @@ import Canton.Vault.V1
 import Canton.Vault.Reference.V1
 import Canton.Vault.Test.Deposit
 import Canton.Vault.Test.MockToken
-
-import Splice.Api.Token.HoldingV2 qualified as V2
-import Splice.TokenStandard.Utils
 
 -- | A donation after the attacker's first share still leaves the victim's deposit whole.
 donationBeforeTheFirstDepositDoesNotRobTheNext : Script ()
@@ -22,7 +19,7 @@ donationBeforeTheFirstDepositDoesNotRobTheNext = script do
 
   -- The smallest deposit the vault will take.
   attackerFunds <- fund f f.alice 0.0000000001
-  attackerResult <- submitWithDisclosures f.alice disclosures do
+  attackerResult <- submit (actAs f.alice <> discloseMany disclosures) do
     exerciseCmd f.vaultCid Vault_Deposit with
       assets = 0.0000000001
       receiver = f.alice
@@ -41,8 +38,9 @@ donationBeforeTheFirstDepositDoesNotRobTheNext = script do
       Some d' -> pure d'
       None -> abort "pool holding disclosure not available"
   now <- getTime
+  closed12 <- closePeriod f f.vaultTemplateCid
   rolledCid <- submit (actAs f.registrar <> discloseMany poolDisclosures) do
-    exerciseCmd f.vaultTemplateCid ReferenceVault_OpenPeriod with
+    exerciseCmd closed12 ClosedPeriod_Open with
       flowCids = map fst flows
       poolHoldingCids = map (toInterfaceContractId . fst) pool
       validUntil = addRelTime now (hours 2)
@@ -58,7 +56,7 @@ donationBeforeTheFirstDepositDoesNotRobTheNext = script do
     _ -> abort "disclosures not available"
 
   victimFunds <- fund f victim 100.0
-  victimResult <- submitWithDisclosures victim rolledDisclosures do
+  victimResult <- submit (actAs victim <> discloseMany rolledDisclosures) do
     exerciseCmd (toInterfaceContractId rolledCid : ContractId Vault) Vault_Deposit with
       assets = 100.0
       receiver = victim
@@ -90,25 +88,3 @@ donationBeforeTheFirstDepositDoesNotRobTheNext = script do
   assertMsg
     ("attacker donated 1000.0, their shares are worth " <> show attackerBacking)
     (attackerBacking < 1.0)
-
-
--- | A factory the depositor supplies must administer the instrument, or it mints for nothing.
-suppliedFactoryMustAdministerTheInstrument : Script ()
-suppliedFactoryMustAdministerTheInstrument = script do
-  f <- setupVault
-  mallory <- allocateParty "mallory"
-  disclosures <- vaultDisclosure f
-
-  -- Mallory's own factory. She never funds anything.
-  fakeCid <- submit mallory do
-    createCmd FreeMintRegistry with admin = mallory
-
-  let args = depositArgsFor f (toInterfaceContractId fakeCid) []
-
-  submitWithDisclosuresMustFail mallory disclosures do
-    exerciseCmd f.vaultCid Vault_Deposit with
-      assets = 1000.0
-      receiver = mallory
-      minSharesOut = None
-      actors = [mallory]
-      extraArgs = args

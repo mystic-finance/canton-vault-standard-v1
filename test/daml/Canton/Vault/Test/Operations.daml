@@ -1,0 +1,218 @@
+-- | Pausing, closing a period, reading the pool, and the records actions leave.
+module Canton.Vault.Test.Operations where
+
+import DA.Assert ((===))
+import DA.Time (addRelTime, hours)
+import Daml.Script
+
+import Canton.Vault.V1
+import Canton.Vault.Reference.V1
+import Canton.Vault.Reference.Share
+import Canton.Vault.Test.Deposit
+import Canton.Vault.Test.MockToken
+import Canton.Vault.Test.Periods
+import Canton.Vault.Test.Reports
+
+setPaused : Fixture -> ContractId ReferenceVault -> Bool -> Script (ContractId ReferenceVault)
+setPaused f vaultCid paused = submit f.registrar do
+  exerciseCmd vaultCid ReferenceVault_SetPaused with pause = paused
+
+-- | A paused vault refuses deposits and mints, still pays out, and takes deposits again once resumed.
+pauseStopsEntriesNotExits : Script ()
+pauseStopsEntriesNotExits = script do
+  f <- setupVault
+  _ <- deposit f f.vaultTemplateCid f.alice 100.0
+  paused <- setPaused f f.vaultTemplateCid True
+  ds <- disclosuresFor f paused
+  funds <- fund f f.alice 100.0
+  let vaultCid : ContractId Vault = toInterfaceContractId paused
+  submitMustFail (actAs f.alice <> discloseMany ds) do
+    exerciseCmd vaultCid Vault_Deposit with
+      assets = 100.0
+      receiver = f.alice
+      minSharesOut = None
+      actors = [f.alice]
+      extraArgs = depositArgs f [funds]
+  submitMustFail (actAs f.alice <> discloseMany ds) do
+    exerciseCmd vaultCid Vault_Mint with
+      shares = 10.0
+      receiver = f.alice
+      maxAssetsIn = None
+      actors = [f.alice]
+      extraArgs = depositArgs f [funds]
+
+  poolDs <- poolDisclosures f
+  pool <- query @MockHolding f.custodian
+  aliceShares <- map fst <$> query @ShareHolding f.alice
+  _ <- submit (actAs f.alice <> discloseMany (ds <> poolDs)) do
+    exerciseCmd vaultCid Vault_Redeem with
+      shares = 100.0
+      owner = f.alice
+      receiver = f.alice
+      minAssetsOut = None
+      actors = [f.alice]
+      extraArgs = redeemArgs f (map (toInterfaceContractId . fst) pool) aliceShares
+
+  resumed <- setPaused f paused False
+  _ <- deposit f resumed f.alice 100.0
+  pure ()
+
+-- | While paused the vault quotes no room to deposit or mint.
+pausedVaultQuotesNoRoom : Script ()
+pausedVaultQuotesNoRoom = script do
+  f <- setupVault
+  paused <- setPaused f f.vaultTemplateCid True
+  quote <- submit f.registrar do
+    createAndExerciseCmd (QuoteProbe with caller = f.registrar) Probe_Quote with
+      vaultCid = toInterfaceContractId paused
+      party = f.alice
+      assets = 1.0
+      shares = 1.0
+      extraArgs = depositArgs f []
+  quote.depositMax === 0.0
+  quote.mintMax === 0.0
+
+-- | Nothing lands in a closed period, so a read taken after the close is complete.
+actionsAfterTheCloseAreRefused : Script ()
+actionsAfterTheCloseAreRefused = script do
+  f <- setupVault
+  ds <- disclosuresFor f f.vaultTemplateCid
+  funds <- fund f f.alice 100.0
+  _ <- closePeriod f f.vaultTemplateCid
+  submitMustFail (actAs f.alice <> discloseMany ds) do
+    exerciseCmd f.vaultCid Vault_Deposit with
+      assets = 100.0
+      receiver = f.alice
+      minSharesOut = None
+      actors = [f.alice]
+      extraArgs = depositArgs f [funds]
+
+-- | The next period counts every action taken before the close.
+theNextPeriodCountsEveryAction : Script ()
+theNextPeriodCountsEveryAction = script do
+  f <- setupVault
+  bob <- allocateParty "bob"
+  first <- deposit f f.vaultTemplateCid f.alice 100.0
+  second <- deposit f f.vaultTemplateCid bob 100.0
+  closed <- closePeriod f f.vaultTemplateCid
+  flows <- query @PeriodFlow f.registrar
+  pool <- query @MockHolding f.custodian
+  poolDs <- poolDisclosures f
+  now <- getTime
+  rolled <- submit (actAs f.registrar <> discloseMany poolDs) do
+    exerciseCmd closed ClosedPeriod_Open with
+      flowCids = map fst flows
+      poolHoldingCids = map (toInterfaceContractId . fst) pool
+      validUntil = addRelTime now (hours 2)
+  Some vault <- queryContractId f.registrar rolled
+  vault.totalShares === first.shares + second.shares
+
+-- | The pool total is the custodian's holdings, readable by anyone between periods.
+poolTotalIsTheCustodiansHoldings : Script ()
+poolTotalIsTheCustodiansHoldings = script do
+  f <- setupVault
+  _ <- deposit f f.vaultTemplateCid f.alice 100.0
+  _ <- fund f f.custodian 5.0
+  pool <- query @MockHolding f.custodian
+  ds <- disclosuresFor f f.vaultTemplateCid
+  poolDs <- poolDisclosures f
+  total <- submit (actAs f.alice <> discloseMany (ds <> poolDs)) do
+    exerciseCmd f.vaultTemplateCid ReferenceVault_PoolTotal with
+      caller = f.alice
+      poolHoldingCids = map (toInterfaceContractId . fst) pool
+  total === 105.0
+
+-- | Each action reports an event to its actors and receiver in its own transaction, and leaves nothing on the ledger.
+actionsReportEventsToTheirParties : Script ()
+actionsReportEventsToTheirParties = script do
+  f <- setupVault
+  bob <- allocateParty "bob"
+  _ <- deposit f f.vaultTemplateCid f.alice 100.0
+  rolled <- rollPeriod f f.vaultTemplateCid
+  ds <- disclosuresFor f rolled
+  let vaultCid : ContractId Vault = toInterfaceContractId rolled
+      reported tree = [ (r.event.action, r.event.receiver, r.event.assets, r.event.shares, r.observers)
+                      | r <- exercisesOf @VaultLog @VaultLog_Report tree ]
+
+  funds <- fund f f.alice 100.0
+  minted <- submitTree (actAs f.alice <> discloseMany ds) do
+    exerciseCmd vaultCid Vault_Mint with
+      shares = 10.0
+      receiver = f.alice
+      maxAssetsIn = None
+      actors = [f.alice]
+      extraArgs = depositArgs f [funds]
+  reported minted === [(Minted, f.alice, 10.0, 10.0, [f.alice])]
+
+  pool <- query @MockHolding f.custodian
+  poolDs <- poolDisclosures f
+  aliceShares <- map fst <$> query @ShareHolding f.alice
+  withdrew <- submitTree (actAs f.alice <> discloseMany (ds <> poolDs)) do
+    exerciseCmd vaultCid Vault_Withdraw with
+      assets = 5.0
+      owner = f.alice
+      receiver = f.alice
+      maxSharesIn = None
+      actors = [f.alice]
+      extraArgs = redeemArgs f (map (toInterfaceContractId . fst) pool) aliceShares
+  reported withdrew === [(Withdrew, f.alice, 5.0, 5.0, [f.alice])]
+
+  pool' <- query @MockHolding f.custodian
+  poolDs' <- poolDisclosures f
+  aliceShares' <- map fst <$> query @ShareHolding f.alice
+  redeemed <- submitTree (actAs f.alice <> discloseMany (ds <> poolDs')) do
+    exerciseCmd vaultCid Vault_Redeem with
+      shares = 5.0
+      owner = f.alice
+      receiver = bob
+      minAssetsOut = None
+      actors = [f.alice]
+      extraArgs = redeemArgs f (map (toInterfaceContractId . fst) pool') aliceShares'
+  reported redeemed === [(Redeemed, bob, 5.0, 5.0, [bob, f.alice])]
+
+  query @VaultLog f.registrar >>= (=== []) . map snd
+
+-- | Re-pinning moves the vault's transfers to the new factory.
+repinnedFactoryCarriesTheTransfers : Script ()
+repinnedFactoryCarriesTheTransfers = script do
+  f <- setupVault
+  pendingCid <- submit f.underlyingAdmin do
+    createCmd PendingRegistry with admin = f.underlyingAdmin
+  Some pendingD <- queryDisclosure f.underlyingAdmin pendingCid
+  Some oldD <- queryDisclosure f.underlyingAdmin f.registryTemplateCid
+  g <- repin f (toInterfaceContractId pendingCid) pendingD
+  Some vaultD <- queryDisclosure g.registrar g.vaultTemplateCid
+  funds <- fund g g.alice 100.0
+  submitMustFail (actAs g.alice <> discloseMany [vaultD, pendingD, oldD]) do
+    exerciseCmd g.vaultCid Vault_Deposit with
+      assets = 100.0
+      receiver = g.alice
+      minSharesOut = None
+      actors = [g.alice]
+      extraArgs = depositArgs g [funds]
+
+-- | A factory of another admin is refused, so the vault is not pinned to the wrong registry.
+repinToAnotherAdminsFactoryIsRefused : Script ()
+repinToAnotherAdminsFactoryIsRefused = script do
+  f <- setupVault
+  mallory <- allocateParty "mallory"
+  other <- submit mallory do
+    createCmd MockRegistry with admin = mallory
+  Some otherD <- queryDisclosure mallory other
+  submitMustFail (actAs f.registrar <> discloseMany [otherD]) do
+    exerciseCmd f.vaultTemplateCid ReferenceVault_SetTransferFactory with
+      factory = toInterfaceContractId other
+
+-- | A close can be undone: the vault comes back as it was, and its flows still count at the next roll.
+reopenRestoresTheVault : Script ()
+reopenRestoresTheVault = script do
+  f <- setupVault
+  bob <- allocateParty "bob"
+  first <- deposit f f.vaultTemplateCid f.alice 100.0
+  closed <- closePeriod f f.vaultTemplateCid
+  reopened <- submit f.registrar do
+    exerciseCmd closed ClosedPeriod_Reopen
+  second <- deposit f reopened bob 100.0
+  rolled <- rollPeriod f reopened
+  Some vault <- queryContractId f.registrar rolled
+  vault.totalShares === first.shares + second.shares

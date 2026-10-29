@@ -1,0 +1,149 @@
+-- | Signed commands: run at whichever period is open, and only against the vault they name.
+module Canton.Vault.Test.Command where
+
+import DA.Assert ((===))
+import DA.Time (RelTime, addRelTime, hours, microseconds, minutes)
+import Daml.Script
+
+import Canton.Vault.V1
+import Canton.Vault.Reference.V1
+import Canton.Vault.Reference.Command
+import Canton.Vault.Test.Deposit
+import Canton.Vault.Test.Limits (failsWith)
+import Canton.Vault.Test.MockToken
+import Canton.Vault.Test.Periods
+
+import Splice.Api.Token.HoldingV2 qualified as V2
+
+-- | Alice signs a deposit of 100 for the vault, to be run by the venue within `ttl`.
+sign : Fixture -> Party -> RelTime -> Script (ContractId VaultCommand)
+sign f venue ttl = do
+  now <- getTime
+  submit f.alice do
+    createCmd VaultCommand with
+      actors = [f.alice]
+      executor = venue
+      vaultId = "reference-1"
+      vaultRegistrar = f.registrar
+      action = DepositCommand with assets = 100.0; receiver = f.alice; minSharesOut = None
+      expiresAt = addRelTime now ttl
+
+run : Fixture -> Party -> ContractId VaultCommand -> ContractId ReferenceVault -> Script (Either SubmitError VaultActionResult)
+run f venue commandCid vaultCid = do
+  funds <- fund f f.alice 100.0
+  Some fundsD <- queryDisclosure f.underlyingAdmin (fromInterfaceContractId funds : ContractId MockHolding)
+  vaultD <- queryDisclosure f.registrar vaultCid
+  registryD <- queryDisclosure f.underlyingAdmin f.registryTemplateCid
+  let ds = [d | Some d <- [vaultD, registryD]] <> [fundsD]
+  trySubmit (actAs venue <> discloseMany ds) do
+    exerciseCmd commandCid VaultCommand_Execute with
+      vaultCid
+      extraArgs = depositArgs f [funds]
+
+-- | A command signed in one period runs in a later one, priced when it runs.
+commandRunsAtTheOpenPeriod : Script ()
+commandRunsAtTheOpenPeriod = script do
+  f <- setupVault
+  venue <- allocateParty "venue"
+  bob <- allocateParty "bob"
+  commandCid <- sign f venue (hours 24)
+  _ <- deposit f f.vaultTemplateCid bob 100.0
+  -- Yield lands, and the signer is slower than the period.
+  _ <- fund f f.custodian 10.0
+  passTime (hours 3)
+  rolled <- rollPeriod f f.vaultTemplateCid
+  quote <- submit f.registrar do
+    createAndExerciseCmd (QuoteProbe with caller = f.registrar) Probe_Quote with
+      vaultCid = toInterfaceContractId rolled
+      party = f.alice
+      assets = 100.0
+      shares = 1.0
+      extraArgs = depositArgs f []
+  Right result <- run f venue commandCid rolled
+  result.shares === quote.depositPreview
+
+-- | A command runs up to, not at, its expiry.
+commandPastItsExpiryIsRefused : Script ()
+commandPastItsExpiryIsRefused = script do
+  f <- setupVault
+  venue <- allocateParty "venue"
+  now <- getTime
+  early <- sign f venue (minutes 30)
+  late <- sign f venue (minutes 30)
+  setTime (addRelTime now (minutes 30 + microseconds (-1)))
+  Right _ <- run f venue early f.vaultTemplateCid
+  setTime (addRelTime now (minutes 30))
+  failsWith "command has not expired" =<< run f venue late f.vaultTemplateCid
+
+-- | A sibling vault under the same registrar is not the vault the command names.
+commandForAnotherVaultIsRefused : Script ()
+commandForAnotherVaultIsRefused = script do
+  f <- setupVault
+  venue <- allocateParty "venue"
+  now <- getTime
+  sibling <- submit (actAs [f.registrar, f.custodian]) do
+    createCmd ReferenceVault with
+      vaultId = "reference-2"
+      vaultRegistrar = f.registrar
+      custodian = f.custodian
+      underlyingInstrument = f.underlying
+      shareInstrument = f.shares with id = "reference-2"
+      totalShares = 0.0
+      totalAssets = 0.0
+      accrual = None
+      depositFeeBps = 0
+      redeemFeeBps = 0
+      rateValidFrom = now
+      rateValidUntil = addRelTime now (hours 1)
+      depositCap = None
+      paused = False
+      underlyingTransferFactory = f.registryCid
+      priceLimits = wideLimits
+  commandCid <- sign f venue (hours 24)
+  Left _ <- run f venue commandCid sibling
+  pure ()
+
+-- | A vault reusing the id under another registrar is not the vault the command names.
+commandForAnotherRegistrarIsRefused : Script ()
+commandForAnotherRegistrarIsRefused = script do
+  f <- setupVault
+  venue <- allocateParty "venue"
+  rogue <- allocateParty "rogue"
+  now <- getTime
+  impostor <- submit rogue do
+    createCmd ReferenceVault with
+      vaultId = "reference-1"
+      vaultRegistrar = rogue
+      custodian = rogue
+      underlyingInstrument = f.underlying
+      shareInstrument = V2.InstrumentId with admin = rogue; id = "reference-1"
+      totalShares = 0.0
+      totalAssets = 0.0
+      accrual = None
+      depositFeeBps = 0
+      redeemFeeBps = 0
+      rateValidFrom = now
+      rateValidUntil = addRelTime now (hours 1)
+      depositCap = None
+      paused = False
+      underlyingTransferFactory = f.registryCid
+      priceLimits = wideLimits
+  commandCid <- sign f venue (hours 24)
+  impostorD <- queryDisclosure rogue impostor
+  registryD <- queryDisclosure f.underlyingAdmin f.registryTemplateCid
+  funds <- fund f f.alice 100.0
+  Some fundsD <- queryDisclosure f.underlyingAdmin (fromInterfaceContractId funds : ContractId MockHolding)
+  submitMustFail (actAs venue <> discloseMany ([d | Some d <- [impostorD, registryD]] <> [fundsD])) do
+    exerciseCmd commandCid VaultCommand_Execute with
+      vaultCid = impostor
+      extraArgs = depositArgs f [funds]
+
+commandIsCancelledOnlyByItsActors : Script ()
+commandIsCancelledOnlyByItsActors = script do
+  f <- setupVault
+  venue <- allocateParty "venue"
+  commandCid <- sign f venue (hours 24)
+  submitMustFail venue do
+    exerciseCmd commandCid VaultCommand_Cancel with actor = venue
+  submit f.alice do
+    exerciseCmd commandCid VaultCommand_Cancel with actor = f.alice
