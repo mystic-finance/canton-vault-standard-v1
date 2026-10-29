@@ -1,0 +1,62 @@
+-- | Queued redemptions: the holder escrows shares, and is paid the underlying
+-- when the vault's executors fulfil the request.
+module Canton.Vault.AsyncRedeem.V1 where
+
+import Splice.Api.Token.MetadataV1
+
+import Canton.Vault.V1
+
+-- | An interface for queuing redemptions. A vault implements it alongside
+-- `Vault` when redemptions are fulfilled later rather than at once; its
+-- `Vault_Withdraw`, `Vault_Redeem`, `previewWithdraw` and `previewRedeem` then
+-- fail, and its `maxWithdraw` and `maxRedeem` return zero.
+--
+-- A request names its terms, and the vault publishes the allocations it needs
+-- as the token standard's `AllocationRequest`: the holder's escrow, sending
+-- `shares` to the burn account with the leg id `requestLegId`, and the
+-- receiver's authorization to be paid the underlying by the custodian, with no
+-- legs. Both carry the request's own settlement, with the id
+-- `requestSettlementId` and a contract id naming the request, so an allocation
+-- made for one request settles no other; both are committed until the end of
+-- the request's period plus the vault's `settlementDeadlineWindow`. Wallets
+-- allocate exactly as requested, and the executors bind the allocations before
+-- the request's period ends, so none is made knowing the price; a request
+-- unfunded by then is dropped. The executors fulfil a request before its
+-- deadline, at the rate its `RequestId` says; how they do so is the vault's
+-- own.
+interface VaultAsyncRedeem requires Vault where
+  viewtype AsyncView
+
+  -- | Shares the party has queued for redemption under the request id, as the
+  -- contracts named in `extraArgs` show. A vault cannot look them up, so one not
+  -- named does not count, and one named twice counts once; naming one that is
+  -- gone fails. A request counts once its allocations are bound, until it is
+  -- fulfilled, rejected or expires.
+  pendingRedeemRequest : RequestId -> Party -> ExtraArgs -> Update Decimal
+
+  vault_requestRedeemImpl : ContractId VaultAsyncRedeem -> Vault_RequestRedeem -> Update RequestId
+  vault_requestRedeemExtraObservers : Vault_RequestRedeem -> [Party]
+
+  nonconsuming choice Vault_RequestRedeem : RequestId
+    -- ^ Queue a redemption of `shares`, paying `receiver` the underlying at a
+    -- rate struck after the request is made, so not known when it is.
+    with
+      label : Text
+        -- ^ The holder's label for the request, in its leg ids. Requests that
+        -- share a label cannot be fulfilled together.
+      shares : Decimal
+        -- ^ Shares to redeem.
+      receiver : Party
+        -- ^ The party to be paid the underlying.
+      minAssetsOut : Optional Decimal
+        -- ^ The least underlying the receiver accepts; a fulfilment that would
+        -- pay less fails rather than fill.
+      actors : [Party]
+        -- ^ Parties executing the request: the parties of the account the
+        -- escrow is funded from.
+      extraArgs : ExtraArgs
+        -- ^ The funding account, as the instant deposit takes it, and the
+        -- receiver's account under `receiver`, both in `meta`.
+    observer vault_requestRedeemExtraObservers this arg
+    controller actors
+    do vault_requestRedeemImpl this self arg

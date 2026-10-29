@@ -1,0 +1,61 @@
+-- | Queued deposits: the depositor escrows the underlying, and is issued shares
+-- when the vault's executors fulfil the request.
+module Canton.Vault.AsyncDeposit.V1 where
+
+import Splice.Api.Token.MetadataV1
+
+import Canton.Vault.V1
+
+-- | An interface for queuing deposits. A vault implements it alongside `Vault`
+-- when deposits are fulfilled later rather than at once; its `Vault_Deposit`,
+-- `Vault_Mint`, `previewDeposit` and `previewMint` then fail, and its
+-- `maxDeposit` and `maxMint` return zero.
+--
+-- A request names its terms, and the vault publishes the allocations it needs
+-- as the token standard's `AllocationRequest`: the depositor's escrow, sending
+-- `assets` to the custodian with the leg id `requestLegId`, and the receiver's
+-- authorization to be issued shares, with no legs. Both carry the request's own
+-- settlement, with the id `requestSettlementId` and a contract id naming the
+-- request, so an allocation made for one request settles no other; both are
+-- committed until the end of the request's period plus the vault's
+-- `settlementDeadlineWindow`. Wallets allocate exactly as requested, and the
+-- executors bind the allocations before the request's period ends, so none is
+-- made knowing the price; a request unfunded by then is dropped. The executors
+-- fulfil a request before its deadline, at the rate its `RequestId` says; how
+-- they do so is the vault's own.
+interface VaultAsyncDeposit requires Vault where
+  viewtype AsyncView
+
+  -- | Units of the underlying the party has queued under the request id, as the
+  -- contracts named in `extraArgs` show. A vault cannot look them up, so one not
+  -- named does not count, and one named twice counts once; naming one that is
+  -- gone fails. A request counts once its allocations are bound, until it is
+  -- fulfilled, rejected or expires.
+  pendingDepositRequest : RequestId -> Party -> ExtraArgs -> Update Decimal
+
+  vault_requestDepositImpl : ContractId VaultAsyncDeposit -> Vault_RequestDeposit -> Update RequestId
+  vault_requestDepositExtraObservers : Vault_RequestDeposit -> [Party]
+
+  nonconsuming choice Vault_RequestDeposit : RequestId
+    -- ^ Queue a deposit of `assets`, for shares issued to `receiver` at a rate
+    -- struck after the request is made, so not known when it is.
+    with
+      label : Text
+        -- ^ The requester's label for the request, in its leg ids. Requests that
+        -- share a label cannot be fulfilled together.
+      assets : Decimal
+        -- ^ Units of the underlying to deposit.
+      receiver : Party
+        -- ^ The party to be issued the shares.
+      minSharesOut : Optional Decimal
+        -- ^ The fewest shares the requester accepts; a fulfilment that would
+        -- issue fewer fails rather than fill.
+      actors : [Party]
+        -- ^ Parties executing the request: the parties of the account the
+        -- escrow is funded from.
+      extraArgs : ExtraArgs
+        -- ^ The funding account, as the instant deposit takes it, and the
+        -- receiver's account under `receiver`, both in `meta`.
+    observer vault_requestDepositExtraObservers this arg
+    controller actors
+    do vault_requestDepositImpl this self arg

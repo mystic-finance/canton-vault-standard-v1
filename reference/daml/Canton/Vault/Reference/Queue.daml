@@ -1,0 +1,242 @@
+-- | What the queued vaults share: pinned factories, allocation checks, struck prices and reports.
+module Canton.Vault.Reference.Queue where
+
+import DA.Foldable (forA_)
+import DA.List (dedup, sort, unique)
+import DA.Map qualified as Map
+
+import DA.TextMap qualified as TextMap
+import DA.Time (isLedgerTimeGE)
+
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.HoldingV2 qualified as V2
+import Splice.Api.Token.AllocationV2 qualified as V2
+import Splice.Api.Token.AllocationInstructionV2 qualified as V2
+import Splice.Api.Token.AllocationRequestV2 qualified as AR
+import Splice.TokenStandard.Utils
+
+-- | A registry's allocation and settlement factories.
+data Factories = Factories with
+    allocationFactory : ContractId V2.AllocationFactory
+    settlementFactory : ContractId V2.SettlementFactory
+  deriving (Show, Eq, Serializable)
+
+-- | A request's settlement reference: its allocations name it, so none can settle another request.
+template RequestAnchor
+  with
+    vaultId : Text
+    vaultRegistrar : Party
+    executors : [Party]
+    requester : Party
+  where
+    signatory vaultRegistrar
+    observer requester, executors
+
+-- | The allocations a queued request needs, published for wallets as the token standard's allocation request.
+template RequestAllocations
+  with
+    vaultId : Text
+    vaultRegistrar : Party
+    executors : [Party]
+    requester : Party
+    receiver : Party
+    label : Text
+    amount : Decimal
+      -- ^ The underlying deposited, or the shares redeemed.
+    minOut : Optional Decimal
+    epoch : Int
+      -- ^ The period the request was made in, which is its id.
+    anchor : ContractId RequestAnchor
+    settlement : V2.SettlementInfo
+    escrow : V2.AllocationSpecification
+      -- ^ The requester's escrow, exactly as it must be allocated.
+    authorization : V2.AllocationSpecification
+      -- ^ The receiver's authorization, exactly as it must be allocated.
+    requestedAt : Time
+    fundBy : Time
+      -- ^ The end of the request's period: allocations are bound before it, so none is made knowing the price.
+  where
+    signatory vaultRegistrar
+    observer requester, receiver, executors
+
+    choice RequestAllocations_Expire : ()
+      -- ^ Drop a request whose allocations were not bound in its period.
+      controller vaultRegistrar
+      do
+        over <- isLedgerTimeGE fundBy
+        require "the request's period has ended" over
+        endUnfunded this "not funded in its period"
+
+    interface instance AR.AllocationRequest for RequestAllocations where
+      view = AR.AllocationRequestView with
+        originalRequestCid = None
+        settlement
+        allocations = [escrow, authorization]
+        requestedAt
+        settleAt = Some fundBy
+        availableActions = Map.fromList [(AR.ARA_Accept, parties), (AR.ARA_Reject, parties)]
+        meta = emptyMetadata
+          where parties = dedup [[requester], [receiver]]
+      allocationRequest_acceptImpl _self _arg = pure AR.AllocationRequest_AcceptResult with meta = emptyMetadata
+      allocationRequest_rejectImpl self arg = do
+        require "the requester or the receiver declines" (arg.actors `elem` [[requester], [receiver]])
+        archive (fromInterfaceContractId @RequestAllocations self)
+        endUnfunded this "declined"
+        pure AR.AllocationRequest_RejectResult with meta = emptyMetadata
+      allocationRequest_withdrawImpl self arg = do
+        require "the executors withdraw" (sort arg.actors == sort executors)
+        archive (fromInterfaceContractId @RequestAllocations self)
+        endUnfunded this "withdrawn by the executors"
+        pure AR.AllocationRequest_WithdrawResult with meta = emptyMetadata
+      allocationRequest_acceptExtraObservers _arg = []
+      allocationRequest_rejectExtraObservers _arg = []
+      allocationRequest_withdrawExtraObservers _arg = []
+
+-- | Ends a request no allocation was bound to, reporting why.
+endUnfunded : RequestAllocations -> Text -> Update ()
+endUnfunded r reason = do
+  archive r.anchor
+  reportQueued r.vaultRegistrar [QueuedEvent with
+    vaultId = r.vaultId; requester = r.requester; receiver = r.receiver; label = r.label
+    requestId = r.epoch; requested = r.amount; outcome = Rejected with reason]
+
+-- | Refuses an allocation that is not exactly the one requested, under the request's own settlement.
+requireRequested : Text -> Party -> V2.SettlementInfo -> V2.AllocationSpecification -> ContractId V2.Allocation -> Update ()
+requireRequested what admin settlement spec cid = do
+  allocation <- fetchSigned what admin cid
+  require' (what <> ".settlement", allocation.settlement) isEqualR ("requested settlement", settlement)
+  require' (what, allocation.allocation) isEqualR ("requested", spec)
+
+-- | Fetches an allocation, refusing one its registry's admin did not sign.
+fetchSigned : Text -> Party -> ContractId V2.Allocation -> Update V2.AllocationView
+fetchSigned what admin cid = do
+  allocation <- fetch cid
+  require (what <> " is signed by its registry") (signedBy admin allocation)
+  pure (view allocation)
+
+-- | Whether the registry's admin signed the allocation, so its view can be believed.
+signedBy : Party -> V2.Allocation -> Bool
+signedBy admin allocation = admin `elem` signatory allocation
+
+-- | Refuses a batch whose requests share a label or an allocation, which would collide when settled.
+requireDistinct : [(Party, Text)] -> [ContractId V2.Allocation] -> Update ()
+requireDistinct labels allocations = do
+  require "each request in the batch has its own label" (unique labels)
+  require "each request in the batch has its own allocations" (unique allocations)
+
+requireFactoriesOf : Party -> Party -> Factories -> Update ()
+requireFactoriesOf actor admin factories = do
+  allocationView <- exercise factories.allocationFactory V2.AllocationFactory_PublicFetch with actors = [actor]
+  require' ("allocation factory admin", allocationView.admin) isEqualR ("registry admin", admin)
+  settlementView <- exercise factories.settlementFactory V2.SettlementFactory_PublicFetch with actors = [actor]
+  require' ("settlement factory admin", settlementView.admin) isEqualR ("registry admin", admin)
+
+finalized : ContractId V2.Allocation -> [V2.TransferLegSide] -> V2.FinalizedAllocation
+finalized allocationCid extra = V2.FinalizedAllocation with
+  allocationCid
+  extraTransferLegSides = extra
+  nextIterationFunding = None
+
+-- | Allocates the vault's side of every leg in a batch, which settles at once.
+allocateSides : Factories -> ExtraArgs -> V2.SettlementInfo -> Time -> Party -> V2.Account -> [Party] -> [ContractId V2.Holding] -> [V2.TransferLegSide] -> Update (ContractId V2.Allocation)
+allocateSides factories extraArgs settlement requestedAt admin authorizer actors inputHoldingCids sides =
+  fst <$> allocateSidesWithChange factories extraArgs settlement requestedAt admin authorizer actors inputHoldingCids sides
+
+-- | Allocates the vault's side of a batch, returning the change of the instrument from the holdings it used.
+allocateSidesWithChange : Factories -> ExtraArgs -> V2.SettlementInfo -> Time -> Party -> V2.Account -> [Party] -> [ContractId V2.Holding] -> [V2.TransferLegSide] -> Update (ContractId V2.Allocation, [ContractId V2.Holding])
+allocateSidesWithChange factories extraArgs settlement requestedAt admin authorizer actors inputHoldingCids sides = do
+  result <- exercise factories.allocationFactory V2.AllocationFactory_Allocate with
+    settlement
+    allocation = V2.AllocationSpecification with
+      admin
+      authorizer
+      transferLegSides = sides
+      settlementDeadline = None
+      nextIterationFunding = None
+      committed = False
+      meta = emptyMetadata
+    requestedAt
+    inputHoldingCids
+    extraArgs
+    actors
+  case result.output of
+    V2.AllocationInstructionResult_Completed with allocationCid ->
+      pure (allocationCid, concatMap snd (TextMap.toList result.authorizerChangeCids))
+    _ -> fail "the vault's own allocation did not complete"
+
+-- | The contract ids listed under the key in a choice context.
+getContractIds : Text -> ChoiceContext -> Update [ContractId t]
+getContractIds key context = case TextMap.lookup key context.values of
+  Some (AV_List cids) -> forA cids $ \v -> case v of
+    AV_ContractId cid -> pure (fromAnyContractId cid)
+    _ -> fail $ "Failed to decode a contract id under '" <> key <> "': " <> show v
+  None -> pure []
+  v -> fail $ "Failed to decode context value for '" <> key <> "': " <> show v
+
+-- | The price struck when a period opened, kept so requests from the period before can still be filled at it.
+template PeriodPrice
+  with
+    vaultId : Text
+    vaultRegistrar : Party
+    executors : [Party]
+    epoch : Int
+      -- ^ The period this price opened.
+    totalShares : Decimal
+    totalAssets : Decimal
+  where
+    signatory vaultRegistrar
+    observer executors
+
+-- | One queued request's outcome, as reported to its requester and receiver.
+data QueuedEvent = QueuedEvent with
+    vaultId : Text
+    requester : Party
+    receiver : Party
+    label : Text
+    requestId : Int
+      -- ^ The period the request was made in.
+    requested : Decimal
+      -- ^ The underlying deposited, or the shares redeemed.
+    outcome : Outcome
+  deriving (Eq, Show, Serializable)
+
+data Outcome
+  = Fulfilled with
+      received : Decimal
+        -- ^ The shares issued, or the underlying paid.
+  | Rejected with
+      reason : Text
+        -- ^ Why the request could not settle.
+  deriving (Eq, Show, Serializable)
+
+-- | Reports queued requests' outcomes in the transaction they happen in, as the token standard's `EventLog` does.
+-- Created and archived within that transaction, so nothing stays on the ledger.
+template QueueLog
+  with
+    vaultRegistrar : Party
+  where
+    signatory vaultRegistrar
+
+    nonconsuming choice QueueLog_Report : ()
+      -- ^ Show the event to its observers.
+      with
+        event : QueuedEvent
+        observers : [Party]
+      observer observers
+      controller vaultRegistrar
+      do pure ()
+
+reportQueued : Party -> [QueuedEvent] -> Update ()
+reportQueued registrar events = do
+  log <- create QueueLog with vaultRegistrar = registrar
+  forA_ events $ \event -> exercise log QueueLog_Report with event; observers = dedup [event.requester, event.receiver]
+  archive log
+
+-- | Opening totals of the period after a request's: those stored for an earlier one, or the current ones.
+struckFor : Int -> Int -> (Decimal, Decimal) -> [PeriodPrice] -> Update (Decimal, Decimal)
+struckFor requestEpoch currentEpoch current prices
+  | requestEpoch + 1 == currentEpoch = pure current
+  | otherwise = case [p | p <- prices, p.epoch == requestEpoch + 1] of
+      p :: _ -> pure (p.totalShares, p.totalAssets)
+      [] -> fail ("no price struck for period " <> show (requestEpoch + 1))
+

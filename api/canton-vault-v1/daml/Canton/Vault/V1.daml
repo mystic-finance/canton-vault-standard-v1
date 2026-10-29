@@ -3,8 +3,9 @@
 -- A vault accepts deposits of a single underlying instrument and issues share
 -- holdings against them. Shares are ordinary token standard holdings.
 --
--- Every vault implements `Vault`. Queued deposits and redemptions, the event
--- log and delegated access are not defined here yet.
+-- Every vault implements `Vault`. Queued deposits and redemptions are in their
+-- own packages, and the types they share are defined here. The event log and
+-- delegated access are not defined yet.
 module Canton.Vault.V1 where
 
 import DA.Time (RelTime)
@@ -102,6 +103,49 @@ data VaultActionResult = VaultActionResult with
 -- action fails and nothing changes.
 vaultSlippageExceeded : Text
 vaultSlippageExceeded = "VAULT_SLIPPAGE_EXCEEDED"
+
+--
+-- Queued requests
+-------------------
+
+-- | Identifies a queued deposit or redemption, together with its requester.
+--
+-- The vault chooses its ids. `0` means requests are told apart only by their
+-- requester, each fulfilled at the rate when it is struck. Requests sharing any
+-- other id are priced together: at one rate struck after the last of them was
+-- made, or a worse rate current when one is filled late.
+type RequestId = Int
+
+-- | What a wallet needs to decide whether to queue a request with a vault.
+--
+-- Served alongside the `VaultView`, as the view of each queued-request
+-- interface the vault implements; a vault may set them differently for
+-- deposits and redemptions.
+data AsyncView = AsyncView with
+    executors : [Party]
+      -- ^ The parties who fulfil and cancel requests, acting together: settling
+      -- or cancelling a pending escrow needs all of them.
+    settlementDeadlineWindow : RelTime
+      -- ^ How long after the end of its period a request's escrow stays
+      -- committed: the time the executors have to fill it. Until the deadline
+      -- only the executors can settle or cancel it; after it, the requester can
+      -- withdraw it.
+    meta : Metadata
+      -- ^ Additional metadata specific to the vault, used for extensibility.
+  deriving (Show, Eq, Serializable)
+
+-- | The settlement id every allocation for a request to the vault carries. The
+-- rest of the settlement is the vault's `executors`, a contract id naming the
+-- request and no metadata, so an allocation made for one request settles no
+-- other. Wallets take it from the request's allocation request.
+requestSettlementId : Text -> Text
+requestSettlementId vaultId = vaultId <> "/requests"
+
+-- | The transfer leg id for one leg of one request: its requester, their label
+-- for the request, and which leg it is, `"underlying"` or `"shares"`.
+requestLegId : Party -> Text -> Text -> Text
+requestLegId requester label leg =
+  partyToText requester <> "/" <> label <> "/" <> leg
 
 --
 -- Vault

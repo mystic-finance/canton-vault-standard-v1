@@ -35,6 +35,39 @@ receiver, through a log created and archived in the same transaction, as the
 token standard's event log does: it shows in their transaction history and
 leaves nothing on the ledger.
 
+## Queued requests
+
+A queued vault takes a request instead of settling at once. The request names
+its terms, and the vault publishes the allocations it needs as the token
+standard's `AllocationRequest`: the requester's escrow and the receiver's
+authorization, each specified exactly, committed until the request's period ends
+plus the vault's window, and under the request's own settlement, so an allocation
+made for one request can settle no other. Wallets allocate as requested; the
+executors bind the allocations to the request before its period ends, so nobody
+funds a request after seeing its price, and a request left unfunded is dropped.
+The bound request is registrar-signed, and its id is the rate period it was made
+in.
+
+Once that period closes, executors fulfil requests in batches, settling both
+registries' legs in one transaction, at the price struck when the next period
+opened: everyone who requested in a period gets one price, which nobody knew
+when they requested. A request filled later than that gets the current price if
+it is worse for the requester, so a late fill never beats the market. A
+requester may set a minimum, below which the request is not filled.
+
+A batch settles whole or not at all, so one request that cannot settle, such as
+a receiver its registry has blocked, fails the rest. Executors dry-run a batch,
+settle the requests that pass, and `Reject` the one that fails, which returns
+its escrow and reports why. Each request settles as its own batch on each
+registry, all inside one fulfilment transaction.
+
+Fulfilments and rejections are reported to the requester and receiver through a
+log created and archived in the same transaction, as the token standard's event
+log does, so they leave nothing on the ledger. Requests expire with their escrow.
+The registrar folds period flows together as they accumulate
+(`PeriodFlow_Merge`) and drops expired requests and old struck prices, so neither
+the roll nor the ledger grows with activity.
+
 ## Trust and limits
 
 - The registrar is trusted. It strikes the price at each roll from the pool it
@@ -65,7 +98,9 @@ leaves nothing on the ledger.
 | | |
 | --- | --- |
 | `api/canton-vault-v1/` | `canton-vault-v1` — the `Vault` interface and its types, which every vault implements |
-| `reference/` | `canton-vault-reference-v1` — a vault implementing it |
+| `api/canton-vault-async-deposit-v1/` | `canton-vault-async-deposit-v1` — `VaultAsyncDeposit`, for vaults that queue deposits |
+| `api/canton-vault-async-redeem-v1/` | `canton-vault-async-redeem-v1` — `VaultAsyncRedeem`, for vaults that queue redemptions |
+| `reference/` | `canton-vault-reference-v1` — the instant vault, and queued-deposit and queued-redemption vaults |
 | `test/` | `canton-vault-standard-test` — Daml Script tests and a mock underlying registry |
 | `dependencies/` | Vendored Splice DARs; see `dependencies/VERSIONS.md` |
 
