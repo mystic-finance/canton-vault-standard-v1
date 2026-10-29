@@ -941,6 +941,19 @@ requestOfAnotherVaultIsRefused = script do
   Right () <- fulfilAs other env.venue [req]
   unlocked env (usdId env) env.alice >>= (=== 40.0)
 
+-- | Executors shared between vaults cannot bind one vault's request through another.
+anotherVaultsRequestIsNotBound : Script ()
+anotherVaultsRequestIsNotBound = script do
+  env <- setup
+  other <- anotherVault env "queued-redeem-2"
+  Right _ <- requestTerms other env.alice "r1" 40.0 env.alice None
+  (cid, r) <- published other env.alice "r1"
+  escrow <- escrowAsRequested other r
+  receipt <- receiptAsRequested other r
+  failsWith "request.vaultId" =<< bindAs env env.venue cid escrow receipt
+  Right _ <- bindAs other env.venue cid escrow receipt
+  pure ()
+
 ownerAndExecutorsArchiveRequests : Script ()
 ownerAndExecutorsArchiveRequests = script do
   env <- setup

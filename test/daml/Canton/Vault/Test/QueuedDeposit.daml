@@ -754,6 +754,10 @@ repinToAnotherRegistrysFactoriesIsRefused = script do
     exerciseCmd env.vaultCid Q.ReferenceQueuedDepositVault_SetFactories with
       transferFactory = usdFactory; shares = factoriesOf env.shares
       underlying = (factoriesOf env.usd) with settlementFactory = toInterfaceContractId env.shares.rulesCid
+  failsWith "allocation factory admin" =<< trySubmit (actAs env.registrar <> discloseMany ds) do
+    exerciseCmd env.vaultCid Q.ReferenceQueuedDepositVault_SetFactories with
+      transferFactory = usdFactory; shares = factoriesOf env.shares
+      underlying = (factoriesOf env.usd) with allocationFactory = toInterfaceContractId env.shares.rulesCid
   _ <- submit (actAs env.registrar <> discloseMany ds) do
     exerciseCmd env.vaultCid Q.ReferenceQueuedDepositVault_SetFactories with
       transferFactory = usdFactory; underlying = factoriesOf env.usd; shares = factoriesOf env.shares
@@ -894,6 +898,19 @@ requestOfAnotherVaultIsRefused = script do
   Left _ <- fulfilAs env env.venue [req]
   Right () <- fulfilAs other env.venue [req]
   tokens other (sharesId other) env.alice >>= (=== 100.0)
+
+-- | Executors shared between vaults cannot bind one vault's request through another.
+anotherVaultsRequestIsNotBound : Script ()
+anotherVaultsRequestIsNotBound = script do
+  env <- setup
+  other <- anotherVault env "queued-2"
+  Right _ <- requestTerms other env.alice "r1" 10.0 env.alice None
+  (cid, r) <- published other env.alice "r1"
+  escrow <- escrowAsRequested other r
+  receiving <- authorizationAsRequested other r
+  failsWith "request.vaultId" =<< bindAs env env.venue cid escrow receiving
+  Right _ <- bindAs other env.venue cid escrow receiving
+  pure ()
 
 requesterAndExecutorsArchiveRequests : Script ()
 requesterAndExecutorsArchiveRequests = script do
