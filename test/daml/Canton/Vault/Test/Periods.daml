@@ -26,7 +26,7 @@ rollPeriod f vaultCid = do
   submit (actAs f.registrar <> discloseMany poolDisclosures) do
     exerciseCmd closed1 ClosedPeriod_Open with
       flowCids = map fst flows
-      poolHoldingCids = map (toInterfaceContractId . fst) pool
+      evidence = PoolHoldings (map (toInterfaceContractId . fst) pool)
       validUntil = addRelTime now (hours 2)
 
 -- | The custodian's pool holdings, disclosed.
@@ -323,6 +323,7 @@ feesOutsideRangeAreRejected = script do
         depositCap = None
         paused = False
         underlyingTransferFactory = f.registryCid
+        pricing = PoolPricing
         priceLimits = wideLimits
   _ <- submit (actAs [f.registrar, f.custodian]) (mk 100)
   submitMustFail (actAs [f.registrar, f.custodian]) (mk (-100))
@@ -350,6 +351,7 @@ shareInstrumentIsTheVaults = script do
         depositCap = None
         paused = False
         underlyingTransferFactory = f.registryCid
+        pricing = PoolPricing
         priceLimits = wideLimits
   _ <- submit (actAs [f.registrar, f.custodian]) (mk (f.shares with id = "second"))
   -- Another vault's shares.

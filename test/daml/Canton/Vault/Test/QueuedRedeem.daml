@@ -15,7 +15,7 @@ import Canton.Vault.AsyncRedeem.V1
 import Canton.Vault.Reference.Math (sharesToAssets, deductFeeBps)
 import Canton.Vault.Reference.QueuedRedeem qualified as R
 import Canton.Vault.Reference.Queue qualified as R
-import Canton.Vault.Reference.V1 (PeriodFlow(..), PriceLimits(..), shareHoldingsKey, underlyingHoldingsKey)
+import Canton.Vault.Reference.V1 (PeriodFlow(..), PriceEvidence(..), PriceLimits(..), Pricing(..), shareHoldingsKey, underlyingHoldingsKey)
 import Canton.Vault.Test.CrossAdminSettlement (Registry(..), setupTokenRegistry, tokenArgs, lockedTokens)
 import Canton.Vault.Test.QueueSupport
 import Canton.Vault.Test.Reports
@@ -88,7 +88,9 @@ setupWithFee redeemFeeBps = do
       underlyingTransferFactory = toInterfaceContractId usd.rulesCid
       underlyingFactories = factoriesOf usd
       shareFactories = factoriesOf shares
+      pricing = PoolPricing
       priceLimits = generousLimits
+      allotments = []
   let env = Env with usd; shares; registrar; custodian; venue; alice; vaultCid; vaultId
   _ <- holdingOf custodian usd.admin (usdId env) 60.0
   _ <- holdingOf custodian usd.admin (usdId env) 40.0
@@ -143,7 +145,7 @@ escrowSpec env party label amount now = V2.AllocationSpecification with
   transferLegSides = [V2.TransferLegSide with
     transferLegId = requestLegId party label "shares"
     side = V2.SenderSide
-    otherside = burnAccount
+    otherside = redemptionAccount env.registrar
     amount
     instrumentId = env.vaultId
     meta = emptyMetadata]
@@ -294,6 +296,7 @@ fulfilPricedTree env party pool requests prices = do
       requestCids = map (.requestCid) requests
       priceCids = prices
       poolHoldingCids = map toInterfaceContractId pool
+      heldHoldingCids = []
       underlyingExtraArgs = tokenArgs env.usd
       shareExtraArgs = tokenArgs env.shares
 
@@ -601,8 +604,9 @@ openQueued env closed = do
   vaultCid <- submit (actAs env.registrar <> readAs env.custodian) do
     exerciseCmd closed R.ClosedQueuedRedeemPeriod_Open with
       flowCids = [cid | (cid, flow) <- flows, flow.vaultId == env.vaultId]
-      poolHoldingCids = map (toInterfaceContractId . fst) pool
+      evidence = PoolHoldings (map (toInterfaceContractId . fst) pool)
       validUntil = addRelTime now (hours 1)
+      allotments = []
   pure env with vaultCid
 
 -- | Nothing lands in a closed period: neither a new request nor a fulfilment.
@@ -753,6 +757,7 @@ providerAccountReceiverIsPaid = script do
     exerciseCmd next.vaultCid R.ReferenceQueuedRedeemVault_Fulfil with
       requestCids = [req.requestCid]; priceCids = []
       poolHoldingCids = map toInterfaceContractId pool
+      heldHoldingCids = []
       underlyingExtraArgs = args; shareExtraArgs = tokenArgs env.shares
   held <- query @Token env.alice
   sum [h.holding.amount | (_, h) <- held, h.holding.account == account, h.holding.instrumentId == usdId env] === 40.0
@@ -783,6 +788,7 @@ providerAccountSharesAreRedeemed = script do
     exerciseCmd next.vaultCid R.ReferenceQueuedRedeemVault_Fulfil with
       requestCids = [req.requestCid]; priceCids = []
       poolHoldingCids = map toInterfaceContractId pool
+      heldHoldingCids = []
       underlyingExtraArgs = tokenArgs env.usd; shareExtraArgs = args
   unlocked env (usdId env) env.alice >>= (=== 40.0)
   left <- query @Token env.alice
@@ -804,7 +810,7 @@ executorCannotForgeARequest = script do
       vaultId = env.vaultId; vaultRegistrar = env.registrar; executors = [env.venue]
       owner = env.alice; receiver = bob; label = "r1"; shares = 40.0; anchor = coerceContractId req.requestCid
       shareAllocation = req.shareAllocation; underlyingAllocation = bobs
-      expiresAt = forgedAt; epoch = 0; minAssetsOut = None
+      expiresAt = forgedAt; epoch = 0; minAssetsOut = None; filledIn = None
 
 -- | A copy of the vault under another id and its own custodian holding 100 USD, with Alice holding 100 of its shares.
 anotherVault : Env -> Text -> Script Env
@@ -860,7 +866,7 @@ executorCannotSignARequestAsRegistrar = script do
       vaultId = env.vaultId; vaultRegistrar = env.venue; executors = [env.venue]
       owner = env.alice; receiver = env.venue; label = "r1"; shares = 40.0; anchor = coerceContractId req.requestCid
       shareAllocation = req.shareAllocation; underlyingAllocation = venues
-      expiresAt = forgedAt; epoch = 0; minAssetsOut = None
+      expiresAt = forgedAt; epoch = 0; minAssetsOut = None; filledIn = None
   failsWith "request.vaultRegistrar" =<<
     fulfilAs env env.venue [req with requestCid = forged; underlyingAllocation = venues]
   unlocked env (usdId env) env.venue >>= (=== 0.0)
@@ -940,7 +946,7 @@ pendingCountsTheirRequestsOfThatPeriodOnce = script do
       vaultId = env.vaultId; vaultRegistrar = env.venue; executors = [env.venue]
       owner = env.alice; receiver = env.alice; label = "f1"; shares = 1000.0; anchor = coerceContractId r1.requestCid
       shareAllocation = r1.shareAllocation; underlyingAllocation = r1.underlyingAllocation
-      expiresAt = addRelTime forgedAt (days 1); epoch = 0; minAssetsOut = None
+      expiresAt = addRelTime forgedAt (days 1); epoch = 0; minAssetsOut = None; filledIn = None
   other <- anotherVault env "queued-redeem-2"
   (_, elsewhere) <- request other env.alice "o1" 30.0
   next <- nextPeriod env
@@ -1039,7 +1045,7 @@ rejectRefusesARecordTheRegistrarDidNotSign = script do
       vaultId = env.vaultId; vaultRegistrar = env.venue; executors = [env.venue]
       owner = env.alice; receiver = env.alice; label = "r1"; shares = 40.0; anchor = coerceContractId req.requestCid
       shareAllocation = req.shareAllocation; underlyingAllocation = req.underlyingAllocation
-      expiresAt = forgedAt; epoch = 0; minAssetsOut = None
+      expiresAt = forgedAt; epoch = 0; minAssetsOut = None; filledIn = None
   failsWith "request.vaultRegistrar" =<< rejectAs env env.venue [req with requestCid = forged] "forged"
   unlocked env (sharesId env) env.alice >>= (=== 60.0)
 
@@ -1130,7 +1136,7 @@ aLateFillNeedsItsOwnStruckPrice = script do
   forged <- submit env.venue do
     createCmd R.PeriodPrice with
       vaultId = env.vaultId; vaultRegistrar = env.venue; executors = [env.venue]
-      epoch = 1; totalShares = 1.0; totalAssets = 100.0
+      epoch = 1; totalShares = 1.0; totalAssets = 100.0; allotments = []
   failsWith "price.vaultRegistrar" =<< fulfilAtTree late env.venue [r1] [forged]
   other <- anotherVault env "queued-redeem-2"
   _ <- nextPeriod other
@@ -1174,11 +1180,13 @@ aQueuedRollBeyondTheLimitsNeedsTheCustodian = script do
   let open beyond parties = trySubmit (actAs parties <> readAs env.custodian) $
         if beyond
           then exerciseCmd closed R.ClosedQueuedRedeemPeriod_OpenBeyondLimits with
-            flowCids = map fst flows; poolHoldingCids = map (toInterfaceContractId . fst) pool
+            flowCids = map fst flows; evidence = PoolHoldings (map (toInterfaceContractId . fst) pool)
             validUntil = addRelTime now (hours 1)
+            allotments = []
           else exerciseCmd closed R.ClosedQueuedRedeemPeriod_Open with
-            flowCids = map fst flows; poolHoldingCids = map (toInterfaceContractId . fst) pool
+            flowCids = map fst flows; evidence = PoolHoldings (map (toInterfaceContractId . fst) pool)
             validUntil = addRelTime now (hours 1)
+            allotments = []
   failsWith "the price rises within the vault's limit" =<< open False [env.registrar]
   failsWith "requires authorizers" =<< open True [env.registrar]
   Right opened <- open True [env.registrar, env.custodian]
@@ -1222,7 +1230,7 @@ requestPublishesTheAllocationsItNeeds = script do
         admin = env.registrar; authorizer = basicAccount env.alice
         transferLegSides = [V2.TransferLegSide with
           transferLegId = requestLegId env.alice "r1" "shares"; side = V2.SenderSide
-          otherside = burnAccount; amount = 10.0; instrumentId = env.vaultId; meta = emptyMetadata]
+          otherside = redemptionAccount env.registrar; amount = 10.0; instrumentId = env.vaultId; meta = emptyMetadata]
         settlementDeadline = deadline; nextIterationFunding = None; committed = True; meta = emptyMetadata
     , V2.AllocationSpecification with
         admin = env.usd.admin; authorizer = basicAccount bob; transferLegSides = []

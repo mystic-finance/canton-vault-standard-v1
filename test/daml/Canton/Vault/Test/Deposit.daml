@@ -81,6 +81,7 @@ setupVaultLimited limits depositFeeBps redeemFeeBps vaultAccrual cap = do
       depositCap = cap
       paused = False
       underlyingTransferFactory = toInterfaceContractId registryTemplateCid
+      pricing = PoolPricing
       priceLimits = limits
 
   pure Fixture with
@@ -304,7 +305,7 @@ periodRollCarriesTotals = script do
   rolledCid <- submit (actAs f.registrar <> discloseMany poolDisclosures) do
     exerciseCmd closed10 ClosedPeriod_Open with
       flowCids = map fst flows
-      poolHoldingCids = map (toInterfaceContractId . fst) custodianHoldings
+      evidence = PoolHoldings (map (toInterfaceContractId . fst) custodianHoldings)
       validUntil = addRelTime now (hours 2)
 
   Some rolled <- queryContractId f.registrar rolledCid
@@ -346,7 +347,7 @@ rollRejectsWrongInstrument = script do
   submitMustFail (actAs f.registrar <> discloseMany poolDisclosures) do
     exerciseCmd closed11 ClosedPeriod_Open with
       flowCids = map fst flows
-      poolHoldingCids = map (toInterfaceContractId . fst) custodianHoldings
+      evidence = PoolHoldings (map (toInterfaceContractId . fst) custodianHoldings)
       validUntil = addRelTime now (hours 2)
 
 -- | An account's provider can fund a deposit alongside its owner.

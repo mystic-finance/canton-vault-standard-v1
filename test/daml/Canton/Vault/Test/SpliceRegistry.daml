@@ -60,6 +60,7 @@ setup = do
       depositCap = None
       paused = False
       underlyingTransferFactory = toInterfaceContractId usd.rulesCid
+      pricing = PoolPricing
       priceLimits = PriceLimits with maxIncreaseBpsPerYear = 1000000000000000000; maxDecreaseBps = 10000
   pool <- holdingOf custodian usd.admin (V2.InstrumentId with admin = usd.admin; id = "USD") 100.0
   shares <- holdingOf alice registrar shareId 100.0

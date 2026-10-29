@@ -43,8 +43,8 @@ virtualOffset : Decimal
 virtualOffset = 1.0
 
 -- | The price of one share, with the virtual offset.
-pricePerShare : Decimal -> Decimal -> Decimal
-pricePerShare totalShares totalAssets = (totalAssets + virtualOffset) / (totalShares + virtualOffset)
+sharePrice : Decimal -> Decimal -> Decimal
+sharePrice totalShares totalAssets = (totalAssets + virtualOffset) / (totalShares + virtualOffset)
 
 assetsToShares : Decimal -> Decimal -> Decimal -> Decimal
 assetsToShares totalShares totalAssets assets =

@@ -1,6 +1,7 @@
--- | A reference vault: one underlying, a computed rate fixed per period, instant settlement.
+-- | A reference vault: one underlying, a rate computed or attested and fixed per period, instant settlement.
 module Canton.Vault.Reference.V1 where
 
+import DA.Foldable (forA_)
 import DA.List (dedup, head)
 import DA.Optional (fromOptional)
 import DA.TextMap qualified as TextMap
@@ -94,6 +95,54 @@ template VaultLog
 data VaultAction = Deposited | Minted | Withdrew | Redeemed
   deriving (Eq, Show, Serializable)
 
+-- | Where a vault's price comes from at each roll.
+data Pricing
+  = PoolPricing
+  | OraclePricing with
+      oracle : Party
+        -- ^ The party whose attestations price the vault.
+      latest : Optional AttestedPrice
+        -- ^ The attestation the current price rests on, once one has been used.
+  deriving (Eq, Show, Serializable)
+
+data AttestedPrice = AttestedPrice with
+    pricePerShare : Decimal
+    effectiveAt : Time
+    attestationId : Text
+  deriving (Eq, Show, Serializable)
+
+validPricing : Party -> Pricing -> Bool
+validPricing registrar pricing = case pricing of
+  PoolPricing -> True
+  OraclePricing {oracle} -> oracle /= registrar
+
+-- | An oracle's price for one share of a vault, used up by the roll that opens a period at it.
+template RateAttestation
+  with
+    oracle : Party
+    vaultRegistrar : Party
+    vaultId : Text
+    pricePerShare : Decimal
+      -- ^ The price of one share in units of the underlying.
+    effectiveAt : Time
+      -- ^ The time the price was taken.
+    attestationId : Text
+  where
+    signatory oracle
+    observer vaultRegistrar
+
+    choice RateAttestation_Use : RateAttestation
+      -- ^ Consume the attestation, so no roll uses it twice.
+      controller vaultRegistrar
+      do pure this
+
+-- | What a roll prices the next period from: the pool for a vault priced from it, an attestation for one priced
+-- by an oracle.
+data PriceEvidence
+  = PoolHoldings [ContractId V2.Holding]
+  | Attestation (ContractId RateAttestation)
+  deriving (Eq, Show, Serializable)
+
 -- | A period that takes no more actions, so its flows are final when it is opened again.
 template ClosedPeriod
   with
@@ -102,18 +151,19 @@ template ClosedPeriod
     signatory vault.vaultRegistrar, vault.custodian
 
     choice ClosedPeriod_Open : ContractId ReferenceVault
-      -- ^ Open the next period, folding in the flows not yet counted and measuring the pool.
+      -- ^ Open the next period, folding in the flows not yet counted and pricing it from the evidence.
       with
         flowCids : [ContractId PeriodFlow]
-        poolHoldingCids : [ContractId V2.Holding]
+        evidence : PriceEvidence
         validUntil : Time
       controller vault.vaultRegistrar
       do
-        (shares, assets, now) <- rollTotals vault flowCids poolHoldingCids validUntil
+        (shares, assets, pricing, now) <- rollTotals vault flowCids evidence validUntil
         requirePriceWithinLimits vault.priceLimits vault shares assets
         create vault with
           totalShares = shares
           totalAssets = assets
+          pricing
           rateValidFrom = now
           rateValidUntil = validUntil
 
@@ -121,14 +171,15 @@ template ClosedPeriod
       -- ^ Open the next period at a price outside the vault's limits, on the custodian's word as well.
       with
         flowCids : [ContractId PeriodFlow]
-        poolHoldingCids : [ContractId V2.Holding]
+        evidence : PriceEvidence
         validUntil : Time
       controller vault.vaultRegistrar, vault.custodian
       do
-        (shares, assets, now) <- rollTotals vault flowCids poolHoldingCids validUntil
+        (shares, assets, pricing, now) <- rollTotals vault flowCids evidence validUntil
         create vault with
           totalShares = shares
           totalAssets = assets
+          pricing
           rateValidFrom = now
           rateValidUntil = validUntil
 
@@ -155,7 +206,9 @@ template ReferenceVault
     totalShares : Decimal
       -- ^ The shares in issue as of `rateValidFrom`.
     totalAssets : Decimal
-      -- ^ The pool as of `rateValidFrom`, before the virtual offset.
+      -- ^ The vault's value as of `rateValidFrom`, before the virtual offset.
+    pricing : Pricing
+      -- ^ Where each roll takes the price from, fixed for the vault's life.
     accrual : Optional Accrual
     depositFeeBps : Int
     redeemFeeBps : Int
@@ -179,6 +232,7 @@ template ReferenceVault
         && depositFeeBps >= 0 && depositFeeBps <= 10000
         && redeemFeeBps >= 0 && redeemFeeBps <= 10000
         && validPriceLimits priceLimits
+        && validPricing vaultRegistrar pricing
 
     interface instance Vault for ReferenceVault where
       view = VaultView with
@@ -189,11 +243,9 @@ template ReferenceVault
         shareInstrument
         totalShares = totalShares + virtualOffset
         totalAssets = totalAssets + virtualOffset
-        rate = ComputedRate with
-          asOf = rateValidFrom
-          accrual
-          depositFeeBps
-          redeemFeeBps
+        rate = rateOf this
+        depositFeeBps
+        redeemFeeBps
         rateValidFrom
         rateValidUntil
         meta = emptyMetadata
@@ -217,14 +269,23 @@ template ReferenceVault
           let cost shares = grossUpFeeBps depositFeeBps (sharesToAssetsUp totalShares assets' shares)
           pure (fitDown (\s -> cost s <= cap) (assetsToShares totalShares assets' (deductFeeBps depositFeeBps cap)))
 
-      -- The most assets whose shares, fee included, the party holds.
+      -- The most assets whose shares, fee included, the party holds, and that the pool can pay.
       maxWithdraw party extraArgs = do
         assets' <- currentAssets this
         held <- heldShares this extraArgs party
+        payable <- payableFrom this extraArgs
         let burned assets = assetsToSharesUp totalShares assets' (grossUpFeeBps redeemFeeBps assets)
-        pure (fitDown (\a -> burned a <= held) (deductFeeBps redeemFeeBps (sharesToAssets totalShares assets' held)))
+        pure (fitDown (\a -> burned a <= held) (min payable (deductFeeBps redeemFeeBps (sharesToAssets totalShares assets' held))))
 
-      maxRedeem party extraArgs = heldShares this extraArgs party
+      -- The shares the party holds, as many as the pool can pay for.
+      maxRedeem party extraArgs = do
+        held <- heldShares this extraArgs party
+        payable <- payableFrom this extraArgs
+        if payable >= uncapped || redeemFeeBps >= 10000 then pure held else do
+          assets' <- currentAssets this
+          let paid s = deductFeeBps redeemFeeBps (sharesToAssets totalShares assets' s)
+          pure (fitDown (\s -> paid s <= payable)
+            (min held (assetsToShares totalShares assets' (grossUpFeeBps redeemFeeBps payable))))
 
       previewDeposit assets = do
         assets' <- currentAssets this
@@ -397,9 +458,19 @@ recordEvent vault action actors receiver assets shares = do
     observers = dedup (receiver :: actors)
   archive log
 
--- | The totals for the next period: this one's flows folded in, the pool measured.
-rollTotals : ReferenceVault -> [ContractId PeriodFlow] -> [ContractId V2.Holding] -> Time -> Update (Decimal, Decimal, Time)
-rollTotals vault flowCids poolHoldingCids validUntil = do
+rateOf : ReferenceVault -> Rate
+rateOf vault = case vault.pricing of
+  OraclePricing {oracle, latest = Some a} -> Attested AttestedRate with
+    pricePerShare = a.pricePerShare
+    authority = oracle
+    effectiveAt = a.effectiveAt
+    attestationId = a.attestationId
+    accrual = vault.accrual
+  _ -> Computed ComputedRate with asOf = vault.rateValidFrom; accrual = vault.accrual
+
+-- | The totals for the next period: this one's flows folded in, the value priced from the evidence.
+rollTotals : ReferenceVault -> [ContractId PeriodFlow] -> PriceEvidence -> Time -> Update (Decimal, Decimal, Pricing, Time)
+rollTotals vault flowCids evidence validUntil = do
   now <- getTime
   require "period ends in the future" (validUntil > now)
   flows <- forA flowCids $ \cid -> do
@@ -407,10 +478,28 @@ rollTotals vault flowCids poolHoldingCids validUntil = do
     require' ("flow.vaultId", flow.vaultId) isEqualR ("vaultId", vault.vaultId)
     archive cid
     pure flow
-  assets <- sumPool vault poolHoldingCids
   let shares = vault.totalShares + sum (map (.sharesDelta) flows)
   require "shares stay non-negative" (shares >= 0.0)
-  pure (shares, assets, now)
+  case (vault.pricing, evidence) of
+    (PoolPricing, PoolHoldings poolHoldingCids) -> do
+      assets <- sumPool vault poolHoldingCids
+      pure (shares, assets, PoolPricing, now)
+    (OraclePricing {oracle, latest}, Attestation cid) -> do
+      a <- exercise cid RateAttestation_Use
+      require' ("attestation.oracle", a.oracle) isEqualR ("oracle", oracle)
+      require' ("attestation.vaultId", a.vaultId) isEqualR ("vaultId", vault.vaultId)
+      require' ("attestation.vaultRegistrar", a.vaultRegistrar) isEqualR ("vaultRegistrar", vault.vaultRegistrar)
+      require "the attested price is not from the future" (a.effectiveAt <= now)
+      forA_ latest $ \l -> require "the attestation is newer than the last" (a.effectiveAt > l.effectiveAt)
+      let assets = mulDivDown a.pricePerShare (shares + virtualOffset) 1.0 - virtualOffset
+      require "the attested price values the vault at no less than nothing" (assets >= 0.0)
+      let used = AttestedPrice with
+            pricePerShare = a.pricePerShare
+            effectiveAt = a.effectiveAt
+            attestationId = a.attestationId
+      pure (shares, assets, (OraclePricing with oracle; latest = Some used), now)
+    (PoolPricing, _) -> fail "the vault is priced from its pool"
+    (OraclePricing {}, _) -> fail "the vault is priced by its oracle"
 
 -- | How far one roll may move the price per share before the custodian must agree.
 data PriceLimits = PriceLimits with
@@ -427,8 +516,8 @@ validPriceLimits limits =
 -- | Refuses a roll whose price per share leaves the limits, measured against the closing period's opening price.
 requirePriceWithinLimits : PriceLimits -> ReferenceVault -> Decimal -> Decimal -> Update ()
 requirePriceWithinLimits limits vault shares assets = do
-  let before = pricePerShare vault.totalShares vault.totalAssets
-      after = pricePerShare shares assets
+  let before = sharePrice vault.totalShares vault.totalAssets
+      after = sharePrice shares assets
       years = elapsedSeconds vault.rateValidFrom vault.rateValidUntil / 31536000.0
       rise = intToDecimal limits.maxIncreaseBpsPerYear / 10000.0 * years
       fall = intToDecimal limits.maxDecreaseBps / 10000.0
@@ -458,6 +547,13 @@ sumPool vault holdingCids = do
     require "pool holding is unlocked" (holding.lock == None)
     pure holding.amount
   pure (sum amounts)
+
+-- | What an exit can be paid: the pool named in `extraArgs` for a vault priced by its oracle, whose value can sit
+-- outside the pool; no limit for one priced from its pool, which holds all its value.
+payableFrom : ReferenceVault -> ExtraArgs -> Update Decimal
+payableFrom vault extraArgs = case vault.pricing of
+  PoolPricing -> pure uncapped
+  OraclePricing {} -> sumPool vault =<< getUnderlyingHoldings extraArgs.context
 
 -- | Shares the party holds among the holdings they named; unnamed ones do not count.
 heldShares : ReferenceVault -> ExtraArgs -> Party -> Update Decimal

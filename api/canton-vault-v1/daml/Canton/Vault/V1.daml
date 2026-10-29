@@ -37,11 +37,28 @@ data ComputedRate = ComputedRate with
       -- ^ The model by which assets accrue after `asOf`. Both the vault and
       -- off-ledger readers accrue `VaultView.totalAssets` forwards using it.
       -- When absent, the rate moves only when a transaction touches the vault.
-    depositFeeBps : Int
-      -- ^ The fee on deposits and mints, in basis points of the assets paid in.
-    redeemFeeBps : Int
-      -- ^ The fee on redemptions and withdrawals, in basis points of what the
-      -- shares are worth. Both paths out pay the same fee.
+  deriving (Show, Eq, Serializable)
+
+-- | Share price, attested by an authority outside the vault, for value the
+-- vault cannot sum from holdings on the ledger.
+data AttestedRate = AttestedRate with
+    pricePerShare : Decimal
+      -- ^ The price of one share in units of the underlying, as attested.
+    authority : Party
+      -- ^ The party that attested the price.
+    effectiveAt : Time
+      -- ^ The time the attested price was taken.
+    attestationId : Text
+      -- ^ The authority's identifier for the attestation.
+    accrual : Optional Accrual
+      -- ^ The model by which the price accrues from `VaultView.rateValidFrom`.
+  deriving (Show, Eq, Serializable)
+
+-- | Share price: computed from the vault's own totals, or attested by an
+-- authority.
+data Rate
+  = Computed ComputedRate
+  | Attested AttestedRate
   deriving (Show, Eq, Serializable)
 
 -- | Everything a wallet needs to quote a vault and decide whether to transact.
@@ -69,11 +86,18 @@ data VaultView = VaultView with
       -- ^ Shares in issue as of `rateValidFrom`. A snapshot rather than a live
       -- total, since actions are nonconsuming and do not rewrite the vault.
     totalAssets : Decimal
-      -- ^ Pool value as of `rateValidFrom`, with the same staleness. Includes
-      -- the virtual offset, so that off-ledger math matches on-ledger.
-    rate : ComputedRate
+      -- ^ Value of the vault as of `rateValidFrom`, with the same staleness:
+      -- the pool for a computed rate, the attested price times the shares for
+      -- an attested one. Includes the virtual offset, so that off-ledger math
+      -- matches on-ledger.
+    rate : Rate
       -- ^ Share price, fixed for the period below. A rate with an accrual still
       -- moves within the period, but its parameters do not.
+    depositFeeBps : Int
+      -- ^ The fee on deposits and mints, in basis points of the assets paid in.
+    redeemFeeBps : Int
+      -- ^ The fee on redemptions and withdrawals, in basis points of what the
+      -- shares are worth. Both paths out pay the same fee.
     rateValidFrom : Time
       -- ^ Start of the period this rate applies to.
     rateValidUntil : Time
@@ -147,6 +171,12 @@ requestLegId : Party -> Text -> Text -> Text
 requestLegId requester label leg =
   partyToText requester <> "/" <> label <> "/" <> leg
 
+-- | The account a queued redemption's escrow sends its shares to: the
+-- registrar's account for shares it holds for redeemers until they are burned
+-- or returned. Wallets compute it before allocating.
+redemptionAccount : Party -> Account
+redemptionAccount registrar = Account with owner = Some registrar; provider = None; id = "redemptions"
+
 --
 -- Vault
 ---------
@@ -182,12 +212,12 @@ interface Vault where
   maxMint : Party -> ExtraArgs -> Update Decimal
 
   -- | Most of the underlying the party's named share holdings can withdraw,
-  -- after the fee. Reading the pool needs the custodian's authority, which a
-  -- read method does not carry, so available liquidity is not reflected and a
-  -- withdrawal may still fail for want of it.
+  -- after the fee. A vault whose value can sit outside its pool, such as one
+  -- with an attested rate, also caps it at what the pool holdings named in
+  -- `extraArgs` can pay.
   maxWithdraw : Party -> ExtraArgs -> Update Decimal
 
-  -- | The party's named share holdings. Liquidity as for `maxWithdraw`.
+  -- | The party's named share holdings, capped as for `maxWithdraw`.
   maxRedeem : Party -> ExtraArgs -> Update Decimal
 
   -- | Shares `assets` would mint, including fees. Rounds down.

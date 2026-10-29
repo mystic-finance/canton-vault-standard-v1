@@ -4,7 +4,7 @@ module Canton.Vault.Reference.Queue where
 import DA.Foldable (forA_)
 import DA.List (dedup, sort, unique)
 import DA.Map qualified as Map
-
+import DA.Optional (isSome)
 import DA.TextMap qualified as TextMap
 import DA.Time (isLedgerTimeGE)
 
@@ -183,6 +183,8 @@ template PeriodPrice
       -- ^ The period this price opened.
     totalShares : Decimal
     totalAssets : Decimal
+    allotments : [(Int, Decimal)]
+      -- ^ The share of each earlier period's requests the period this price opened could fill.
   where
     signatory vaultRegistrar
     observer executors
@@ -204,9 +206,16 @@ data Outcome
   = Fulfilled with
       received : Decimal
         -- ^ The shares issued, or the underlying paid.
+  | PartlyFilled with
+      received : Decimal
+        -- ^ The underlying paid for the part filled.
+      filled : Decimal
+        -- ^ The shares filled; the rest stay queued.
   | Rejected with
       reason : Text
         -- ^ Why the request could not settle.
+  | Reclaimed
+      -- ^ The owner took back the shares not yet filled.
   deriving (Eq, Show, Serializable)
 
 -- | Reports queued requests' outcomes in the transaction they happen in, as the token standard's `EventLog` does.
@@ -231,6 +240,22 @@ reportQueued registrar events = do
   log <- create QueueLog with vaultRegistrar = registrar
   forA_ events $ \event -> exercise log QueueLog_Report with event; observers = dedup [event.requester, event.receiver]
   archive log
+
+-- | The opening totals of the first period after a request's that could fill it: one that allotted its period a share,
+-- or the one right after for a vault that fills every request whole. Those stored for an earlier one, or the current.
+firstFillableFor : Bool -> Int -> Int -> ((Decimal, Decimal), [(Int, Decimal)]) -> [PeriodPrice] -> Update (Decimal, Decimal)
+firstFillableFor whole requestEpoch = firstFillableFrom whole requestEpoch (requestEpoch + 1)
+
+firstFillableFrom : Bool -> Int -> Int -> Int -> ((Decimal, Decimal), [(Int, Decimal)]) -> [PeriodPrice] -> Update (Decimal, Decimal)
+firstFillableFrom whole requestEpoch e currentEpoch current prices
+  | e > currentEpoch = fail ("no period has allotted requests of period " <> show requestEpoch)
+  | otherwise = do
+      (totals, allotted) <- if e == currentEpoch then pure current else
+        case [p | p <- prices, p.epoch == e] of
+          p :: _ -> pure ((p.totalShares, p.totalAssets), p.allotments)
+          [] -> fail ("no price struck for period " <> show e)
+      if whole || isSome (lookup requestEpoch allotted) then pure totals
+        else firstFillableFrom whole requestEpoch (e + 1) currentEpoch current prices
 
 -- | Opening totals of the period after a request's: those stored for an earlier one, or the current ones.
 struckFor : Int -> Int -> (Decimal, Decimal) -> [PeriodPrice] -> Update (Decimal, Decimal)

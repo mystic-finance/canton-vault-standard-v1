@@ -56,12 +56,12 @@ closeForRoll f vaultCid = do
 openAs : [Party] -> Roll -> Script (Either SubmitError (ContractId ReferenceVault))
 openAs parties r = trySubmit (actAs parties <> discloseMany r.ds) do
   exerciseCmd r.closed ClosedPeriod_Open with
-    flowCids = r.flowCids; poolHoldingCids = r.poolHoldingCids; validUntil = r.validUntil
+    flowCids = r.flowCids; evidence = PoolHoldings (r.poolHoldingCids); validUntil = r.validUntil
 
 openBeyondAs : [Party] -> Roll -> Script (Either SubmitError (ContractId ReferenceVault))
 openBeyondAs parties r = trySubmit (actAs parties <> discloseMany r.ds) do
   exerciseCmd r.closed ClosedPeriod_OpenBeyondLimits with
-    flowCids = r.flowCids; poolHoldingCids = r.poolHoldingCids; validUntil = r.validUntil
+    flowCids = r.flowCids; evidence = PoolHoldings (r.poolHoldingCids); validUntil = r.validUntil
 
 -- | Replaces the pool with the given fraction of it.
 shrinkPoolTo : Fixture -> Decimal -> Script ()

@@ -13,17 +13,18 @@ import Canton.Vault.V1
 --
 -- A request names its terms, and the vault publishes the allocations it needs
 -- as the token standard's `AllocationRequest`: the holder's escrow, sending
--- `shares` to the burn account with the leg id `requestLegId`, and the
--- receiver's authorization to be paid the underlying by the custodian, with no
--- legs. Both carry the request's own settlement, with the id
--- `requestSettlementId` and a contract id naming the request, so an allocation
--- made for one request settles no other; both are committed until the end of
--- the request's period plus the vault's `settlementDeadlineWindow`. Wallets
--- allocate exactly as requested, and the executors bind the allocations before
--- the request's period ends, so none is made knowing the price; a request
--- unfunded by then is dropped. The executors fulfil a request before its
--- deadline, at the rate its `RequestId` says; how they do so is the vault's
--- own.
+-- `shares` to the registrar's `redemptionAccount` with the leg id
+-- `requestLegId`, and the receiver's authorization to be paid the underlying by
+-- the custodian, with no legs. Both carry the request's own settlement, with
+-- the id `requestSettlementId` and a contract id naming the request, so an
+-- allocation made for one request settles no other; both are committed until
+-- the end of the request's period plus the vault's `settlementDeadlineWindow`.
+-- Wallets allocate exactly as requested, and the executors bind the allocations
+-- before the request's period ends, so none is made knowing the price; a
+-- request unfunded by then is dropped. The executors fulfil a request at the
+-- rate its `RequestId` says, settling the escrow before its deadline; how they
+-- do so is the vault's own. A vault may fill a request in parts over several
+-- periods, holding the rest of its shares in the redemption account meanwhile.
 interface VaultAsyncRedeem requires Vault where
   viewtype AsyncView
 
@@ -31,7 +32,8 @@ interface VaultAsyncRedeem requires Vault where
   -- contracts named in `extraArgs` show. A vault cannot look them up, so one not
   -- named does not count, and one named twice counts once; naming one that is
   -- gone fails. A request counts once its allocations are bound, until it is
-  -- fulfilled, rejected or expires.
+  -- fulfilled, rejected or expires; the unfilled rest of one filled in part
+  -- counts until it is filled or returned.
   pendingRedeemRequest : RequestId -> Party -> ExtraArgs -> Update Decimal
 
   vault_requestRedeemImpl : ContractId VaultAsyncRedeem -> Vault_RequestRedeem -> Update RequestId

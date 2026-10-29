@@ -98,6 +98,7 @@ commandForAnotherVaultIsRefused = script do
       depositCap = None
       paused = False
       underlyingTransferFactory = f.registryCid
+      pricing = PoolPricing
       priceLimits = wideLimits
   commandCid <- sign f venue (hours 24)
   Left _ <- run f venue commandCid sibling
@@ -127,6 +128,7 @@ commandForAnotherRegistrarIsRefused = script do
       depositCap = None
       paused = False
       underlyingTransferFactory = f.registryCid
+      pricing = PoolPricing
       priceLimits = wideLimits
   commandCid <- sign f venue (hours 24)
   impostorD <- queryDisclosure rogue impostor

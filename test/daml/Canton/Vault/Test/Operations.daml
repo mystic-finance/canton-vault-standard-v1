@@ -102,7 +102,7 @@ theNextPeriodCountsEveryAction = script do
   rolled <- submit (actAs f.registrar <> discloseMany poolDs) do
     exerciseCmd closed ClosedPeriod_Open with
       flowCids = map fst flows
-      poolHoldingCids = map (toInterfaceContractId . fst) pool
+      evidence = PoolHoldings (map (toInterfaceContractId . fst) pool)
       validUntil = addRelTime now (hours 2)
   Some vault <- queryContractId f.registrar rolled
   vault.totalShares === first.shares + second.shares
