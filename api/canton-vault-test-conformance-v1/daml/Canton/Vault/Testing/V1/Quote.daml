@@ -1,0 +1,72 @@
+-- | Quoting from a vault's view alone, by the formulas `Vault` states: what a
+-- wallet computes before it acts.
+module Canton.Vault.Testing.V1.Quote where
+
+import DA.Math (exp)
+import DA.Numeric qualified as N
+import DA.Time (convertRelTimeToMicroseconds, subTime)
+
+import Canton.Vault.V1
+
+ulp : Decimal
+ulp = 0.0000000001
+
+-- | `a * b / c` taken exactly, then rounded down to 10 decimals.
+down : Decimal -> Decimal -> Decimal -> Decimal
+down a b c =
+  let p = N.mul @20 a b
+      r = N.div @10 p c
+  in if N.mul @20 r c > p then r - ulp else r
+
+-- | `a * b / c` taken exactly, then rounded up to 10 decimals.
+up : Decimal -> Decimal -> Decimal -> Decimal
+up a b c =
+  let p = N.mul @20 a b
+      r = N.div @10 p c
+  in if N.mul @20 r c < p then r + ulp else r
+
+net : Int -> Decimal -> Decimal
+net fee x = x - up x (intToDecimal fee) 10000.0
+
+-- | The least amount, in steps of 10^-10, that nets at least `x`; none at a full fee.
+gross : Int -> Decimal -> Optional Decimal
+gross fee x
+  | fee >= 10000 = None
+  | otherwise = Some (climb fee x (up x 10000.0 (intToDecimal (10000 - fee))))
+
+climb : Int -> Decimal -> Decimal -> Decimal
+climb fee x g = if net fee g >= x then lower fee x g else climb fee x (g + ulp)
+
+lower : Int -> Decimal -> Decimal -> Decimal
+lower fee x g = if g > 0.0 && net fee (g - ulp) >= x then lower fee x (g - ulp) else g
+
+data Quote = Quote with
+    toShares : Decimal
+    toAssets : Decimal
+    deposit : Decimal
+    mint : Optional Decimal
+    withdraw : Optional Decimal
+    redeem : Decimal
+  deriving (Eq, Show)
+
+-- | The view's `totalAssets` accrued to `t`, as `Accrual` states.
+accrued : VaultView -> Time -> Decimal
+accrued v t =
+  let dt = intToDecimal (convertRelTimeToMicroseconds (subTime t v.rate.asOf)) / 1000000.0
+  in if dt <= 0.0 then v.totalAssets else case v.rate.accrual of
+    None -> v.totalAssets
+    Some (AccrualSimple with ratePerSecond) -> v.totalAssets * (1.0 + ratePerSecond * dt)
+    Some (AccrualCompounding with ratePerSecond) -> v.totalAssets * exp (ratePerSecond * dt)
+
+-- | Every path quoted from the view at `t`, for `assets` in and `shares` out.
+quote : VaultView -> Time -> Decimal -> Decimal -> Quote
+quote v t assets shares =
+  let s = v.totalShares + v.virtualShares
+      a = accrued v t + v.virtualAssets
+  in Quote with
+    toShares = down assets s a
+    toAssets = down shares a s
+    deposit = down (net v.depositFeeBps assets) s a
+    mint = gross v.mintFeeBps (up shares a s)
+    withdraw = (\g -> up g s a) <$> gross v.withdrawFeeBps assets
+    redeem = net v.redeemFeeBps (down shares a s)

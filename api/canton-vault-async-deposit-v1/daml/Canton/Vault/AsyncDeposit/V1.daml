@@ -3,61 +3,73 @@
 module Canton.Vault.AsyncDeposit.V1 where
 
 import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.HoldingV2
 
 import Canton.Vault.V1
 
 -- | An interface for queuing deposits. A vault implements it alongside `Vault`
 -- when deposits are fulfilled later rather than at once; its `Vault_Deposit`,
--- `Vault_Mint`, `previewDeposit` and `previewMint` then fail, and its
--- `maxDeposit` and `maxMint` return zero.
+-- `Vault_Mint`, `previewDeposit` and `previewMint` MUST then fail, and its
+-- `maxDeposit` and `maxMint` MUST return zero.
 --
 -- A request names its terms, and the vault publishes the allocations it needs
--- to fund it as the token standard's `AllocationRequest`. The escrow pays an
--- account of the vault's `custodian` or `vaultRegistrar`, and an allocation
--- made for one request settles no other. The escrow stays committed until the
--- end of the request's period plus the vault's `settlementDeadlineWindow`,
--- after which the requester can withdraw it.
+-- to fund it as the token standard's `AllocationRequest`, whose settlement's
+-- executors MUST be the `AsyncView.executors`. The requester and the receiver
+-- MUST each be able to reject it, and the executors to withdraw it. The escrow
+-- MUST pay the vault's `custodian` account or an account of its
+-- `vaultRegistrar`, an allocation made for one request MUST settle no other,
+-- and the escrow's settlement deadline MUST be no later than the end of the
+-- request's period plus the vault's `settlementDeadlineWindow`, after which the
+-- requester can withdraw it. A vault SHOULD settle only allocations created by
+-- the underlying's registry.
 --
--- A vault may fill a request in parts. No part is filled at a rate below the
--- requester's minimum, and the unfilled rest is recoverable by the requester
--- alone by the request's deadline. How and when the executors fill requests is
--- the vault's own; its `AsyncView` says when they are priced.
+-- A vault may fill a request in parts. It MUST NOT fill a part for fewer shares
+-- than that part's share of the requester's minimum, and the unfilled rest
+-- MUST stay recoverable by the requester alone by the request's deadline. How
+-- and when the executors fill requests is the vault's own; its `AsyncView`
+-- says when they are priced.
+--
+-- A vault implementing this interface MUST report its events through a
+-- `VaultEventLog`.
 interface VaultAsyncDeposit requires Vault where
   viewtype AsyncView
 
-  -- | Units of the underlying the party has queued under the request id, as the
-  -- contracts named in `extraArgs` show. A vault cannot look them up, so one not
-  -- named does not count, and one named twice counts once; naming one that is
-  -- gone fails. A request counts from when the vault accepts its funding until
-  -- it is filled, rejected or expires; the unfilled rest of one filled in part
-  -- counts until it is filled or returned.
-  pendingDepositRequest : RequestId -> Party -> ExtraArgs -> Update Decimal
+  -- | Units of the underlying the account has queued under the request id, as
+  -- the requests named in `extraArgs` show. A vault cannot look them up, so
+  -- one not named does not count, and one named twice counts once; naming one
+  -- that has ended fails. A request counts from when the vault accepts its
+  -- funding until it is filled, closed or past its deadline; the unfilled rest
+  -- of one filled in part counts until it is filled or returned.
+  pendingDepositRequest : RequestId -> Account -> ExtraArgs -> Update Decimal
 
-  vault_requestDepositImpl : ContractId VaultAsyncDeposit -> Vault_RequestDeposit -> Update RequestId
+  vault_requestDepositImpl : ContractId VaultAsyncDeposit -> Vault_RequestDeposit -> Update Vault_RequestDepositResult
   vault_requestDepositExtraObservers : Vault_RequestDeposit -> [Party]
   vault_publicPendingDepositRequestImpl : ContractId VaultAsyncDeposit -> Vault_PublicPendingDepositRequest -> Update Decimal
 
-  nonconsuming choice Vault_RequestDeposit : RequestId
-    -- ^ Queue a deposit of `assets`, for shares issued to `receiver` at the rate
-    -- the vault's request pricing gives it.
+  nonconsuming choice Vault_RequestDeposit : Vault_RequestDepositResult
+    -- ^ Queue a deposit of `assets` from `sender`, for shares issued to
+    -- `receiver` at the rate the vault's request pricing gives it.
     with
       label : Text
-        -- ^ The requester's label for the request, telling their requests
-        -- apart.
+        -- ^ The requester's label for the request, which the vault's events
+        -- name it by. Requesters SHOULD keep it unique among their open
+        -- requests.
       assets : Decimal
-        -- ^ Units of the underlying to deposit.
-      receiver : Party
-        -- ^ The party to be issued the shares.
+        -- ^ The units of the underlying to deposit.
+      sender : Account
+        -- ^ The account the escrow is funded from.
+      receiver : Account
+        -- ^ The account the shares are issued to.
       minSharesOut : Optional Decimal
-        -- ^ The fewest shares the requester accepts for the whole request; a
-        -- fill, or part of one, at a lower rate fails rather than fill.
+        -- ^ The fewest shares the requester accepts for the whole request, or
+        -- `None` for any rate.
       actors : [Party]
-        -- ^ Parties executing the request: the parties of the account the
-        -- escrow is funded from. Implementations MUST check them, as for
-        -- `Vault_Deposit`.
+        -- ^ The parties executing the request.
+        --
+        -- Implementations MUST check these parties against `sender`, to avoid
+        -- unauthorized requests.
       extraArgs : ExtraArgs
-        -- ^ The funding account, as the instant deposit takes it, and the
-        -- receiver's account under `receiver`, both in `meta`.
+        -- ^ Additional context required in order to exercise the choice.
     observer vault_requestDepositExtraObservers this arg
     controller actors
     do vault_requestDepositImpl this self arg
@@ -67,16 +79,24 @@ interface VaultAsyncDeposit requires Vault where
     --
     -- Fetching a vault needs the authority of one of its stakeholders, so a
     -- contract of another party, such as a vault with a request queued here,
-    -- reads it through this choice. The vault may refuse actors it has not
+    -- reads it through this choice. The vault MAY refuse actors it has not
     -- chosen to serve.
     with
       requestId : RequestId
         -- ^ The request id to read.
-      party : Party
-        -- ^ The party whose queued underlying is read.
+      account : Account
+        -- ^ The account whose queued underlying is read.
       actors : [Party]
-        -- ^ Parties executing the read.
+        -- ^ The parties executing the read.
       extraArgs : ExtraArgs
         -- ^ The requests to count, as `pendingDepositRequest` takes them.
     controller actors
     do vault_publicPendingDepositRequestImpl this self arg
+
+-- | The result of `Vault_RequestDeposit`.
+data Vault_RequestDepositResult = Vault_RequestDepositResult with
+    requestId : RequestId
+      -- ^ The id the request is queued under.
+    meta : Metadata
+      -- ^ Additional metadata specific to the request, used for extensibility.
+  deriving (Show, Eq, Serializable)

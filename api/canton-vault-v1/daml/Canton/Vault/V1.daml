@@ -18,14 +18,21 @@ import Splice.Api.Token.HoldingV2
 ---------
 
 -- | Per-second yield model used to accrue a vault's total assets.
+--
+-- Assets accrued from `Rate.asOf` to time `t` are, in Daml `Decimal`
+-- arithmetic evaluated as written, `totalAssets * (1.0 + ratePerSecond * dt)`
+-- for `AccrualSimple` and `totalAssets * exp (ratePerSecond * dt)` for
+-- `AccrualCompounding`, where `exp` is `DA.Math.exp` and `dt` is the
+-- microseconds from `asOf` to `t` divided by `1000000.0`. When `dt` is not
+-- positive, assets do not accrue.
 data Accrual
   = AccrualSimple with
       ratePerSecond : Decimal
-        -- ^ Simple-linear accrual (APR): assets grow by `ratePerSecond` of the
-        -- value at `asOf` for every elapsed second.
+        -- ^ The simple-linear rate (APR): assets grow by this fraction of
+        -- their value at `asOf` for every elapsed second.
   | AccrualCompounding with
       ratePerSecond : Decimal
-        -- ^ Continuously-compounding accrual (APY).
+        -- ^ The continuously-compounding rate (APY).
   deriving (Show, Eq, Serializable)
 
 -- | A price from outside the ledger that a vault's value depends on.
@@ -40,14 +47,16 @@ data PriceInput = PriceInput with
       -- ^ The authority's identifier for the price.
   deriving (Show, Eq, Serializable)
 
--- | Share price: `VaultView.totalAssets` over `VaultView.totalShares`, fixed
--- for the period on the view except as the accrual moves it.
+-- | Share price: `VaultView.totalAssets` plus `virtualAssets` over
+-- `VaultView.totalShares` plus `virtualShares`, fixed for the period on the
+-- view except as the accrual moves it.
 data Rate = Rate with
     asOf : Time
-      -- ^ When the totals this rate prices were taken.
+      -- ^ The time the totals this rate prices were taken.
     accrual : Optional Accrual
-      -- ^ The model by which assets accrue after `asOf`. Both the vault and
-      -- off-ledger readers accrue `VaultView.totalAssets` forwards using it.
+      -- ^ The model by which assets accrue after `asOf`, if any. The vault and
+      -- off-ledger readers MUST both accrue `VaultView.totalAssets` by it, and
+      -- not `virtualAssets`.
     inputs : [PriceInput]
       -- ^ The prices from outside the ledger the totals depend on. Empty when
       -- they are derived entirely from on-ledger state.
@@ -64,25 +73,31 @@ data VaultView = VaultView with
       -- ^ The identifier of the vault, unique per registrar and stable across
       -- archives, so wallets key on it rather than on a contract id.
     vaultRegistrar : Party
-      -- ^ Admin of the share instrument, and the party that operates the vault.
-    custodian : Party
-      -- ^ The party holding the vault's assets. A contract cannot own holdings,
-      -- so a vault names a party for them.
+      -- ^ The admin of the share instrument, and the party that operates the
+      -- vault.
+    custodian : Account
+      -- ^ The account holding the vault's assets. A contract cannot own
+      -- holdings, so a vault names an account for them; it MUST have an owner,
+      -- and that owner MUST be a signatory of the vault.
     underlyingInstrument : InstrumentId
       -- ^ The instrument the vault accepts. There is exactly one per vault.
     shareInstrument : InstrumentId
       -- ^ The instrument the vault issues, administered by `vaultRegistrar`.
     totalShares : Decimal
-      -- ^ Shares in issue as of `rateValidFrom`. A snapshot rather than a live
-      -- total, since actions are nonconsuming and do not rewrite the vault.
+      -- ^ The shares in issue as of `rateValidFrom`: a snapshot, not a live
+      -- total.
     totalAssets : Decimal
-      -- ^ Value of the vault's assets in the underlying as of `rateValidFrom`,
-      -- with the same staleness, counting only assets that belong to this
-      -- vault. Includes any virtual offset, so that off-ledger math matches
-      -- on-ledger.
+      -- ^ The value of the vault's assets in the underlying as of
+      -- `rateValidFrom`, counting only assets that belong to this vault.
+    virtualShares : Decimal
+      -- ^ The shares the vault counts on top of `totalShares` when it prices,
+      -- so that the first deposit cannot set the price; zero for none.
+    virtualAssets : Decimal
+      -- ^ The assets the vault counts on top of `totalAssets` when it prices;
+      -- zero for none.
     rate : Rate
-      -- ^ Share price, fixed for the period below. A rate with an accrual still
-      -- moves within the period, but its parameters do not.
+      -- ^ The share price, fixed for the period below. A rate with an accrual
+      -- still moves within the period, but its parameters do not.
     depositFeeBps : Int
       -- ^ The fee on `Vault_Deposit`, in basis points of the assets paid in.
     mintFeeBps : Int
@@ -94,10 +109,10 @@ data VaultView = VaultView with
       -- ^ The fee on `Vault_Redeem`, in basis points of what the shares are
       -- worth.
     rateValidFrom : Time
-      -- ^ Start of the period this rate applies to.
+      -- ^ The start of the period this rate applies to.
     rateValidUntil : Time
-      -- ^ End of the period. Actions fail at or after this time; the registrar
-      -- rolls the period, and bears that cost.
+      -- ^ The end of the period. Actions MUST fail at or after this time,
+      -- until the vault publishes a new rate.
     meta : Metadata
       -- ^ Additional metadata specific to the vault, used for extensibility,
       -- and, for a vault open only to some parties, the evidence it accepts
@@ -115,21 +130,22 @@ eligibilityKey = "canton-vault/eligibility"
 -- | The result of an instant deposit, mint, withdrawal or redemption.
 data VaultActionResult = VaultActionResult with
     vaultCid : Optional (ContractId Vault)
-      -- ^ Set only when the implementation rewrote the vault.
+      -- ^ The vault's new contract, set only when the implementation rewrote
+      -- the vault.
     assets : Decimal
-      -- ^ Units of the underlying that moved.
+      -- ^ The units of the underlying that moved.
     shares : Decimal
-      -- ^ Shares minted or burned.
+      -- ^ The shares minted or burned.
     holdingCids : [ContractId Holding]
-      -- ^ Holdings created for the receiver, if the registry represents them
-      -- on-ledger.
+      -- ^ The holdings created for the receiver, if the registry represents
+      -- them on-ledger.
     meta : Metadata
       -- ^ Additional metadata specific to the result of the action, used for
       -- extensibility; e.g., fees charged.
   deriving (Show, Eq, Serializable)
 
--- | Reported when an action would breach the caller's slippage limit. The
--- action fails and nothing changes.
+-- | The text a vault fails with when an action or a fill would breach the
+-- caller's slippage limit or the requester's minimum.
 vaultSlippageExceeded : Text
 vaultSlippageExceeded = "VAULT_SLIPPAGE_EXCEEDED"
 
@@ -137,13 +153,18 @@ vaultSlippageExceeded = "VAULT_SLIPPAGE_EXCEEDED"
 -- Queued requests
 -------------------
 
--- | Identifies a queued deposit or redemption, together with its requester.
+-- | Identifies a queued deposit or redemption, together with its requester's
+-- account.
 --
--- The vault chooses its ids. Requests sharing an id other than `0` are
--- fungible: they are filled at the same time, at the same rate, and when filled
--- in part, in the same proportion. `0` means requests are told apart only by
--- their requester. When and how a request is priced is the vault's own, and it
--- says so on its `AsyncView`.
+-- The vault chooses its ids, for deposits and redemptions separately: a
+-- deposit and a redemption sharing an id are unrelated. Requests sharing an id
+-- other than `0` are fungible: the vault MUST fill them together, at the same
+-- rate, leaving none queued that it could fill at that rate, and when it fills
+-- them in part, in the same proportion. `0` promises no such
+-- grouping: requests under it are told apart only by their requester, and what
+-- is pending under it is all the requester has queued. A vault MUST give every
+-- request in a direction the id `0`, or none of them. When and how a request is
+-- priced is the vault's own, and it says so on its `AsyncView`.
 type RequestId = Int
 
 -- | What a wallet needs to decide whether to queue a request with a vault.
@@ -156,8 +177,8 @@ data AsyncView = AsyncView with
       -- ^ The parties who settle and cancel requests: the executors of the
       -- token standard settlement every request's allocations carry.
     settlementDeadlineWindow : RelTime
-      -- ^ How long after the end of its period a request's escrow stays
-      -- committed: the time the executors have to fill it. Until the deadline
+      -- ^ The longest a request's escrow stays committed after the end of its
+      -- period: the time the executors have to fill it. Until the deadline
       -- only the executors can settle or cancel it; after it, the requester can
       -- withdraw it.
     meta : Metadata
@@ -167,7 +188,7 @@ data AsyncView = AsyncView with
 
 -- | The `AsyncView` metadata key saying when a request's rate is struck. Free
 -- text; recommended values are `"period-close"` and `"fulfilment"`. A vault
--- MUST NOT strike a request's rate when it is made.
+-- MUST set it, and MUST NOT strike a request's rate when the request is made.
 requestPricingKey : Text
 requestPricingKey = "canton-vault/request-pricing"
 
@@ -179,20 +200,41 @@ requestPricingKey = "canton-vault/request-pricing"
 -- share accounting, limits and instant actions. Every conformant vault
 -- implements it, including vaults whose deposits or redemptions are queued.
 --
--- The read methods run on-ledger, and agree with the published view. Every
--- quantity rounds in the vault's favour, in the direction given per method
--- below, and a deposit that would mint zero shares is rejected.
+-- The read methods run on-ledger, and MUST agree with the published view: a
+-- reader computing from the view gets the figures they return. Every quantity
+-- MUST round in the vault's favour, in the direction given per method below,
+-- and a deposit or mint that would issue zero shares MUST fail.
+--
+-- From the view, with `S` its `totalShares` plus `virtualShares` and `A` its
+-- `totalAssets` accrued to the evaluation time plus `virtualAssets`, the read
+-- methods MUST return, each product and quotient exact before it is rounded to
+-- 10 decimals in the direction named:
+--
+-- * `convertToShares a = down (a * S / A)`, `convertToAssets s = down (s * A / S)`
+-- * `previewDeposit a = down (net depositFeeBps a * S / A)`
+-- * `previewMint s = gross mintFeeBps (up (s * A / S))`
+-- * `previewWithdraw a = up (gross withdrawFeeBps a * S / A)`
+-- * `previewRedeem s = net redeemFeeBps (down (s * A / S))`
+--
+-- where `net f x = x - up (x * f / 10000)` and `gross f x` is the least `g`, in
+-- steps of 10^-10, with `net f g >= x`.
+--
+-- Accounts are the token standard's. A vault MUST refuse an account with no
+-- owner, which the token standard reserves for the instrument admin. A vault
+-- MUST accept the basic account (`Account (Some p) None ""`) of a party it is
+-- open to, and MAY refuse accounts with a provider or a non-empty id; its max
+-- methods return zero for an account it refuses.
 --
 -- A vault open only to some parties checks the evidence named in `extraArgs`
--- under `eligibilityKey` before letting a party in: `maxDeposit` and `maxMint`
--- return zero for a receiver without evidence it accepts, and `Vault_Deposit`,
--- `Vault_Mint` and `Vault_RequestDeposit` fail for one. Whether a party without
--- it may still withdraw or redeem is the vault's own, and its max methods say
--- so.
+-- under `eligibilityKey` before letting a receiver in: `maxDeposit` and
+-- `maxMint` MUST return zero for a receiver without evidence it accepts, and
+-- `Vault_Deposit`, `Vault_Mint` and `Vault_RequestDeposit` MUST fail for one.
+-- Whether an owner without it may still withdraw or redeem is the vault's own,
+-- and its max methods say so.
 --
 -- Choices a vault adds for its own roles, such as filling requests or
--- publishing a price, take their controllers from the vault contract rather
--- than from an argument.
+-- publishing a price, MUST take their controllers from the vault contract
+-- rather than from an argument.
 interface Vault where
   viewtype VaultView
 
@@ -204,46 +246,55 @@ interface Vault where
   -- Rounds down.
   convertToAssets : Decimal -> Update Decimal
 
-  -- | Most the party may deposit in one call, after limits, capacity and
-  -- eligibility. Zero means they cannot deposit at all right now.
+  -- | Most of the underlying one `Vault_Deposit` may pay in for the receiver
+  -- account, after limits, capacity and eligibility. A deposit of no more MUST
+  -- NOT fail for the vault's limits, and one of more MUST fail. Zero means the
+  -- account cannot be deposited for right now.
   --
-  -- A vault cannot look up what a party holds, so the answers below depend on
-  -- the holdings named in `extraArgs`. A caller that names none gets the
+  -- A vault cannot look up what an account holds, so the answers below depend
+  -- on the holdings named in `extraArgs`. A caller that names none gets the
   -- vault's own limit rather than theirs.
-  maxDeposit : Party -> ExtraArgs -> Update Decimal
+  maxDeposit : Account -> ExtraArgs -> Update Decimal
 
-  -- | Most the party may mint in one call right now, with the fee included in
-  -- what counts against any limit. Zero as for `maxDeposit`.
-  maxMint : Party -> ExtraArgs -> Update Decimal
+  -- | Most shares the receiver account may mint in one `Vault_Mint`, with the
+  -- fee included in what counts against any limit. Exact, and zero, as for
+  -- `maxDeposit`.
+  maxMint : Account -> ExtraArgs -> Update Decimal
 
-  -- | Most of the underlying the party's named share holdings can withdraw,
-  -- after the fee. A vault whose value can sit outside its pool, such as one
-  -- with an attested rate, also caps it at what it can pay at once, as the
-  -- contracts named in `extraArgs` show.
-  maxWithdraw : Party -> ExtraArgs -> Update Decimal
+  -- | Most of the underlying the owner account's named share holdings can
+  -- withdraw in one `Vault_Withdraw`, after the fee. A vault whose value can
+  -- sit outside its pool, such as one with an attested rate, also caps it at
+  -- what it can pay at once, as the contracts named in `extraArgs` show. Exact
+  -- as for `maxDeposit`.
+  maxWithdraw : Account -> ExtraArgs -> Update Decimal
 
-  -- | The party's named share holdings, capped as for `maxWithdraw`.
-  maxRedeem : Party -> ExtraArgs -> Update Decimal
+  -- | The owner account's named share holdings, capped as for `maxWithdraw`.
+  -- Exact as for `maxDeposit`.
+  maxRedeem : Account -> ExtraArgs -> Update Decimal
 
-  -- | Shares `assets` would mint, including fees. Rounds down.
+  -- | Shares `assets` would mint, including fees: what `Vault_Deposit` issues
+  -- if exercised in the same transaction. Rounds down.
   --
-  -- A vault that queues deposits fails this method: a queued request is
-  -- priced at fulfillment.
+  -- A vault that queues deposits MUST fail this method: a queued request is
+  -- not priced when it is made.
   previewDeposit : Decimal -> Update Decimal
 
-  -- | Assets required to mint `shares`, including fees. Rounds up.
+  -- | Assets required to mint `shares`, including fees: what `Vault_Mint`
+  -- takes if exercised in the same transaction. Rounds up.
   --
-  -- A vault that queues deposits fails this method.
+  -- A vault that queues deposits MUST fail this method.
   previewMint : Decimal -> Update Decimal
 
-  -- | Shares burned to withdraw `assets`, including fees. Rounds up.
+  -- | Shares burned to withdraw `assets`, including fees: what
+  -- `Vault_Withdraw` burns if exercised in the same transaction. Rounds up.
   --
-  -- A vault that queues redemptions fails this method.
+  -- A vault that queues redemptions MUST fail this method.
   previewWithdraw : Decimal -> Update Decimal
 
-  -- | Assets returned for `shares`, including fees. Rounds down.
+  -- | Assets returned for `shares`, including fees: what `Vault_Redeem` pays
+  -- if exercised in the same transaction. Rounds down.
   --
-  -- A vault that queues redemptions fails this method.
+  -- A vault that queues redemptions MUST fail this method.
   previewRedeem : Decimal -> Update Decimal
 
   vault_depositImpl : ContractId Vault -> Vault_Deposit -> Update VaultActionResult
@@ -259,24 +310,30 @@ interface Vault where
   vault_redeemExtraObservers : Vault_Redeem -> [Party]
 
   nonconsuming choice Vault_Deposit : VaultActionResult
-    -- ^ Deposit `assets` of the underlying and mint shares to `receiver`.
+    -- ^ Deposit `assets` of the underlying from `sender` and issue shares to
+    -- `receiver`.
     --
-    -- The underlying moves to the custodian and the shares are minted in the
-    -- same transaction. A leg that is still pending never mints: a registry may
-    -- answer with a `TransferInstruction` rather than execute.
+    -- Implementations MUST move the underlying to the `custodian` account and
+    -- issue the shares in the same transaction, and MUST NOT issue shares
+    -- against a transfer that is still pending: a registry may answer with a
+    -- `TransferInstruction` rather than complete it.
+    --
+    -- Implementations MUST fail with `vaultSlippageExceeded`, changing
+    -- nothing, if fewer than `minSharesOut` shares would be issued.
     with
       assets : Decimal
-        -- ^ Units of the underlying to deposit.
-      receiver : Party
-        -- ^ The party receiving the shares.
+        -- ^ The units of the underlying to deposit.
+      sender : Account
+        -- ^ The account the underlying is paid from.
+      receiver : Account
+        -- ^ The account the shares are issued to.
       minSharesOut : Optional Decimal
-        -- ^ Fewest shares the caller will accept, or `None` for any rate.
+        -- ^ The fewest shares the caller accepts, or `None` for any rate.
       actors : [Party]
-        -- ^ Parties executing the deposit.
+        -- ^ The parties executing the deposit.
         --
-        -- Implementations MUST check these parties against the account whose
-        -- underlying or shares the action moves, to avoid unauthorized
-        -- actions.
+        -- Implementations MUST check these parties against `sender`, to avoid
+        -- unauthorized deposits.
       extraArgs : ExtraArgs
         -- ^ Additional context required in order to exercise the choice.
     observer vault_depositExtraObservers this arg
@@ -284,18 +341,26 @@ interface Vault where
     do vault_depositImpl this self arg
 
   nonconsuming choice Vault_Mint : VaultActionResult
-    -- ^ Mint exactly `shares` to `receiver`, taking the assets they cost.
+    -- ^ Issue exactly `shares` to `receiver`, taking the underlying they cost
+    -- from `sender`.
     --
-    -- Settlement requirements are as for `Vault_Deposit`.
+    -- Implementations MUST settle as for `Vault_Deposit`, and MUST fail with
+    -- `vaultSlippageExceeded`, changing nothing, if more than `maxAssetsIn`
+    -- would be taken.
     with
       shares : Decimal
-        -- ^ Shares to mint.
-      receiver : Party
-        -- ^ The party receiving the shares.
+        -- ^ The shares to issue.
+      sender : Account
+        -- ^ The account the underlying is paid from.
+      receiver : Account
+        -- ^ The account the shares are issued to.
       maxAssetsIn : Optional Decimal
-        -- ^ Most of the underlying the caller will pay, or `None` for any rate.
+        -- ^ The most of the underlying the caller pays, or `None` for any rate.
       actors : [Party]
-        -- ^ Parties executing the mint. Checked as for `Vault_Deposit`.
+        -- ^ The parties executing the mint.
+        --
+        -- Implementations MUST check these parties against `sender`, to avoid
+        -- unauthorized mints.
       extraArgs : ExtraArgs
         -- ^ Additional context required in order to exercise the choice.
     observer vault_mintExtraObservers this arg
@@ -303,22 +368,29 @@ interface Vault where
     do vault_mintImpl this self arg
 
   nonconsuming choice Vault_Withdraw : VaultActionResult
-    -- ^ Send exactly `assets` of the underlying to `receiver` and burn the
+    -- ^ Pay exactly `assets` of the underlying to `receiver` and burn the
     -- shares they cost from `owner`.
     --
-    -- The underlying moves from the custodian and the shares are burned in the
-    -- same transaction. A leg that is still pending never burns.
+    -- Implementations MUST move the underlying from the `custodian` account and
+    -- burn the shares in the same transaction, and MUST NOT burn shares against
+    -- a transfer that is still pending.
+    --
+    -- Implementations MUST fail with `vaultSlippageExceeded`, changing
+    -- nothing, if more than `maxSharesIn` shares would be burned.
     with
       assets : Decimal
-        -- ^ Units of the underlying to withdraw.
-      owner : Party
-        -- ^ The party whose shares are burned.
-      receiver : Party
-        -- ^ The party receiving the underlying.
+        -- ^ The units of the underlying to withdraw.
+      owner : Account
+        -- ^ The account whose shares are burned.
+      receiver : Account
+        -- ^ The account paid the underlying.
       maxSharesIn : Optional Decimal
-        -- ^ Most shares the caller will give up, or `None` for any rate.
+        -- ^ The most shares the caller gives up, or `None` for any rate.
       actors : [Party]
-        -- ^ Parties executing the withdrawal. Checked as for `Vault_Deposit`.
+        -- ^ The parties executing the withdrawal.
+        --
+        -- Implementations MUST check these parties against `owner`, to avoid
+        -- unauthorized withdrawals.
       extraArgs : ExtraArgs
         -- ^ Additional context required in order to exercise the choice.
     observer vault_withdrawExtraObservers this arg
@@ -326,21 +398,27 @@ interface Vault where
     do vault_withdrawImpl this self arg
 
   nonconsuming choice Vault_Redeem : VaultActionResult
-    -- ^ Burn exactly `shares` from `owner` and send the underlying they are
+    -- ^ Burn exactly `shares` from `owner` and pay the underlying they are
     -- worth to `receiver`.
     --
-    -- Settlement requirements are as for `Vault_Withdraw`.
+    -- Implementations MUST settle as for `Vault_Withdraw`, and MUST fail with
+    -- `vaultSlippageExceeded`, changing nothing, if less than `minAssetsOut`
+    -- would be paid.
     with
       shares : Decimal
-        -- ^ Shares to burn.
-      owner : Party
-        -- ^ The party whose shares are burned.
-      receiver : Party
-        -- ^ The party receiving the underlying.
+        -- ^ The shares to burn.
+      owner : Account
+        -- ^ The account whose shares are burned.
+      receiver : Account
+        -- ^ The account paid the underlying.
       minAssetsOut : Optional Decimal
-        -- ^ Least of the underlying the caller will accept, or `None` for any rate.
+        -- ^ The least of the underlying the caller accepts, or `None` for any
+        -- rate.
       actors : [Party]
-        -- ^ Parties executing the redemption. Checked as for `Vault_Deposit`.
+        -- ^ The parties executing the redemption.
+        --
+        -- Implementations MUST check these parties against `owner`, to avoid
+        -- unauthorized redemptions.
       extraArgs : ExtraArgs
         -- ^ Additional context required in order to exercise the choice.
     observer vault_redeemExtraObservers this arg
@@ -351,11 +429,12 @@ interface Vault where
     -- ^ The vault's view, for a party it is disclosed to.
     --
     -- Fetching a vault needs the authority of one of its stakeholders, so a
-    -- contract of another party reads it through this choice. The vault may
-    -- refuse actors it has not chosen to serve; what it returns is its view.
+    -- contract of another party reads it through this choice. The vault MAY
+    -- refuse actors it has not chosen to serve; what it returns MUST be its
+    -- view.
     with
       actors : [Party]
-        -- ^ Parties executing the fetch.
+        -- ^ The parties executing the fetch.
     controller actors
     do vault_publicFetchImpl this self arg
 
@@ -364,8 +443,8 @@ interface Vault where
     -- Refused as for `Vault_PublicFetch`. Rounds down.
     with
       shares : Decimal
-        -- ^ Shares to convert.
+        -- ^ The shares to convert.
       actors : [Party]
-        -- ^ Parties executing the conversion.
+        -- ^ The parties executing the conversion.
     controller actors
     do vault_publicConvertToAssetsImpl this self arg

@@ -1,0 +1,39 @@
+-- | Properties of the events a vault reports for its instant actions.
+module Canton.Vault.Testing.V1.Events where
+
+import DA.Action (unless, when)
+import DA.Assert ((===))
+import DA.Optional (isSome)
+import Daml.Script
+
+
+import Canton.Vault.EventLog.V1
+import Canton.Vault.Testing.V1.Flow
+import Canton.Vault.Testing.V1.Harness
+import Canton.Vault.Testing.V1.Read
+
+-- | Each instant action is reported once, with what moved, to the parties of both accounts and the actors. A vault
+-- with a queue must report; one without may not, and then this is skipped.
+instantActionsAreReported : Harness -> Script ()
+instantActionsAreReported h = do
+  found <- h.deploy plainConfig
+  case found of
+    None -> skip (h.name <> " offers no plain vault")
+    Some d -> do
+      alice <- allocateParty "alice"
+      let me = basic alice
+      enter d alice "alice" 100.0
+      d.fund alice 100.0
+      v <- viewOf d
+      let check what step expected = do
+            (result, tree) <- succeeded what =<< performTree d [alice] step
+            let reports = [r | r <- reportsIn [tree], r.vaultRegistrar == v.vaultRegistrar, r.vaultId == v.vaultId]
+            if null reports && not (isSome d.queue) then skip (what <> " is not reported, as a vault with no queue may") else do
+              map (.event) reports === [expected result]
+              shownToTheirParties what reports
+      when (depositsByVault d) do
+        check "a deposit" (Deposit 10.0 me me None) (\r -> Deposited with assets = r.assets; shares = r.shares; fromRequest = None)
+        check "a mint" (Mint 1.0 me me None) (\r -> Deposited with assets = r.assets; shares = r.shares; fromRequest = None)
+      unless (redemptionsQueued d) do
+        check "a redemption" (Redeem 1.0 me me None) (\r -> Withdrew with assets = r.assets; shares = r.shares; fromRequest = None)
+        check "a withdrawal" (Withdraw 1.0 me me None) (\r -> Withdrew with assets = r.assets; shares = r.shares; fromRequest = None)

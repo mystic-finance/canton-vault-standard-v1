@@ -3,55 +3,88 @@
 module Canton.Vault.EventLog.V1 where
 
 import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.HoldingV2
 
 import Canton.Vault.V1 (RequestId)
 
+-- | A queued request, as the vault's events name it.
+data RequestRef = RequestRef with
+    requestId : RequestId
+      -- ^ The id the request is queued under.
+    label : Text
+      -- ^ The requester's label for the request.
+  deriving (Show, Eq, Ord, Serializable)
+
+-- | Why a request left the queue unfilled.
+data CloseReason
+  = CR_Rejected
+    -- ^ The executors ended it.
+  | CR_Cancelled
+    -- ^ The requester or the receiver ended it.
+  | CR_Expired
+    -- ^ It was not funded in its period, or its deadline passed.
+  | -- | Used to represent vault-specific reasons.
+    CR_Custom with
+      id : Text
+        -- ^ The identifier of the reason. Namespaced analogously to metadata
+        -- keys.
+  deriving (Show, Eq, Serializable)
+
 -- | What a vault did.
+--
+-- A wallet reads what a request still has queued from these events alone: what
+-- was requested, less the fills naming it, less what closed unfilled. A
+-- request no fill has named counts nothing from its deadline; the rest of one
+-- filled in part counts until it is filled or closed.
 data VaultEvent
   = Deposited with
       assets : Decimal
         -- ^ The units of the underlying paid in.
       shares : Decimal
         -- ^ The shares issued.
-      fromRequest : Optional RequestId
-        -- ^ The id of the request filled, when the deposit was queued.
+      fromRequest : Optional RequestRef
+        -- ^ The request filled, when the deposit was queued.
   | Withdrew with
       assets : Decimal
         -- ^ The units of the underlying paid out.
       shares : Decimal
         -- ^ The shares burned.
-      fromRequest : Optional RequestId
-        -- ^ The id of the request filled, when the redemption was queued. A
-        -- request filled in part keeps the rest queued.
+      fromRequest : Optional RequestRef
+        -- ^ The request filled, when the redemption was queued. A request
+        -- filled in part keeps the rest queued.
   | DepositRequested with
-      requestId : RequestId
-        -- ^ The id the request is queued under.
-      label : Text
-        -- ^ The requester's label for the request.
+      request : RequestRef
+        -- ^ The request queued.
       assets : Decimal
         -- ^ The units of the underlying queued.
+      deadline : Time
+        -- ^ The escrow's settlement deadline, after which the requester can
+        -- withdraw it and, unless a fill has named it, the request no longer
+        -- counts as queued.
   | RedeemRequested with
-      requestId : RequestId
-        -- ^ The id the request is queued under.
-      label : Text
-        -- ^ The requester's label for the request.
+      request : RequestRef
+        -- ^ The request queued.
       shares : Decimal
         -- ^ The shares queued.
+      deadline : Time
+        -- ^ The escrow's settlement deadline, as for `DepositRequested`.
   | RequestClosed with
-      requestId : RequestId
-        -- ^ The id the request was queued under.
-      label : Text
-        -- ^ The requester's label for the request.
+      request : RequestRef
+        -- ^ The request that left the queue.
       amount : Decimal
-        -- ^ The underlying or shares that left the queue unfilled.
-      reason : Text
-        -- ^ Why: rejected, withdrawn or reclaimed.
+        -- ^ The underlying or shares that left the queue unfilled: zero for a
+        -- request whose funding the vault never accepted.
+      reason : CloseReason
+        -- ^ Why it left.
   deriving (Show, Eq, Serializable)
 
 -- | An interface for reporting a vault's events.
 --
 -- A vault exercises its choice in the transaction the event happens in. Only
 -- events reported by a vault's `vaultRegistrar` are that vault's events.
+--
+-- A vault implementing `VaultAsyncDeposit` or `VaultAsyncRedeem` MUST report
+-- its events; any other vault MAY.
 interface VaultEventLog where
   viewtype VaultEventLogView
 
@@ -60,24 +93,25 @@ interface VaultEventLog where
   nonconsuming choice VaultEventLog_Report : VaultEventLog_ReportResult
     -- ^ Show an event to its observers.
     --
-    -- A vault MUST report every instant action, every request it accepts the
-    -- funding of, every fill, and every request that leaves its queue unfilled
-    -- through the vault.
+    -- A vault that reports MUST report every instant action, every request it
+    -- accepts the funding of, every fill, and every request that leaves its
+    -- queue unfilled through the vault.
     with
       vaultRegistrar : Party
         -- ^ The registrar of the vault reporting the event.
       vaultId : Text
         -- ^ The vault the event happened in.
-      owner : Party
-        -- ^ The party whose underlying or shares were paid in.
-      receiver : Party
-        -- ^ The party paid the shares or the underlying.
+      owner : Account
+        -- ^ The account whose underlying or shares were paid in.
+      receiver : Account
+        -- ^ The account paid the shares or the underlying.
       actors : [Party]
         -- ^ The parties that took the action.
       event : VaultEvent
         -- ^ What happened.
       observers : [Party]
-        -- ^ The parties shown the event. MUST include `owner` and `receiver`.
+        -- ^ The parties shown the event. MUST include the owner and provider
+        -- of `owner` and of `receiver`, and `actors`.
       extraArgs : ExtraArgs
         -- ^ Additional context and metadata about the event.
     observer observers

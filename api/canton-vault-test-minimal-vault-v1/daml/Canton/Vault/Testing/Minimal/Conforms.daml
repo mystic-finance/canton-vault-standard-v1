@@ -1,0 +1,130 @@
+-- | The minimal vault under the conformance suite.
+module Canton.Vault.Testing.Minimal.Conforms where
+
+import DA.Action (void, when)
+import DA.Foldable (forA_)
+import DA.List (head)
+import DA.Optional (fromSome, optionalToList)
+import DA.TextMap qualified as TextMap
+import DA.Time (addRelTime, hours)
+import Daml.Script
+
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.HoldingV2
+import Splice.Testing.Tokens.TestTokenV2 (TokenRules(..))
+import Splice.Testing.Tokens.TestTokenV2.AccountConfig (accountConfigsContextKey)
+import Splice.Testing.Tokens.TestTokenV2.Holding (Token(..))
+import Splice.Testing.Tokens.TestTokenV2.Util (tokenRulesContextKey)
+
+import Canton.Vault.V1 (Vault)
+import Canton.Vault.Testing.V1.Harness
+import Canton.Vault.Testing.V1.Read (refusedFor)
+import Canton.Vault.Testing.V1.Suite (conformance)
+import Canton.Vault.Testing.Minimal.Vault
+
+minimal : Harness
+minimal = Harness with
+  name = "the minimal vault"
+  deploy = \config -> if config /= plainConfig then pure None else Some <$> deployMinimal
+
+deployMinimal : Script Deployment
+deployMinimal = do
+  usd <- allocateParty "usdAdmin"
+  registrar <- allocateParty "minimalRegistrar"
+  custodian <- allocateParty "minimalCustodian"
+  rules <- submit usd (createCmd TokenRules with admin = usd)
+  rulesD <- fromSome <$> queryDisclosure usd rules
+  now <- getTime
+  let vaultId = "minimal-1"
+      underlying = InstrumentId with admin = usd; id = "USD"
+      pool = Account with owner = Some custodian; provider = None; id = "pool"
+      shareInstrument = InstrumentId with admin = registrar; id = vaultId
+      current = do
+        vaults <- query @MinimalVault registrar
+        pure (head [cid | (cid, v) <- vaults, v.vaultId == vaultId])
+      tokens party instrument account = do
+        held <- query @Token party
+        forA [cid | (cid, t) <- held, t.holding.instrumentId == instrument, t.holding.account == account, t.holding.lock == None] $ \cid ->
+          (cid,) . fromSome <$> queryDisclosure party cid
+      owned instrument account = case account.owner of
+        Some p -> tokens p instrument account
+        None -> pure []
+      registryArgs = withRegistry rules
+      ids cs = AV_List [AV_ContractId (coerceContractId c) | (c, _) <- cs]
+      mint = mintToken
+  _ <- submit (actAs [registrar, custodian]) do
+    createCmd MinimalVault with
+      registrar; custodian = pool; vaultId; underlying; shares = shareInstrument
+      transferFactory = toInterfaceContractId rules; totalShares = 0.0; totalAssets = 0.0
+      validFrom = now; validUntil = addRelTime now (hours 1)
+  let vaultDisclosed = do
+        cid <- current
+        fromSome <$> queryDisclosure registrar cid
+  pure Deployment with
+    reader = registrar
+    vault = toInterfaceContractId @Vault <$> current
+    fund = \party amount -> mint party underlying amount
+    entry = \account -> do
+      funds <- owned underlying account
+      vd <- vaultDisclosed
+      pure Prepared with
+        extraArgs = registryArgs [(fundsKey, ids funds)]
+        disclosures = vd :: rulesD :: map snd funds
+    exit = \account -> do
+      held <- owned shareInstrument account
+      paying <- tokens custodian underlying pool
+      vd <- vaultDisclosed
+      pure Prepared with
+        extraArgs = registryArgs [(sharesKey, ids held), (poolKey, ids paying)]
+        disclosures = vd :: rulesD :: map snd held <> map snd paying
+    nextPeriod = do
+      cid <- current
+      t <- getTime
+      _ <- submit registrar (exerciseCmd cid MinimalVault_Roll with until = addRelTime t (hours 1))
+      pure []
+    changeValue = Some $ \factor -> do
+      held <- query @Token custodian
+      let pooled = [(c, t.holding.amount) | (c, t) <- held, t.holding.instrumentId == underlying, t.holding.account == pool]
+          total = sum (map snd pooled) * factor
+      forA_ pooled $ \(c, _) -> submit (actAs [usd, custodian]) (archiveCmd c)
+      when (total > 0.0) (mintTo pool underlying total)
+      cid <- current
+      void $ submit (actAs [registrar, custodian]) (exerciseCmd cid MinimalVault_Revalue with assets = total)
+    queue = None
+    issue = None
+
+-- | A test token in the party's basic account.
+mintToken : Party -> InstrumentId -> Decimal -> Script ()
+mintToken party = mintTo (Account with owner = Some party; provider = None; id = "")
+
+-- | A test token in the account.
+mintTo : Account -> InstrumentId -> Decimal -> Script ()
+mintTo account instrument amount = void $ submit (actAs (optionalToList account.owner <> [instrument.admin])) do
+  createCmd Token with
+    holding = HoldingView with account; instrumentId = instrument; amount; lock = None; meta = emptyMetadata
+
+-- | The test token's context, with this vault's keys added.
+withRegistry : ContractId TokenRules -> [(Text, AnyValue)] -> ExtraArgs
+withRegistry rules extra = ExtraArgs with
+  context = ChoiceContext with
+    values = TextMap.fromList ([(accountConfigsContextKey, AV_List []), (tokenRulesContextKey, AV_ContractId (coerceContractId rules))] <> extra)
+  meta = emptyMetadata
+
+minimalVaultConforms : Script ()
+minimalVaultConforms = conformance minimal
+
+-- | The vault refuses a custodian account with no owner.
+aCustodianAccountWithNoOwnerIsRefused : Script ()
+aCustodianAccountWithNoOwnerIsRefused = do
+  usd <- allocateParty "usdAdmin"
+  registrar <- allocateParty "minimalRegistrar"
+  rules <- submit usd (createCmd TokenRules with admin = usd)
+  now <- getTime
+  refusedFor "a vault whose custodian account has no owner" "Template precondition violated" =<< trySubmit registrar do
+    createCmd MinimalVault with
+      registrar; vaultId = "minimal-1"
+      custodian = Account with owner = None; provider = None; id = "pool"
+      underlying = InstrumentId with admin = usd; id = "USD"
+      shares = InstrumentId with admin = registrar; id = "minimal-1"
+      transferFactory = toInterfaceContractId rules; totalShares = 0.0; totalAssets = 0.0
+      validFrom = now; validUntil = addRelTime now (hours 1)

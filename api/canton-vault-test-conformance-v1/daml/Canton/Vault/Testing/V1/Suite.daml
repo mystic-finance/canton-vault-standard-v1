@@ -1,0 +1,48 @@
+-- | Every conformance property, to run against a `Harness`.
+module Canton.Vault.Testing.V1.Suite where
+
+import DA.Foldable (forA_)
+import Daml.Script
+
+import Canton.Vault.Testing.V1.Delegation
+import Canton.Vault.Testing.V1.Events
+import Canton.Vault.Testing.V1.Harness
+import Canton.Vault.Testing.V1.Instant
+import Canton.Vault.Testing.V1.Queued
+
+-- | Every property, by name.
+properties : [(Text, Harness -> Script ())]
+properties =
+  [ ("previewsMatchActions", previewsMatchActions)
+  , ("conversionsBoundPreviews", conversionsBoundPreviews)
+  , ("roundTripsDoNotProfit", roundTripsDoNotProfit)
+  , ("maxLimitsAreExact", maxLimitsAreExact)
+  , ("viewQuotesEveryPath", viewQuotesEveryPath)
+  , ("slippageLimitsRefuseAndMoveNothing", slippageLimitsRefuseAndMoveNothing)
+  , ("actorsBeyondTheAccountAreRefused", actorsBeyondTheAccountAreRefused)
+  , ("anAccountWithNoOwnerIsRefused", anAccountWithNoOwnerIsRefused)
+  , ("aBasicAccountIsAccepted", aBasicAccountIsAccepted)
+  , ("thePoolSitsInTheCustodianAccount", thePoolSitsInTheCustodianAccount)
+  , ("actionsMoveTheAccountsNamed", actionsMoveTheAccountsNamed)
+  , ("nothingIsIssuedForNothing", nothingIsIssuedForNothing)
+  , ("actionsFailWhenThePeriodEnds", actionsFailWhenThePeriodEnds)
+  , ("publicReadsServeTheView", publicReadsServeTheView)
+  , ("instantActionsAreReported", instantActionsAreReported)
+  , ("queuedDirectionsHaveNoInstantPath", queuedDirectionsHaveNoInstantPath)
+  , ("requestsPublishTheirTerms", requestsPublishTheirTerms)
+  , ("requestsAreEndedByTheirParties", requestsAreEndedByTheirParties)
+  , ("requestsAreFilled", requestsAreFilled)
+  , ("minimumsAreHonoured", minimumsAreHonoured)
+  , ("requestIdsKeepTheirPromise", requestIdsKeepTheirPromise)
+  , ("pendingRebuildsFromEvents", pendingRebuildsFromEvents)
+  , ("delegatesActWithinTheirAllowance", delegatesActWithinTheirAllowance) ]
+
+-- | Runs every property in turn, stopping at the first that fails.
+conformance : Harness -> Script ()
+conformance = conformanceOf properties
+
+-- | Runs the properties given in turn, stopping at the first that fails.
+conformanceOf : [(Text, Harness -> Script ())] -> Harness -> Script ()
+conformanceOf ps h = forA_ ps $ \(name, property) -> do
+  debug ("conformance: " <> name)
+  property h

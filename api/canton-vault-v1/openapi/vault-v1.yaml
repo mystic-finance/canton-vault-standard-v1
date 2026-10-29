@@ -9,7 +9,9 @@ info:
     Served under the URL prefixes the vault registrar publishes for its share
     registry, in the metadata of its CNS entry under
     `splice.lfdecentralizedtrust.org/registryUrls`, as the token standard's
-    registry APIs are.
+    registry APIs are. A registrar serving it SHOULD list the vault packages it
+    implements, such as `canton-vault-v1`, in the `supportedApis` of its
+    token metadata `getRegistryInfo` response.
   version: 0.1.0
 paths:
 
@@ -159,7 +161,9 @@ components:
         view:
           type: object
           description: |
-            The vault's `VaultView`, as the Daml JSON API encodes it.
+            The vault's `VaultView`, as the Daml JSON API encodes it. Its
+            `custodian` is the token standard's `Account`, an object with
+            `owner`, `provider` and `id`, and always has an `owner`.
         asyncDepositView:
           type: object
           description: |
@@ -210,6 +214,13 @@ components:
           description: |
             The arguments intended for the choice, as the Daml JSON API encodes
             them, with `extraArgs.context` and `extraArgs.meta` empty.
+        meta:
+          description: |
+            Metadata that will be passed to the choice, and should be incorporated
+            into the choice context. Provided for extensibility.
+          type: object
+          additionalProperties:
+            type: string
         excludeDebugFields:
           description: "If set to true, the response will not include fields prefixed with 'debug'."
           default: false

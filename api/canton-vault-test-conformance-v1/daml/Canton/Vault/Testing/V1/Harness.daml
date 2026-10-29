@@ -1,0 +1,94 @@
+-- | What an implementer supplies so the conformance suite can drive their vault.
+--
+-- The standard leaves deploying a vault, funding parties, serving choice
+-- contexts, rolling rate periods and filling requests to the implementer; the
+-- suite reaches them only through a `Harness`. Everything else it does through
+-- the standard's interfaces, as a wallet would.
+module Canton.Vault.Testing.V1.Harness where
+
+import Daml.Script
+
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.HoldingV2
+import Splice.Api.Token.AllocationV2 (Allocation, AllocationSpecification, SettlementInfo)
+
+import Canton.Vault.V1
+
+-- | The fees, limit and accrual a property asks a new vault for.
+data VaultConfig = VaultConfig with
+    depositFeeBps : Int
+    mintFeeBps : Int
+    withdrawFeeBps : Int
+    redeemFeeBps : Int
+    depositCap : Optional Decimal
+      -- ^ The most one deposit may bring in, or `None` for no limit.
+    accrual : Optional Accrual
+      -- ^ The accrual the vault's rate carries, or `None` for a fixed price.
+  deriving (Eq, Show)
+
+-- | No fees, no limit and no accrual.
+plainConfig : VaultConfig
+plainConfig = VaultConfig with depositFeeBps = 0; mintFeeBps = 0; withdrawFeeBps = 0; redeemFeeBps = 0; depositCap = None; accrual = None
+
+-- | A choice's context and the contracts to disclose with it, as the vault's
+-- endpoint would serve them.
+data Prepared = Prepared with
+    extraArgs : ExtraArgs
+    disclosures : [Disclosure]
+
+-- | An implementation under test.
+data Harness = Harness with
+    name : Text
+      -- ^ The implementation's name, for messages.
+    deploy : VaultConfig -> Script (Optional Deployment)
+      -- ^ A new vault with the config, or `None` if the implementation does
+      -- not offer one; properties needing it are then skipped.
+
+-- | One deployed vault, and the implementer's side of driving it.
+data Deployment = Deployment with
+    reader : Party
+      -- ^ A stakeholder of the vault, who reads its methods on-ledger.
+    vault : Script (ContractId Vault)
+      -- ^ The vault as it stands; it may be a new contract after any action.
+    fund : Party -> Decimal -> Script ()
+      -- ^ Gives the party that much of the underlying in its basic account.
+    entry : Account -> Script Prepared
+      -- ^ The context for a deposit, mint or deposit request funded from the
+      -- account, naming its holdings of the underlying.
+    exit : Account -> Script Prepared
+      -- ^ The context for a withdrawal, redemption or redeem request from the
+      -- account, naming its shares and what the vault pays out from.
+    nextPeriod : Script [TransactionTree]
+      -- ^ Ends the rate period and opens the next.
+    changeValue : Optional (Decimal -> Script ())
+      -- ^ Multiplies the vault's value outside vault actions, as yield or a
+      -- loss would, shown from the next period; `None` if the implementation
+      -- can't.
+    queue : Optional Queue
+      -- ^ The executors' side, for a vault with a queued direction.
+    issue : Optional (Party -> Decimal -> Script ())
+      -- ^ Gives the party shares worth that much of the underlying, counted in
+      -- the vault's books, when the test environment can't complete a deposit
+      -- through the vault; properties that need one to succeed are then
+      -- skipped.
+
+-- | The executors' side of a vault's queue.
+data Queue = Queue with
+    deposits : Bool
+      -- ^ Whether deposits are queued.
+    redemptions : Bool
+      -- ^ Whether redemptions are queued.
+    allocate : Party -> AllocationSpecification -> SettlementInfo -> Script (ContractId Allocation)
+      -- ^ Makes the allocation as the party's wallet would, through the
+      -- registry the specification's admin names.
+    accept : Party -> Text -> [ContractId Allocation] -> Script [TransactionTree]
+      -- ^ Accepts the funding of the requester's request under the label,
+      -- given its allocations in the order its allocation request lists them.
+    fill : Script [TransactionTree]
+      -- ^ Fills every request it can, rolling the period first if it must.
+      -- A request it cannot fill, such as one whose minimum isn't met, is
+      -- left queued.
+    reject : Optional (Party -> Text -> Script [TransactionTree])
+      -- ^ The executors end the requester's request under the label unfilled.
+    pending : Account -> Script Prepared
+      -- ^ The context naming the account's requests, for the pending methods.
