@@ -11,6 +11,7 @@ import Canton.Vault.Reference.V1 (PriceLimits(..))
 
 import Splice.Api.Token.MetadataV1
 import Splice.Api.Token.AllocationV2 qualified as V2
+import Splice.TokenStandard.Utils (basicAccount)
 
 -- | Passes only if the submission was refused, and for the given reason.
 failsWith : Text -> Either SubmitError a -> Script ()
@@ -36,10 +37,10 @@ template PathProbe
       do
         vault <- fetch vaultCid
         let methods =
-              [ ("maxDeposit", V.maxDeposit vault party extraArgs)
-              , ("maxMint", V.maxMint vault party extraArgs)
-              , ("maxWithdraw", V.maxWithdraw vault party extraArgs)
-              , ("maxRedeem", V.maxRedeem vault party extraArgs)
+              [ ("maxDeposit", V.maxDeposit vault (basicAccount party) extraArgs)
+              , ("maxMint", V.maxMint vault (basicAccount party) extraArgs)
+              , ("maxWithdraw", V.maxWithdraw vault (basicAccount party) extraArgs)
+              , ("maxRedeem", V.maxRedeem vault (basicAccount party) extraArgs)
               , ("previewDeposit", V.previewDeposit vault amount)
               , ("previewMint", V.previewMint vault amount)
               , ("previewWithdraw", V.previewWithdraw vault amount)

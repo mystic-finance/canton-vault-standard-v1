@@ -37,7 +37,7 @@ template SelectiveVault
     vault : ReferenceVault
     readers : [Party]
   where
-    signatory vault.vaultRegistrar, vault.custodian
+    signatory vault.vaultRegistrar, custodianOwner vault.custodian
 
     interface instance Vault for SelectiveVault where
       view = view (inner this)
@@ -106,7 +106,7 @@ anyDisclosedPartyReadsTheReferenceVault = script do
   Right got <- viewVault reader d vaultCid
   Right assets <- convertAt reader d vaultCid
   got === v
-  assets === mulDivDown 40.0 v.totalAssets v.totalShares
+  assets === mulDivDown 40.0 (v.totalAssets + v.virtualAssets) (v.totalShares + v.virtualShares)
   assertMsg "a share is worth more than one unit" (assets > 40.0)
   failsWith "requires one of the stakeholders" =<< trySubmit (actAs reader <> discloseMany [d]) do
     createAndExerciseCmd (VaultReader with reader) VaultReader_Fetch with vaultCid; shares = 40.0
@@ -127,6 +127,6 @@ aVaultServesOnlyTheReadersItNames = script do
   Right got <- viewVault allocator d vaultCid
   Right assets <- convertAt allocator d vaultCid
   got === v
-  assets === mulDivDown 40.0 v.totalAssets v.totalShares
+  assets === mulDivDown 40.0 (v.totalAssets + v.virtualAssets) (v.totalShares + v.virtualShares)
   failsWith "the vault does not serve this reader" =<< viewVault stranger d vaultCid
   failsWith "the vault does not serve this reader" =<< convertAt stranger d vaultCid

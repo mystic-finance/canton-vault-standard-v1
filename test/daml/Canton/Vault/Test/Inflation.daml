@@ -9,6 +9,7 @@ import Canton.Vault.V1
 import Canton.Vault.Reference.V1
 import Canton.Vault.Test.Deposit
 import Canton.Vault.Test.MockToken
+import Splice.TokenStandard.Utils (basicAccount)
 
 -- | A donation after the attacker's first share still leaves the victim's deposit whole.
 donationBeforeTheFirstDepositDoesNotRobTheNext : Script ()
@@ -21,8 +22,9 @@ donationBeforeTheFirstDepositDoesNotRobTheNext = script do
   attackerFunds <- fund f f.alice 0.0000000001
   attackerResult <- submit (actAs f.alice <> discloseMany disclosures) do
     exerciseCmd f.vaultCid Vault_Deposit with
+      sender = basicAccount f.alice
       assets = 0.0000000001
-      receiver = f.alice
+      receiver = basicAccount f.alice
       minSharesOut = None
       actors = [f.alice]
       extraArgs = depositArgs f [attackerFunds]
@@ -58,8 +60,9 @@ donationBeforeTheFirstDepositDoesNotRobTheNext = script do
   victimFunds <- fund f victim 100.0
   victimResult <- submit (actAs victim <> discloseMany rolledDisclosures) do
     exerciseCmd (toInterfaceContractId rolledCid : ContractId Vault) Vault_Deposit with
+      sender = basicAccount victim
       assets = 100.0
-      receiver = victim
+      receiver = basicAccount victim
       minSharesOut = None
       actors = [victim]
       extraArgs = depositArgs f [victimFunds]

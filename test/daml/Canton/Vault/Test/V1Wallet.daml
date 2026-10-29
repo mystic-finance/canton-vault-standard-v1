@@ -34,7 +34,7 @@ aV1WalletSeesAndTransfersShares : Script ()
 aV1WalletSeesAndTransfersShares = script do
   env <- setup
   bob <- allocateParty "bob"
-  (_, req) <- request env env.alice "r1" 100.0
+  (_, req) <- queueRequest env env.alice "r1" 100.0
   Right () <- fulfilAs env env.venue [req]
   shares <- v1Holdings env.alice (sharesId env)
   map snd shares === [100.0]

@@ -17,6 +17,7 @@ import Canton.Vault.Test.QueuedDeposit qualified as Q
 import Canton.Vault.Test.QueuedRedeem qualified as R
 
 import Splice.Api.Token.MetadataV1
+import Splice.TokenStandard.Utils (basicAccount)
 
 -- | The owner's authorization for the delegate in the vault, until `ttl` from now.
 authorize : Party -> Party -> Party -> Text -> Optional Decimal -> Optional Decimal -> RelTime -> Script (ContractId VaultDelegateAuth)
@@ -34,7 +35,8 @@ depositAs f delegate auth amount = do
   ds <- vaultDisclosure f
   trySubmit (actAs delegate <> discloseMany (fundsD :: ds)) do
     exerciseCmd auth VaultDelegateAuth_Deposit with
-      vaultCid = f.vaultCid; assets = amount; receiver = f.alice; minSharesOut = None
+      sender = basicAccount f.alice
+      vaultCid = f.vaultCid; assets = amount; receiver = basicAccount f.alice; minSharesOut = None
       extraArgs = depositArgs f [funds]
 
 redeemAs : Fixture -> Party -> ContractId VaultDelegateAuth -> Decimal -> Party -> Script (Either SubmitError (ContractId VaultDelegateAuth, VaultActionResult))
@@ -46,7 +48,8 @@ redeemAs f delegate auth shares receiver = do
   ds <- vaultDisclosure f
   trySubmit (actAs delegate <> discloseMany (ds <> poolDs <> ownedDs)) do
     exerciseCmd auth VaultDelegateAuth_Redeem with
-      vaultCid = f.vaultCid; shares; receiver; minAssetsOut = None
+      from = basicAccount f.alice
+      vaultCid = f.vaultCid; shares; receiver = basicAccount receiver; minAssetsOut = None
       extraArgs = redeemArgs f (map (toInterfaceContractId . fst) pool) owned
 
 allowances : Party -> ContractId VaultDelegateAuth -> Script (Optional Decimal, Optional Decimal)
@@ -88,7 +91,8 @@ mintAndWithdrawSpendWhatTheyMove = script do
   ds <- vaultDisclosure f
   (auth, minted) <- submit (actAs bob <> discloseMany (fundsD :: ds)) do
     exerciseCmd auth VaultDelegateAuth_Mint with
-      vaultCid = f.vaultCid; shares = 20.0; receiver = f.alice; maxAssetsIn = None
+      sender = basicAccount f.alice
+      vaultCid = f.vaultCid; shares = 20.0; receiver = basicAccount f.alice; maxAssetsIn = None
       extraArgs = depositArgs f [funds]
   minted.assets === 20.0
   pool <- query @MockHolding f.custodian
@@ -97,7 +101,8 @@ mintAndWithdrawSpendWhatTheyMove = script do
   ownedDs <- forA owned $ \cid -> fromSome <$> queryDisclosure f.alice cid
   (auth, withdrew) <- submit (actAs bob <> discloseMany (ds <> poolDs <> ownedDs)) do
     exerciseCmd auth VaultDelegateAuth_Withdraw with
-      vaultCid = f.vaultCid; assets = 5.0; receiver = bob; maxSharesIn = None
+      from = basicAccount f.alice
+      vaultCid = f.vaultCid; assets = 5.0; receiver = basicAccount bob; maxSharesIn = None
       extraArgs = redeemArgs f (map (toInterfaceContractId . fst) pool) owned
   withdrew.shares === 5.0
   allowances f.alice auth >>= (=== (Some 80.0, Some 45.0))
@@ -153,7 +158,8 @@ onlyTheDelegateActs = script do
   ds <- vaultDisclosure f
   failsWith "requires authorizers" =<< trySubmit (actAs carol <> discloseMany (authD :: fundsD :: ds)) do
     exerciseCmd auth VaultDelegateAuth_Deposit with
-      vaultCid = f.vaultCid; assets = 10.0; receiver = f.alice; minSharesOut = None
+      sender = basicAccount f.alice
+      vaultCid = f.vaultCid; assets = 10.0; receiver = basicAccount f.alice; minSharesOut = None
       extraArgs = depositArgs f [funds]
 
 -- | A delegate queues a deposit as the owner's own request, spending the allowance as it requests.
@@ -165,11 +171,12 @@ aDelegateQueuesADepositForTheOwner = script do
   vd <- Q.vaultDisclosure env
   let requestAs auth label assets = trySubmit (actAs bob <> discloseMany [vd]) do
         exerciseCmd auth VaultDelegateAuth_RequestDeposit with
-          vaultCid = toInterfaceContractId env.vaultCid; label; assets; receiver = env.alice; minSharesOut = None
+          sender = basicAccount env.alice
+          vaultCid = toInterfaceContractId env.vaultCid; label; assets; receiver = basicAccount env.alice; minSharesOut = None
           extraArgs = ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata
   Right (auth, rid) <- requestAs auth "r1" 60.0
   (_, r) <- Q.published env env.alice "r1"
-  (r.requester, r.amount, rid) === (env.alice, 60.0, 0)
+  (r.requester, r.amount, rid.requestId) === (env.alice, 60.0, 1)
   failsWith "the deposit allowance is exceeded" =<< requestAs auth "r2" 50.0
   allowances env.alice auth >>= (=== (Some 40.0, None))
 
@@ -182,10 +189,25 @@ aDelegateQueuesARedemptionForTheOwner = script do
   vd <- R.vaultDisclosure env
   let requestAs auth label shares = trySubmit (actAs bob <> discloseMany [vd]) do
         exerciseCmd auth VaultDelegateAuth_RequestRedeem with
-          vaultCid = toInterfaceContractId env.vaultCid; label; shares; receiver = bob; minAssetsOut = None
+          from = basicAccount env.alice
+          vaultCid = toInterfaceContractId env.vaultCid; label; shares; receiver = basicAccount bob; minAssetsOut = None
           extraArgs = ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata
   Right (auth, _) <- requestAs auth "r1" 30.0
   (_, r) <- R.published env env.alice "r1"
   (r.requester, r.receiver, r.amount) === (env.alice, bob, 30.0)
   failsWith "the redeem allowance is exceeded" =<< requestAs auth "r2" 30.0
   allowances env.alice auth >>= (=== (None, Some 20.0))
+
+-- | A delegate pays in only from the owner's own accounts, whatever the vault would let through.
+aDelegatePaysInOnlyFromTheOwnersAccounts : Script ()
+aDelegatePaysInOnlyFromTheOwnersAccounts = script do
+  f <- setupVault
+  bob <- allocateParty "bob"
+  auth <- authorize f.alice bob f.registrar "reference-1" (Some 100.0) (Some 100.0) (days 1)
+  funds <- fund f bob 10.0
+  fundsD <- fromSome <$> queryDisclosure bob (fromInterfaceContractId @MockHolding funds)
+  ds <- vaultDisclosure f
+  failsWith "the account is not the owner's" =<< trySubmit (actAs bob <> discloseMany (fundsD :: ds)) do
+    exerciseCmd auth VaultDelegateAuth_Deposit with
+      vaultCid = f.vaultCid; assets = 10.0; sender = basicAccount bob; receiver = basicAccount bob; minSharesOut = None
+      extraArgs = depositArgs f [funds]

@@ -72,7 +72,7 @@ setupWithFee redeemFeeBps = do
     createCmd R.ReferenceQueuedRedeemVault with
       vaultId
       vaultRegistrar = registrar
-      custodian
+      custodian = basicAccount custodian
       underlyingInstrument = V2.InstrumentId with admin = usd.admin; id = "USD"
       shareInstrument = V2.InstrumentId with admin = registrar; id = vaultId
       totalShares = 100.0
@@ -82,7 +82,7 @@ setupWithFee redeemFeeBps = do
       redeemFeeBps
       rateValidFrom = now
       rateValidUntil = addRelTime now (hours 1)
-      epoch = 0
+      epoch = 1
       depositCap = None
       executors = [venue]
       settlementDeadlineWindow = window
@@ -191,8 +191,9 @@ vaultDisclosure env = do
 -- | A request on the party's behalf, naming its terms; the vault publishes the allocations it needs.
 requestCmd : Env -> Party -> Text -> Decimal -> Party -> Optional Decimal -> Commands RequestId
 requestCmd env party label shares receiver minAssetsOut =
-  exerciseCmd (toInterfaceContractId env.vaultCid : ContractId VaultAsyncRedeem) Vault_RequestRedeem with
-    label; shares; receiver; minAssetsOut
+  (.requestId) <$> exerciseCmd (toInterfaceContractId env.vaultCid : ContractId VaultAsyncRedeem) Vault_RequestRedeem with
+    owner = basicAccount party
+    label; shares; receiver = basicAccount receiver; minAssetsOut
     actors = [party]
     extraArgs = ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata
 
@@ -252,8 +253,8 @@ requestFor env party receiver label shares minAssetsOut = do
   req <- requestOf env party label
   pure (rid, req)
 
-request : Env -> Party -> Text -> Decimal -> Script (RequestId, Req)
-request env party label shares = requestFor env party party label shares None
+queueRequest : Env -> Party -> Text -> Decimal -> Script (RequestId, Req)
+queueRequest env party label shares = requestFor env party party label shares None
 
 -- | Every price the vault has struck.
 pricesOf : Env -> Script [ContractId R.PeriodPrice]
@@ -340,7 +341,7 @@ template PendingRedeemProbe
       controller caller
       do
         vault <- fetch vaultCid
-        pendingRedeemRequest vault requestId party (requestArgs requests)
+        pendingRedeemRequest vault requestId (basicAccount party) (requestArgs requests)
 
 pending : Env -> RequestId -> Party -> [ContractId R.QueuedRedeemRequest] -> Script Decimal
 pending env rid party requests = do
@@ -373,7 +374,7 @@ template PendingReader
         requests : [ContractId R.QueuedRedeemRequest]
       controller reader
       do exercise vaultCid Vault_PublicPendingRedeemRequest with
-           requestId; party; actors = [reader]; extraArgs = requestArgs requests
+           requestId; account = basicAccount party; actors = [reader]; extraArgs = requestArgs requests
     choice PendingReader_Fetch : Decimal
       with
         vaultCid : ContractId VaultAsyncRedeem
@@ -383,7 +384,7 @@ template PendingReader
       controller reader
       do
         vault <- fetch vaultCid
-        pendingRedeemRequest vault requestId party (requestArgs requests)
+        pendingRedeemRequest vault requestId (basicAccount party) (requestArgs requests)
 
 readPending : Env -> Party -> Party -> RequestId -> [ContractId R.QueuedRedeemRequest] -> Script (Either SubmitError Decimal)
 readPending env reader party requestId requests = do
@@ -406,7 +407,7 @@ template MaxDepositProbe
       controller caller
       do
         vault <- fetch vaultCid
-        maxDeposit vault party (ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata)
+        maxDeposit vault (basicAccount party) (ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata)
 
 maxDepositOf : Env -> Script Decimal
 maxDepositOf env = submit env.registrar do
@@ -422,11 +423,19 @@ supply env = do
 -- Requests and fulfilment
 ---------------------------
 
+-- | Periods count from 1, so no request takes the id `0`.
+periodsCountFromOne : Script ()
+periodsCountFromOne = script do
+  env <- setup
+  Some v <- queryContractId env.registrar env.vaultCid
+  v.epoch === 1
+  failsWith "Template precondition violated" =<< trySubmit (actAs [env.registrar, env.custodian]) (createCmd v with epoch = 0)
+
 requestThenFulfil : Script ()
 requestThenFulfil = script do
   env <- setup
-  (rid, req) <- request env env.alice "r1" 40.0
-  rid === 0
+  (rid, req) <- queueRequest env env.alice "r1" 40.0
+  rid === 1
   pending env rid env.alice [req.requestCid] >>= (=== 40.0)
   Right () <- fulfilAs env env.venue [req]
   unlocked env (usdId env) env.alice >>= (=== 40.0)
@@ -438,11 +447,11 @@ requestThenFulfil = script do
 requestsAggregateUnderOneId : Script ()
 requestsAggregateUnderOneId = script do
   env <- setup
-  (r1, a) <- request env env.alice "r1" 30.0
-  (r2, b) <- request env env.alice "r2" 20.0
+  (r1, a) <- queueRequest env env.alice "r1" 30.0
+  (r2, b) <- queueRequest env env.alice "r2" 20.0
   r1 === r2
-  pending env 0 env.alice [a.requestCid, b.requestCid] >>= (=== 50.0)
-  pending env 1 env.alice [a.requestCid, b.requestCid] >>= (=== 0.0)
+  pending env 1 env.alice [a.requestCid, b.requestCid] >>= (=== 50.0)
+  pending env 2 env.alice [a.requestCid, b.requestCid] >>= (=== 0.0)
   Right () <- fulfilAs env env.venue [a, b]
   unlocked env (usdId env) env.alice >>= (=== 50.0)
 
@@ -452,7 +461,7 @@ requesterReadsItsPendingRequestFromItsOwnContract : Script ()
 requesterReadsItsPendingRequestFromItsOwnContract = script do
   env <- setup
   stranger <- allocateParty "stranger"
-  (rid, req) <- request env env.alice "r1" 30.0
+  (rid, req) <- queueRequest env env.alice "r1" 30.0
   Right got <- readPending env env.alice env.alice rid [req.requestCid]
   got === 30.0
   failsWith "a party reads only its own requests" =<< readPending env stranger env.alice rid [req.requestCid]
@@ -475,20 +484,20 @@ acceptedFundingIsReported = script do
   tree <- submitTree (actAs env.venue <> discloseMany [vd, env.usd.disclosure, env.shares.disclosure]) do
     exerciseCmd env.vaultCid R.ReferenceQueuedRedeemVault_Bind with
       requestCid = cid; shareAllocation = escrowed; underlyingAllocation = receiving
-  reported tree === [RedeemRequested with requestId = rid; label = "r1"; shares = 40.0]
+  reported tree === [RedeemRequested with request = RequestRef rid "r1"; shares = 40.0; deadline = fromSome r.escrow.settlementDeadline]
   map (.observers) (vaultReports tree) === [[env.alice, bob, env.venue]]
 
 -- | A request is recorded while pending; its fulfilment is reported and leaves nothing behind.
 requestIsRecordedAndItsFulfilmentReported : Script ()
 requestIsRecordedAndItsFulfilmentReported = script do
   env <- setup
-  (_, req) <- request env env.alice "r1" 40.0
+  (_, req) <- queueRequest env env.alice "r1" 40.0
   pendingNow <- map snd <$> query @R.QueuedRedeemRequest env.alice
   map (\r -> (r.label, r.shares, r.receiver)) pendingNow === [("r1", 40.0, env.alice)]
   ready <- readyToFill env [req]
   Right tree <- fulfilNowTree ready env.venue [req]
   query @R.QueuedRedeemRequest env.alice >>= (=== []) . map snd
-  reported tree === [Withdrew with assets = 40.0; shares = 40.0; fromRequest = Some 0]
+  reported tree === [Withdrew with assets = 40.0; shares = 40.0; fromRequest = Some (RequestRef 1 "r1")]
   map (.observers) (vaultReports tree) === [[env.alice, env.venue]]
   query @VaultLog env.registrar >>= (=== []) . map snd
 
@@ -496,7 +505,7 @@ requestIsRecordedAndItsFulfilmentReported = script do
 payoutIsPricedWhenStruck : Script ()
 payoutIsPricedWhenStruck = script do
   env <- setup
-  (_, req) <- request env env.alice "r1" 40.0
+  (_, req) <- queueRequest env env.alice "r1" 40.0
   _ <- holdingOf env.custodian env.usd.admin (usdId env) 10.0
   closed <- closeQueued env
   next <- openQueued env closed
@@ -507,7 +516,7 @@ payoutIsPricedWhenStruck = script do
 redeemFeeStaysInThePool : Script ()
 redeemFeeStaysInThePool = script do
   env <- setupWithFee 100
-  (_, req) <- request env env.alice "r1" 40.0
+  (_, req) <- queueRequest env env.alice "r1" 40.0
   Right () <- fulfilAs env env.venue [req]
   let paid = deductFeeBps 100 (sharesToAssets 100.0 100.0 40.0)
   unlocked env (usdId env) env.alice >>= (=== paid)
@@ -517,7 +526,7 @@ redeemFeeStaysInThePool = script do
 payoutTakesOnlyTheHoldingsItNeeds : Script ()
 payoutTakesOnlyTheHoldingsItNeeds = script do
   env <- setup
-  (_, req) <- request env env.alice "r1" 40.0
+  (_, req) <- queueRequest env env.alice "r1" 40.0
   pool <- heldBy env (usdId env) env.custodian
   let larger = [cid | (cid, a) <- pool, a == 60.0]
       smaller = [cid | (cid, a) <- pool, a == 40.0]
@@ -543,7 +552,7 @@ instantRedemptionIsRefused = script do
             (tokenArgs env.usd).context.values
   submitMustFail (actAs env.alice <> discloseMany ([vd, env.usd.disclosure] <> poolDs)) do
     exerciseCmd (toInterfaceContractId env.vaultCid : ContractId Vault) Vault_Redeem with
-      shares = 10.0; owner = env.alice; receiver = env.alice; minAssetsOut = None
+      shares = 10.0; owner = basicAccount env.alice; receiver = basicAccount env.alice; minAssetsOut = None
       actors = [env.alice]; extraArgs = args
 
 -- | A queued direction has no instant path: its max methods are zero and its previews fail, while deposits still quote.
@@ -576,7 +585,8 @@ requestWithAStrangerIsRefused = script do
   vd <- vaultDisclosure env
   submitMustFail (actAs [env.alice, carol] <> discloseMany [vd]) do
     exerciseCmd (toInterfaceContractId env.vaultCid : ContractId VaultAsyncRedeem) Vault_RequestRedeem with
-      label = "r1"; shares = 40.0; receiver = env.alice; minAssetsOut = None
+      owner = basicAccount env.alice
+      label = "r1"; shares = 40.0; receiver = basicAccount env.alice; minAssetsOut = None
       actors = [env.alice, carol]; extraArgs = ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata
 
 requestAfterThePeriodEndsIsRefused : Script ()
@@ -588,14 +598,14 @@ requestAfterThePeriodEndsIsRefused = script do
 fulfilmentByAnotherPartyIsRefused : Script ()
 fulfilmentByAnotherPartyIsRefused = script do
   env <- setup
-  (_, req) <- request env env.alice "r1" 40.0
+  (_, req) <- queueRequest env env.alice "r1" 40.0
   failsWith "requires authorizers" =<< fulfilAs env env.alice [req]
   unlocked env (usdId env) env.alice >>= (=== 0.0)
 
 fulfilmentAfterThePeriodEndsIsRefused : Script ()
 fulfilmentAfterThePeriodEndsIsRefused = script do
   env <- setup
-  (_, req) <- request env env.alice "r1" 40.0
+  (_, req) <- queueRequest env env.alice "r1" 40.0
   next <- nextPeriod env
   passTime (hours 2)
   failsWith "rate period is still open" =<< fulfilNow next env.venue [req]
@@ -605,7 +615,7 @@ fulfilmentAfterThePeriodEndsIsRefused = script do
 fulfilmentIsAtomic : Script ()
 fulfilmentIsAtomic = script do
   env <- setup
-  (_, req) <- request env env.alice "r1" 40.0
+  (_, req) <- queueRequest env env.alice "r1" 40.0
   doomed <- submit env.usd.admin (createCmd TokenRules with admin = env.usd.admin)
   Some doomedD <- queryDisclosure env.usd.admin doomed
   vaultCid <- submit (actAs env.registrar <> discloseMany [env.usd.disclosure, env.shares.disclosure, doomedD]) do
@@ -624,14 +634,14 @@ fulfilmentIsAtomic = script do
 escrowCannotBeWithdrawnBeforeTheDeadline : Script ()
 escrowCannotBeWithdrawnBeforeTheDeadline = script do
   env <- setup
-  (_, req) <- request env env.alice "r1" 40.0
+  (_, req) <- queueRequest env env.alice "r1" 40.0
   submitMustFail (actAs env.alice <> discloseMany [env.shares.disclosure]) do
     exerciseCmd req.shareAllocation V2.Allocation_Withdraw with actors = [env.alice]; extraArgs = tokenArgs env.shares
 
 receiptCannotBeWithdrawnBeforeTheDeadline : Script ()
 receiptCannotBeWithdrawnBeforeTheDeadline = script do
   env <- setup
-  (_, req) <- request env env.alice "r1" 40.0
+  (_, req) <- queueRequest env env.alice "r1" 40.0
   submitMustFail (actAs env.alice <> discloseMany [env.usd.disclosure]) do
     exerciseCmd req.underlyingAllocation V2.Allocation_Withdraw with actors = [env.alice]; extraArgs = tokenArgs env.usd
 
@@ -639,7 +649,7 @@ receiptCannotBeWithdrawnBeforeTheDeadline = script do
 executorsCancelBeforeTheDeadline : Script ()
 executorsCancelBeforeTheDeadline = script do
   env <- setup
-  (_, req) <- request env env.alice "r1" 40.0
+  (_, req) <- queueRequest env env.alice "r1" 40.0
   locked <- lockedTokens env.shares [req.shareAllocation]
   _ <- submit (actAs env.venue <> discloseMany (env.shares.disclosure :: locked)) do
     exerciseCmd req.shareAllocation V2.Allocation_Cancel with actors = [env.venue]; extraArgs = tokenArgs env.shares
@@ -649,7 +659,7 @@ executorsCancelBeforeTheDeadline = script do
 holderRecoversAfterTheDeadline : Script ()
 holderRecoversAfterTheDeadline = script do
   env <- setup
-  (_, req) <- request env env.alice "r1" 40.0
+  (_, req) <- queueRequest env env.alice "r1" 40.0
   passTime (window + hours 2)
   _ <- submit (actAs env.alice <> discloseMany [env.shares.disclosure]) do
     exerciseCmd req.shareAllocation V2.Allocation_Withdraw with actors = [env.alice]; extraArgs = tokenArgs env.shares
@@ -674,9 +684,10 @@ pauseStopsDepositsNotRedemptions = script do
   vd <- vaultDisclosure paused
   failsWith "vault is not paused" =<< trySubmit (actAs env.alice <> discloseMany [vd]) do
     exerciseCmd (toInterfaceContractId paused.vaultCid : ContractId Vault) Vault_Deposit with
-      assets = 10.0; receiver = env.alice; minSharesOut = None; actors = [env.alice]
+      sender = basicAccount env.alice
+      assets = 10.0; receiver = basicAccount env.alice; minSharesOut = None; actors = [env.alice]
       extraArgs = ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata
-  (_, req) <- request paused env.alice "r1" 40.0
+  (_, req) <- queueRequest paused env.alice "r1" 40.0
   Right () <- fulfilAs paused env.venue [req]
   unlocked env (usdId env) env.alice >>= (=== 40.0)
 
@@ -706,7 +717,7 @@ openQueued env closed = do
 closedPeriodRefusesRequestsAndFulfilment : Script ()
 closedPeriodRefusesRequestsAndFulfilment = script do
   env <- setup
-  (_, req) <- request env env.alice "r1" 40.0
+  (_, req) <- queueRequest env env.alice "r1" 40.0
   vd <- vaultDisclosure env
   _ <- closeQueued env
   submitMustFail (actAs env.alice <> discloseMany [vd]) (requestCmd env env.alice "r2" 10.0 env.alice None)
@@ -717,7 +728,7 @@ closedPeriodRefusesRequestsAndFulfilment = script do
 nextPeriodCountsFulfilments : Script ()
 nextPeriodCountsFulfilments = script do
   env <- setup
-  (_, req) <- request env env.alice "r1" 40.0
+  (_, req) <- queueRequest env env.alice "r1" 40.0
   Right () <- fulfilAs env env.venue [req]
   closed <- closeQueued env
   next <- openQueued env closed
@@ -729,11 +740,11 @@ nextPeriodCountsFulfilments = script do
 reopenRestoresTheQueuedVault : Script ()
 reopenRestoresTheQueuedVault = script do
   env <- setup
-  (_, first) <- request env env.alice "r1" 30.0
+  (_, first) <- queueRequest env env.alice "r1" 30.0
   closed <- closeQueued env
   reopened <- submit env.registrar (exerciseCmd closed R.ClosedQueuedRedeemPeriod_Reopen)
   let env' = env with vaultCid = reopened
-  (_, second) <- request env' env.alice "r2" 20.0
+  (_, second) <- queueRequest env' env.alice "r2" 20.0
   Right () <- fulfilAs env' env.venue [first, second]
   unlocked env (usdId env) env.alice >>= (=== 50.0)
 
@@ -744,7 +755,7 @@ reopenRestoresTheQueuedVault = script do
 repinnedFactoriesCarryFulfilment : Script ()
 repinnedFactoriesCarryFulfilment = script do
   env <- setup
-  (_, req) <- request env env.alice "r1" 40.0
+  (_, req) <- queueRequest env env.alice "r1" 40.0
   rulesCid <- submit env.usd.admin (createCmd TokenRules with admin = env.usd.admin)
   Some disclosure <- queryDisclosure env.usd.admin rulesCid
   let usd' = env.usd with rulesCid; disclosure
@@ -786,7 +797,7 @@ repinToAnotherRegistrysFactoriesIsRefused = script do
 fulfilsALargeQueueInOneBatch : Script ()
 fulfilsALargeQueueInOneBatch = script do
   env <- setup
-  requests <- forA [1 .. 30] $ \i -> snd <$> request env env.alice ("r" <> show i) 2.0
+  requests <- forA [1 .. 30] $ \i -> snd <$> queueRequest env env.alice ("r" <> show i) 2.0
   Right () <- fulfilAs env env.venue requests
   unlocked env (usdId env) env.alice >>= (=== 60.0)
   supply env >>= (=== 40.0)
@@ -835,7 +846,8 @@ providerAccountReceiverIsPaid = script do
   vd <- vaultDisclosure env
   _ <- submit (actAs env.alice <> discloseMany [vd]) do
     exerciseCmd (toInterfaceContractId env.vaultCid : ContractId VaultAsyncRedeem) Vault_RequestRedeem with
-      label = "r1"; shares = 40.0; receiver = env.alice; minAssetsOut = None
+      owner = basicAccount env.alice
+      label = "r1"; shares = 40.0; receiver = account; minAssetsOut = None
       actors = [env.alice]; extraArgs = ExtraArgs with context = emptyChoiceContext; meta = accountToMeta "receiver" account emptyMetadata
   (cid, r) <- published env env.alice "r1"
   escrowed <- escrowAsRequested env r
@@ -866,7 +878,8 @@ providerAccountSharesAreRedeemed = script do
   vd <- vaultDisclosure env
   _ <- submit (actAs [env.alice, bank] <> discloseMany [vd]) do
     exerciseCmd (toInterfaceContractId env.vaultCid : ContractId VaultAsyncRedeem) Vault_RequestRedeem with
-      label = "r1"; shares = 40.0; receiver = env.alice; minAssetsOut = None
+      owner = account
+      label = "r1"; shares = 40.0; receiver = basicAccount env.alice; minAssetsOut = None
       actors = [env.alice, bank]; extraArgs = ExtraArgs with context = emptyChoiceContext; meta = accountToMeta "sender" account emptyMetadata
   (cid, r) <- published env env.alice "r1"
   escrowed <- allocateApproved env.shares env.alice bank args cfgD r.escrow r.settlement [toInterfaceContractId held]
@@ -894,16 +907,16 @@ providerAccountSharesAreRedeemed = script do
 executorCannotForgeARequest : Script ()
 executorCannotForgeARequest = script do
   env <- setup
-  (_, req) <- request env env.alice "r1" 40.0
+  (_, req) <- queueRequest env env.alice "r1" 40.0
   bob <- allocateParty "bob"
   forgedAt <- getTime
   bobs <- allocateWith env.usd bob (receiptSpec env bob forgedAt) (settlementOf env) []
   submitMustFail env.venue do
     createCmd R.QueuedRedeemRequest with
       vaultId = env.vaultId; vaultRegistrar = env.registrar; executors = [env.venue]
-      owner = env.alice; receiver = bob; label = "r1"; shares = 40.0; anchor = coerceContractId req.requestCid
+      owner = env.alice; sender = basicAccount env.alice; receiverAccount = basicAccount bob; receiver = bob; label = "r1"; shares = 40.0; anchor = coerceContractId req.requestCid
       shareAllocation = req.shareAllocation; underlyingAllocation = bobs
-      expiresAt = forgedAt; epoch = 0; minAssetsOut = None; filledIn = None
+      expiresAt = forgedAt; epoch = 1; minAssetsOut = None; filledIn = None
 
 -- | A copy of the vault under another id and its own custodian holding 100 USD, with Alice holding 100 of its shares.
 anotherVault : Env -> Text -> Script Env
@@ -912,7 +925,7 @@ anotherVault env vaultId = do
   Some vault <- queryContractId env.registrar now.vaultCid
   custodian <- allocateParty "otherCustodian"
   vaultCid <- submit (actAs [env.registrar, custodian]) do
-    createCmd vault with vaultId; custodian; shareInstrument = vault.shareInstrument with id = vaultId
+    createCmd vault with vaultId; custodian = basicAccount custodian; shareInstrument = vault.shareInstrument with id = vaultId
   let other = env with vaultCid; vaultId; custodian
   _ <- holdingOf custodian env.usd.admin (usdId env) 100.0
   _ <- holdingOf env.alice env.registrar (sharesId other) 100.0
@@ -923,7 +936,7 @@ requestOfAnotherVaultIsRefused : Script ()
 requestOfAnotherVaultIsRefused = script do
   env <- setup
   other <- anotherVault env "queued-redeem-2"
-  (_, req) <- request other env.alice "r1" 40.0
+  (_, req) <- queueRequest other env.alice "r1" 40.0
   Left _ <- fulfilAs env env.venue [req]
   Right () <- fulfilAs other env.venue [req]
   unlocked env (usdId env) env.alice >>= (=== 40.0)
@@ -931,8 +944,8 @@ requestOfAnotherVaultIsRefused = script do
 ownerAndExecutorsArchiveRequests : Script ()
 ownerAndExecutorsArchiveRequests = script do
   env <- setup
-  (_, r1) <- request env env.alice "r1" 40.0
-  (_, r2) <- request env env.alice "r2" 20.0
+  (_, r1) <- queueRequest env env.alice "r1" 40.0
+  (_, r2) <- queueRequest env env.alice "r2" 20.0
   submit env.alice (exerciseCmd r1.requestCid R.QueuedRedeemRequest_Archive with actor = env.alice)
   submit env.venue (exerciseCmd r2.requestCid R.QueuedRedeemRequest_Archive with actor = env.venue)
   query @R.QueuedRedeemRequest env.alice >>= (=== []) . map snd
@@ -941,7 +954,7 @@ ownerAndExecutorsArchiveRequests = script do
 strangerCannotArchiveARequest : Script ()
 strangerCannotArchiveARequest = script do
   env <- setup
-  (_, req) <- request env env.alice "r1" 40.0
+  (_, req) <- queueRequest env env.alice "r1" 40.0
   carol <- allocateParty "carol"
   rd <- fromSome <$> queryDisclosure env.registrar req.requestCid
   submitMustFail (actAs carol <> discloseMany [rd]) do
@@ -951,15 +964,15 @@ strangerCannotArchiveARequest = script do
 executorCannotSignARequestAsRegistrar : Script ()
 executorCannotSignARequestAsRegistrar = script do
   env <- setup
-  (_, req) <- request env env.alice "r1" 40.0
+  (_, req) <- queueRequest env env.alice "r1" 40.0
   forgedAt <- getTime
   venues <- allocateWith env.usd env.venue (receiptSpec env env.venue forgedAt) (settlementOf env) []
   forged <- submit env.venue do
     createCmd R.QueuedRedeemRequest with
       vaultId = env.vaultId; vaultRegistrar = env.venue; executors = [env.venue]
-      owner = env.alice; receiver = env.venue; label = "r1"; shares = 40.0; anchor = coerceContractId req.requestCid
+      owner = env.alice; sender = basicAccount env.alice; receiverAccount = basicAccount env.venue; receiver = env.venue; label = "r1"; shares = 40.0; anchor = coerceContractId req.requestCid
       shareAllocation = req.shareAllocation; underlyingAllocation = venues
-      expiresAt = forgedAt; epoch = 0; minAssetsOut = None; filledIn = None
+      expiresAt = forgedAt; epoch = 1; minAssetsOut = None; filledIn = None
   failsWith "request.vaultRegistrar" =<<
     fulfilAs env env.venue [req with requestCid = forged; underlyingAllocation = venues]
   unlocked env (usdId env) env.venue >>= (=== 0.0)
@@ -982,8 +995,8 @@ requestsOf env party label = do
 aBatchRepeatingALabelIsRefused : Script ()
 aBatchRepeatingALabelIsRefused = script do
   env <- setup
-  _ <- request env env.alice "same" 10.0
-  _ <- request env env.alice "same" 20.0
+  _ <- queueRequest env env.alice "same" 10.0
+  _ <- queueRequest env env.alice "same" 20.0
   [a, b] <- requestsOf env env.alice "same"
   failsWith "each request in the batch has its own label" =<< fulfilAs env env.venue [a, b]
   Right () <- fulfilAs env env.venue [a]
@@ -1016,7 +1029,7 @@ dustRequestIsRefused = script do
 requestWorthNothingAtFulfilmentIsRefused : Script ()
 requestWorthNothingAtFulfilmentIsRefused = script do
   env <- setup
-  (_, req) <- request env env.alice "r1" 0.0000000001
+  (_, req) <- queueRequest env env.alice "r1" 0.0000000001
   next <- withLoss env
   failsWith "each request pays out a positive amount" =<< fulfilAs next env.venue [req]
 
@@ -1028,23 +1041,23 @@ requestWorthNothingAtFulfilmentIsRefused = script do
 pendingCountsTheirRequestsOfThatPeriodOnce : Script ()
 pendingCountsTheirRequestsOfThatPeriodOnce = script do
   env <- setup
-  (first, r1) <- request env env.alice "r1" 30.0
-  (_, r2) <- request env env.alice "r2" 20.0
+  (first, r1) <- queueRequest env env.alice "r1" 30.0
+  (_, r2) <- queueRequest env env.alice "r2" 20.0
   bob <- allocateParty "bob"
   _ <- holdingOf bob env.registrar (sharesId env) 50.0
-  (_, bobs) <- request env bob "b1" 50.0
+  (_, bobs) <- queueRequest env bob "b1" 50.0
   forgedAt <- getTime
   forged <- submit env.venue do
     createCmd R.QueuedRedeemRequest with
       vaultId = env.vaultId; vaultRegistrar = env.venue; executors = [env.venue]
-      owner = env.alice; receiver = env.alice; label = "f1"; shares = 1000.0; anchor = coerceContractId r1.requestCid
+      owner = env.alice; sender = basicAccount env.alice; receiverAccount = basicAccount env.alice; receiver = env.alice; label = "f1"; shares = 1000.0; anchor = coerceContractId r1.requestCid
       shareAllocation = r1.shareAllocation; underlyingAllocation = r1.underlyingAllocation
-      expiresAt = addRelTime forgedAt (days 1); epoch = 0; minAssetsOut = None; filledIn = None
+      expiresAt = addRelTime forgedAt (days 1); epoch = 1; minAssetsOut = None; filledIn = None
   other <- anotherVault env "queued-redeem-2"
-  (_, elsewhere) <- request other env.alice "o1" 30.0
+  (_, elsewhere) <- queueRequest other env.alice "o1" 30.0
   next <- nextPeriod env
-  (second, r3) <- request next env.alice "r3" 7.0
-  (first, second) === (0, 1)
+  (second, r3) <- queueRequest next env.alice "r3" 7.0
+  (first, second) === (1, 2)
   let named = [r1.requestCid, r1.requestCid, r2.requestCid, bobs.requestCid, forged, elsewhere.requestCid, r3.requestCid]
   pending next first env.alice named >>= (=== 50.0)
   pending next second env.alice named >>= (=== 7.0)
@@ -1058,7 +1071,7 @@ pendingCountsTheirRequestsOfThatPeriodOnce = script do
 registrarDropsAnExpiredRequest : Script ()
 registrarDropsAnExpiredRequest = script do
   env <- setup
-  (_, req) <- request env env.alice "r1" 10.0
+  (_, req) <- queueRequest env env.alice "r1" 10.0
   passTime (window + hours 2)
   submit env.registrar (exerciseCmd req.requestCid R.QueuedRedeemRequest_Archive with actor = env.registrar)
   query @R.QueuedRedeemRequest env.alice >>= (=== []) . map snd
@@ -1067,7 +1080,7 @@ registrarDropsAnExpiredRequest = script do
 registrarCannotDropALiveRequest : Script ()
 registrarCannotDropALiveRequest = script do
   env <- setup
-  (_, req) <- request env env.alice "r1" 10.0
+  (_, req) <- queueRequest env env.alice "r1" 10.0
   Some r <- queryContractId env.registrar req.requestCid
   setTime (addRelTime r.expiresAt (microseconds (-1)))
   failsWith "or the registrar once it has expired" =<<
@@ -1079,7 +1092,7 @@ registrarCannotDropALiveRequest = script do
 pendingEndsAtExpiry : Script ()
 pendingEndsAtExpiry = script do
   env <- setup
-  (rid, req) <- request env env.alice "r1" 10.0
+  (rid, req) <- queueRequest env env.alice "r1" 10.0
   Some r <- queryContractId env.registrar req.requestCid
   setTime (addRelTime r.expiresAt (microseconds (-1)))
   pending env rid env.alice [req.requestCid] >>= (=== 10.0)
@@ -1090,7 +1103,7 @@ pendingEndsAtExpiry = script do
 requestExpiresWithItsEscrow : Script ()
 requestExpiresWithItsEscrow = script do
   env <- setup
-  (_, req) <- request env env.alice "r1" 10.0
+  (_, req) <- queueRequest env env.alice "r1" 10.0
   passTime (window + hours 2)
   submit env.registrar (exerciseCmd req.requestCid R.QueuedRedeemRequest_Archive with actor = env.registrar)
 
@@ -1115,30 +1128,30 @@ rejectTreeAs env party requests reason = do
 rejectReturnsTheEscrow : Script ()
 rejectReturnsTheEscrow = script do
   env <- setup
-  (_, req) <- request env env.alice "r1" 40.0
+  (_, req) <- queueRequest env env.alice "r1" 40.0
   Right tree <- rejectTreeAs env env.venue [req] "receiver blocked"
   unlocked env (sharesId env) env.alice >>= (=== 100.0)
   query @R.QueuedRedeemRequest env.alice >>= (=== []) . map snd
-  reported tree === [RequestClosed with requestId = 0; label = "r1"; amount = 40.0; reason = "receiver blocked"]
+  reported tree === [RequestClosed with request = RequestRef 1 "r1"; amount = 40.0; reason = CR_Rejected]
 
 rejectionByAnotherPartyIsRefused : Script ()
 rejectionByAnotherPartyIsRefused = script do
   env <- setup
-  (_, req) <- request env env.alice "r1" 40.0
+  (_, req) <- queueRequest env env.alice "r1" 40.0
   failsWith "requires authorizers" =<< rejectAs env env.alice [req] "changed my mind"
 
 -- | Only the registrar's request records are rejected, so an executor cannot sign a rejection in its name.
 rejectRefusesARecordTheRegistrarDidNotSign : Script ()
 rejectRefusesARecordTheRegistrarDidNotSign = script do
   env <- setup
-  (_, req) <- request env env.alice "r1" 40.0
+  (_, req) <- queueRequest env env.alice "r1" 40.0
   forgedAt <- getTime
   forged <- submit env.venue do
     createCmd R.QueuedRedeemRequest with
       vaultId = env.vaultId; vaultRegistrar = env.venue; executors = [env.venue]
-      owner = env.alice; receiver = env.alice; label = "r1"; shares = 40.0; anchor = coerceContractId req.requestCid
+      owner = env.alice; sender = basicAccount env.alice; receiverAccount = basicAccount env.alice; receiver = env.alice; label = "r1"; shares = 40.0; anchor = coerceContractId req.requestCid
       shareAllocation = req.shareAllocation; underlyingAllocation = req.underlyingAllocation
-      expiresAt = forgedAt; epoch = 0; minAssetsOut = None; filledIn = None
+      expiresAt = forgedAt; epoch = 1; minAssetsOut = None; filledIn = None
   failsWith "request.vaultRegistrar" =<< rejectAs env env.venue [req with requestCid = forged] "forged"
   unlocked env (sharesId env) env.alice >>= (=== 60.0)
 
@@ -1146,9 +1159,9 @@ rejectRefusesARecordTheRegistrarDidNotSign = script do
 aPoisonedRequestIsSplitOffAndRejected : Script ()
 aPoisonedRequestIsSplitOffAndRejected = script do
   env <- setup
-  (_, a) <- request env env.alice "a" 10.0
-  (_, b) <- request env env.alice "b" 20.0
-  (_, c) <- request env env.alice "c" 30.0
+  (_, a) <- queueRequest env env.alice "a" 10.0
+  (_, b) <- queueRequest env env.alice "b" 20.0
+  (_, c) <- queueRequest env env.alice "c" 30.0
   _ <- submit (actAs env.venue <> discloseMany [env.usd.disclosure]) do
     exerciseCmd b.underlyingAllocation V2.Allocation_Cancel with actors = [env.venue]; extraArgs = tokenArgs env.usd
   Left _ <- fulfilAs env env.venue [a, b, c]
@@ -1164,11 +1177,11 @@ aPoisonedRequestIsSplitOffAndRejected = script do
 aRequestIsNotFilledInItsOwnPeriod : Script ()
 aRequestIsNotFilledInItsOwnPeriod = script do
   env <- setup
-  (first, req) <- request env env.alice "r1" 40.0
+  (first, req) <- queueRequest env env.alice "r1" 40.0
   failsWith "a request is filled after the period it was made in" =<< fulfilNow env env.venue [req]
   next <- nextPeriod env
-  (second, _) <- request next env.alice "r2" 10.0
-  (first, second) === (0, 1)
+  (second, _) <- queueRequest next env.alice "r2" 10.0
+  (first, second) === (1, 2)
   Right () <- fulfilNow next env.venue [req]
   unlocked env (usdId env) env.alice >>= (=== 40.0)
 
@@ -1191,7 +1204,7 @@ theRequesterBearsAFallBeforeTheirPeriodCloses = script do
   forA_ held $ \(cid, _) -> submit (actAs [env.alice, env.registrar]) (archiveCmd cid)
   _ <- holdingOf env.alice env.registrar (sharesId env) 50.0
   _ <- holdingOf bob env.registrar (sharesId env) 50.0
-  (_, req) <- request env env.alice "r1" 50.0
+  (_, req) <- queueRequest env env.alice "r1" 50.0
   moveUsdPool env (-20.0)
   next <- nextPeriod env
   Right () <- fulfilAs next env.venue [req]
@@ -1205,8 +1218,8 @@ theRequesterBearsAFallBeforeTheirPeriodCloses = script do
 requestsFromOnePeriodShareOnePrice : Script ()
 requestsFromOnePeriodShareOnePrice = script do
   env <- setup
-  (_, a) <- request env env.alice "a" 30.0
-  (_, b) <- request env env.alice "b" 20.0
+  (_, a) <- queueRequest env env.alice "a" 30.0
+  (_, b) <- queueRequest env env.alice "b" 20.0
   moveUsdPool env 100.0
   next <- nextPeriod env
   Right () <- fulfilNow next env.venue [a]
@@ -1218,7 +1231,7 @@ requestsFromOnePeriodShareOnePrice = script do
 withAPendingRedemption : Script (Env, Req)
 withAPendingRedemption = do
   env <- setup
-  (_, r1) <- request env env.alice "r1" 50.0
+  (_, r1) <- queueRequest env env.alice "r1" 50.0
   next <- nextPeriod env
   pure (next, r1)
 
@@ -1245,11 +1258,11 @@ aLateFillNeedsItsOwnStruckPrice : Script ()
 aLateFillNeedsItsOwnStruckPrice = script do
   (env, r1) <- withAPendingRedemption
   late <- nextPeriod env
-  failsWith "no price struck for period 1" =<< fulfilAtTree late env.venue [r1] []
+  failsWith "no price struck for period 2" =<< fulfilAtTree late env.venue [r1] []
   forged <- submit env.venue do
     createCmd R.PeriodPrice with
       vaultId = env.vaultId; vaultRegistrar = env.venue; executors = [env.venue]
-      epoch = 1; totalShares = 1.0; totalAssets = 100.0; allotments = []
+      epoch = 2; totalShares = 1.0; totalAssets = 100.0; allotments = []
   failsWith "price.vaultRegistrar" =<< fulfilAtTree late env.venue [r1] [forged]
   other <- anotherVault env "queued-redeem-2"
   _ <- nextPeriod other
@@ -1304,9 +1317,9 @@ aQueuedRollBeyondTheLimitsNeedsTheCustodian = script do
   failsWith "requires authorizers" =<< open True [env.registrar]
   Right opened <- open True [env.registrar, env.custodian]
   Some vault <- queryContractId env.registrar opened
-  (vault.epoch, vault.totalAssets) === (1, 110.0)
+  (vault.epoch, vault.totalAssets) === (2, 110.0)
   prices <- map snd <$> query @R.PeriodPrice env.registrar
-  map (\p -> (p.epoch, p.totalAssets)) prices === [(1, 110.0)]
+  map (\p -> (p.epoch, p.totalAssets)) prices === [(2, 110.0)]
 
 -- Paying another receiver
 ---------------------------

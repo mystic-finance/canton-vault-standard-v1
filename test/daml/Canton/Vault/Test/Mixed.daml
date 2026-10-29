@@ -53,7 +53,7 @@ template MixedVault
     prices : [PriceInput]
       -- ^ The outside prices the current totals rest on.
   where
-    signatory vault.vaultRegistrar, vault.custodian
+    signatory vault.vaultRegistrar, custodianOwner vault.custodian
 
     interface instance Vault for MixedVault where
       view = let v = view (inner this) in v with rate = (v.rate with inputs = prices)
@@ -118,17 +118,17 @@ inner : MixedVault -> Vault
 inner = toInterface . (.vault)
 
 -- | What the custodian's unlocked shares of another vault are worth, as that vault converts them.
-worth : Party -> VaultPosition -> Update Decimal
+worth : V2.Account -> VaultPosition -> Update Decimal
 worth custodian position = do
   require "share holdings are distinct" (length (dedup position.holdingCids) == length position.holdingCids)
-  otherView <- exercise position.vaultCid Vault_PublicFetch with actors = [custodian]
+  otherView <- exercise position.vaultCid Vault_PublicFetch with actors = custodianOwner custodian
   amounts <- forA position.holdingCids $ \cid -> do
     holding <- (.holding) <$> fetch cid
     require "the holding is of the vault's shares" (holding.instrumentId == otherView.shareInstrument)
-    require "the holding is the custodian's" (holding.account == basicAccount custodian)
+    require "the holding is the custodian's" (holding.account == custodian)
     require "the holding is unlocked" (holding.lock == None)
     pure holding.amount
-  exercise position.vaultCid Vault_PublicConvertToAssets with shares = sum amounts; actors = [custodian]
+  exercise position.vaultCid Vault_PublicConvertToAssets with shares = sum amounts; actors = custodianOwner custodian
 
 -- | Reads a vault's maxRedeem with the authority of every party it needs.
 template ExitProbe
@@ -140,7 +140,7 @@ template ExitProbe
       controller readers
       do
         vault <- fetch vaultCid
-        maxRedeem vault party extraArgs
+        maxRedeem vault (basicAccount party) extraArgs
 
 -- Fixture
 -----------
@@ -170,7 +170,7 @@ setupMixed = do
       prices = []
   now <- getTime
   otherCid <- submit (actAs [otherRegistrar, otherCustodian]) $ createCmd ref with
-    vaultId = "other-1"; vaultRegistrar = otherRegistrar; custodian = otherCustodian
+    vaultId = "other-1"; vaultRegistrar = otherRegistrar; custodian = basicAccount otherCustodian
     shareInstrument = V2.InstrumentId with admin = otherRegistrar; id = "other-1"
     rateValidFrom = now; rateValidUntil = addRelTime now (hours 1)
   let m = Mixed with f; vaultCid; otherCid; otherRegistrar; otherCustodian; desk; venue
@@ -180,7 +180,8 @@ setupMixed = do
   otherDs <- otherDisclosures m
   _ <- submit (actAs f.custodian <> discloseMany otherDs) do
     exerciseCmd (toInterfaceContractId otherCid : ContractId Vault) Vault_Deposit with
-      assets = 200.0; receiver = f.custodian; minSharesOut = None; actors = [f.custodian]
+      sender = basicAccount f.custodian
+      assets = 200.0; receiver = basicAccount f.custodian; minSharesOut = None; actors = [f.custodian]
       extraArgs = depositArgs f [toInterfaceContractId pooled]
   [(change, _)] <- query @MockHolding f.custodian
   _ <- submit f.underlyingAdmin do
@@ -242,7 +243,8 @@ depositInto m party amount = do
   ds <- mixedDisclosures m m.vaultCid
   submit (actAs party <> discloseMany ds) do
     exerciseCmd (toInterfaceContractId m.vaultCid : ContractId Vault) Vault_Deposit with
-      assets = amount; receiver = party; minSharesOut = None; actors = [party]
+      sender = basicAccount party
+      assets = amount; receiver = basicAccount party; minSharesOut = None; actors = [party]
       extraArgs = depositArgs m.f [funds]
 
 -- | Alice's shares and the pool, named as an exit needs them.
@@ -260,7 +262,7 @@ redeemFromMixed m vaultCid shares = do
   poolDs <- forA pool $ \(cid, _) -> fromSome <$> queryDisclosure m.f.custodian cid
   trySubmit (actAs m.f.alice <> discloseMany (ds <> poolDs)) do
     exerciseCmd (toInterfaceContractId vaultCid : ContractId Vault) Vault_Redeem with
-      shares; owner = m.f.alice; receiver = m.f.alice; minAssetsOut = None; actors = [m.f.alice]
+      shares; owner = basicAccount m.f.alice; receiver = basicAccount m.f.alice; minAssetsOut = None; actors = [m.f.alice]
       extraArgs = args
 
 viewOf : Mixed -> ContractId MixedVault -> Script VaultView
@@ -279,13 +281,14 @@ mixedVaultCountsEveryStrategy = script do
   other <- rollOther m
   Some otherVault <- queryContractId m.otherRegistrar other
   let o = view (toInterface @Vault otherVault)
-      otherWorth = mulDivDown 200.0 o.totalAssets o.totalShares
+      otherWorth = mulDivDown 200.0 (o.totalAssets + o.virtualAssets) (o.totalShares + o.virtualShares)
   assertMsg "the other vault's shares earned" (otherWorth > 200.0)
   t <- getTime
   rolled <- rollMixed m other
   v <- viewOf m rolled
-  v.totalAssets === 300.0 + otherWorth + 303.0 + 198.0 + virtualOffset
-  v.totalShares === 1000.0 + virtualOffset
+  v.totalAssets === 300.0 + otherWorth + 303.0 + 198.0
+  v.totalShares === 1000.0
+  (v.virtualShares, v.virtualAssets) === (virtualOffset, virtualOffset)
   v.rate.inputs ===
     [ PriceInput with authority = m.desk; subject = "loan-1"; effectiveAt = t; attestationId = "desk-7"
     , PriceInput with authority = m.venue; subject = "basis-1"; effectiveAt = t; attestationId = "venue-3" ]
@@ -301,9 +304,9 @@ mixedVaultPricesAsItsView = script do
     (onAssets, onShares) <- submit m.f.registrar do
       createAndExerciseCmd (ConvertProbe with registrar = m.f.registrar) ConvertProbe_Convert with
         vaultCid = toInterfaceContractId rolled; shares = x; assets = x
-    (onAssets, onShares) === (mulDivDown x v.totalAssets v.totalShares, mulDivDown x v.totalShares v.totalAssets)
+    (onAssets, onShares) === (mulDivDown x (v.totalAssets + v.virtualAssets) (v.totalShares + v.virtualShares), mulDivDown x (v.totalShares + v.virtualShares) (v.totalAssets + v.virtualAssets))
   minted <- depositInto (m with vaultCid = rolled) m.f.alice 100.0
-  minted.shares === mulDivDown 100.0 v.totalShares v.totalAssets
+  minted.shares === mulDivDown 100.0 (v.totalShares + v.virtualShares) (v.totalAssets + v.virtualAssets)
 
 -- | Exits are paid from the pool alone: the most Alice may redeem is what the pool covers, which she can redeem, and
 -- no more.
@@ -317,7 +320,7 @@ mixedVaultPaysExitsFromItsPool = script do
     createAndExerciseCmd (ExitProbe with readers = [m.f.registrar, m.f.custodian]) ExitProbe_MaxRedeem with
       vaultCid = toInterfaceContractId rolled; party = m.f.alice; extraArgs = args
   assertMsg "the pool caps the exit below Alice's shares" (most < 1000.0)
-  assertMsg "the pool covers the most" (mulDivDown most v.totalAssets v.totalShares <= 300.0)
+  assertMsg "the pool covers the most" (mulDivDown most (v.totalAssets + v.virtualAssets) (v.totalShares + v.virtualShares) <= 300.0)
   Right paid <- redeemFromMixed m rolled most
-  paid.assets === mulDivDown most v.totalAssets v.totalShares
+  paid.assets === mulDivDown most (v.totalAssets + v.virtualAssets) (v.totalShares + v.virtualShares)
   failsWith "'available' is less than 'transfer.amount'" =<< redeemFromMixed m rolled 1.0

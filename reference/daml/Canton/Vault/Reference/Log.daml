@@ -7,6 +7,8 @@ import DA.List (dedup)
 import Canton.Vault.EventLog.V1
 
 import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.HoldingV2 qualified as V2
+import Splice.TokenStandard.Utils (regularAccountParties)
 
 -- | Reports events in the transaction they happen in. Created and archived within that transaction, so nothing
 -- stays on the ledger.
@@ -22,18 +24,19 @@ template VaultLog
 
 -- | One event, with the parties it concerns.
 data Report = Report with
-    owner : Party
-    receiver : Party
+    owner : V2.Account
+    receiver : V2.Account
     actors : [Party]
     event : VaultEvent
+    meta : Metadata
 
--- | Shows each event to its owner, receiver and actors.
+-- | Shows each event to the parties of its owner and receiver accounts, and its actors.
 report : Party -> Text -> [Report] -> Update ()
 report vaultRegistrar vaultId reports = do
   log <- create VaultLog with vaultRegistrar
   forA_ reports $ \r -> exercise (toInterfaceContractId @VaultEventLog log) VaultEventLog_Report with
     vaultRegistrar; vaultId
     owner = r.owner; receiver = r.receiver; actors = r.actors; event = r.event
-    observers = dedup (r.owner :: r.receiver :: r.actors)
-    extraArgs = ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata
+    observers = dedup (regularAccountParties r.owner <> regularAccountParties r.receiver <> r.actors)
+    extraArgs = ExtraArgs with context = emptyChoiceContext; meta = r.meta
   archive log

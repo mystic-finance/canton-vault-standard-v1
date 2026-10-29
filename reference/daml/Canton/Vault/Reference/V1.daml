@@ -2,8 +2,8 @@
 module Canton.Vault.Reference.V1 where
 
 import DA.Foldable (forA_)
-import DA.List (dedup, head)
-import DA.Optional (fromOptional)
+import DA.List (dedup)
+import DA.Optional (fromOptional, isNone, isSome, optionalToList)
 import DA.TextMap qualified as TextMap
 import DA.Time (isLedgerTimeLT)
 
@@ -119,7 +119,7 @@ template ClosedPeriod
   with
     vault : ReferenceVault
   where
-    signatory vault.vaultRegistrar, vault.custodian
+    signatory vault.vaultRegistrar, custodianOwner vault.custodian
 
     choice ClosedPeriod_Open : ContractId ReferenceVault
       -- ^ Open the next period, folding in the flows not yet counted and pricing it from the evidence.
@@ -144,7 +144,7 @@ template ClosedPeriod
         flowCids : [ContractId PeriodFlow]
         evidence : PriceEvidence
         validUntil : Time
-      controller vault.vaultRegistrar, vault.custodian
+      controller vault.vaultRegistrar, custodianOwner vault.custodian
       do
         (shares, assets, pricing, now) <- rollTotals vault flowCids evidence validUntil
         create vault with
@@ -167,11 +167,15 @@ requireMintable v = require "the deposit fee leaves something to mint" (v.deposi
 requireWithdrawable : ReferenceVault -> Update ()
 requireWithdrawable v = require "the redemption fee leaves something to withdraw" (v.redeemFeeBps < 10000)
 
+-- | The custodian account's owner, a signatory of the vault.
+custodianOwner : V2.Account -> [Party]
+custodianOwner account = optionalToList account.owner
+
 template ReferenceVault
   with
     vaultId : Text
     vaultRegistrar : Party
-    custodian : Party
+    custodian : V2.Account
     underlyingInstrument : V2.InstrumentId
     shareInstrument : V2.InstrumentId
     totalShares : Decimal
@@ -194,9 +198,10 @@ template ReferenceVault
     priceLimits : PriceLimits
       -- ^ How far a roll may move the price on the registrar's word alone.
   where
-    signatory vaultRegistrar, custodian
+    signatory vaultRegistrar, custodianOwner custodian
 
     ensure totalShares >= 0.0 && totalAssets >= 0.0
+        && isSome custodian.owner
         && rateValidUntil > rateValidFrom
         -- One share instrument per vault, so two vaults never issue the same shares.
         && shareInstrument == V2.InstrumentId with admin = vaultRegistrar; id = vaultId
@@ -212,8 +217,10 @@ template ReferenceVault
         custodian
         underlyingInstrument
         shareInstrument
-        totalShares = totalShares + virtualOffset
-        totalAssets = totalAssets + virtualOffset
+        totalShares
+        totalAssets
+        virtualShares = virtualOffset
+        virtualAssets = virtualOffset
         rate = rateOf this
         depositFeeBps
         mintFeeBps = depositFeeBps
@@ -231,11 +238,11 @@ template ReferenceVault
         assets' <- currentAssets this
         pure (sharesToAssets totalShares assets' shares)
 
-      maxDeposit _party _extraArgs = pure (if paused then 0.0 else fromOptional uncapped depositCap)
+      maxDeposit account _extraArgs = pure (if paused || isNone account.owner then 0.0 else fromOptional uncapped depositCap)
 
       -- The most shares whose cost, fee included, fits under the cap.
-      maxMint _party _extraArgs = case depositCap of
-        _ | paused || depositFeeBps >= 10000 -> pure 0.0
+      maxMint account _extraArgs = case depositCap of
+        _ | paused || isNone account.owner || depositFeeBps >= 10000 -> pure 0.0
         None -> pure uncapped
         Some cap -> do
           assets' <- currentAssets this
@@ -243,16 +250,16 @@ template ReferenceVault
           pure (fitDown (\s -> cost s <= cap) (assetsToShares totalShares assets' (deductFeeBps depositFeeBps cap)))
 
       -- The most assets whose shares, fee included, the party holds, and that the pool can pay.
-      maxWithdraw party extraArgs = do
+      maxWithdraw account extraArgs = do
         assets' <- currentAssets this
-        held <- heldShares this extraArgs party
+        held <- heldShares this extraArgs account
         payable <- payableFrom this extraArgs
         let burned assets = assetsToSharesUp totalShares assets' (grossUpFeeBps redeemFeeBps assets)
         pure (fitDown (\a -> burned a <= held) (min payable (deductFeeBps redeemFeeBps (sharesToAssets totalShares assets' held))))
 
       -- The shares the party holds, as many as the pool can pay for.
-      maxRedeem party extraArgs = do
-        held <- heldShares this extraArgs party
+      maxRedeem account extraArgs = do
+        held <- heldShares this extraArgs account
         payable <- payableFrom this extraArgs
         if payable >= uncapped || redeemFeeBps >= 10000 then pure held else do
           assets' <- currentAssets this
@@ -284,8 +291,7 @@ template ReferenceVault
       vault_redeemExtraObservers _arg = []
 
       vault_depositImpl _self arg = do
-        sender <- fundingAccount arg.actors arg.extraArgs
-        requireReceiverAuthorizes arg.receiver arg.actors
+        requirePayIn arg.sender arg.receiver arg.actors
         requirePeriodOpen this
         require "vault is not paused" (not paused)
         require "deposit within cap" (arg.assets <= fromOptional uncapped depositCap)
@@ -295,10 +301,10 @@ template ReferenceVault
         require "deposit mints a positive number of shares" (shares > 0.0)
         checkMinSharesOut arg.minSharesOut shares
         require "rounding favours the vault" (sharesToAssets totalShares assets' shares <= net)
-        pullUnderlying this arg.extraArgs sender arg.assets
-        holdingCid <- mintShares shareInstrument (basicAccount arg.receiver) shares
+        pullUnderlying this arg.extraArgs arg.sender arg.assets
+        holdingCid <- mintShares shareInstrument arg.receiver shares
         recordFlow this arg.assets shares
-        recordEvent this (regularAccountOwner sender) arg.actors arg.receiver
+        recordEvent this arg.sender arg.actors arg.receiver
           Deposited with assets = arg.assets; shares; fromRequest = None
         pure VaultActionResult with
           vaultCid = None
@@ -308,8 +314,7 @@ template ReferenceVault
           meta = emptyMetadata
 
       vault_mintImpl _self arg = do
-        sender <- fundingAccount arg.actors arg.extraArgs
-        requireReceiverAuthorizes arg.receiver arg.actors
+        requirePayIn arg.sender arg.receiver arg.actors
         requirePeriodOpen this
         require "vault is not paused" (not paused)
         require "mint is positive" (arg.shares > 0.0)
@@ -318,10 +323,10 @@ template ReferenceVault
         let assets = grossUpFeeBps depositFeeBps (sharesToAssetsUp totalShares assets' arg.shares)
         require "mint within cap" (assets <= fromOptional uncapped depositCap)
         checkMaxAssetsIn arg.maxAssetsIn assets
-        pullUnderlying this arg.extraArgs sender assets
-        holdingCid <- mintShares shareInstrument (basicAccount arg.receiver) arg.shares
+        pullUnderlying this arg.extraArgs arg.sender assets
+        holdingCid <- mintShares shareInstrument arg.receiver arg.shares
         recordFlow this assets arg.shares
-        recordEvent this (regularAccountOwner sender) arg.actors arg.receiver
+        recordEvent this arg.sender arg.actors arg.receiver
           Deposited with assets; shares = arg.shares; fromRequest = None
         pure VaultActionResult with
           vaultCid = None
@@ -331,7 +336,7 @@ template ReferenceVault
           meta = emptyMetadata
 
       vault_withdrawImpl _self arg = do
-        checkActors arg.actors [[arg.owner]]
+        requirePayOut arg.owner arg.receiver arg.actors
         requirePeriodOpen this
         require "withdrawal is positive" (arg.assets > 0.0)
         requireWithdrawable this
@@ -351,7 +356,7 @@ template ReferenceVault
           meta = emptyMetadata
 
       vault_redeemImpl _self arg = do
-        checkActors arg.actors [[arg.owner]]
+        requirePayOut arg.owner arg.receiver arg.actors
         requirePeriodOpen this
         require "redemption is positive" (arg.shares > 0.0)
         assets' <- currentAssets this
@@ -395,7 +400,7 @@ template ReferenceVault
       -- ^ Change the price limits, which the custodian must agree to.
       with
         limits : PriceLimits
-      controller vaultRegistrar, custodian
+      controller vaultRegistrar, custodianOwner custodian
       do create this with priceLimits = limits
 
     choice ReferenceVault_SetPaused : ContractId ReferenceVault
@@ -423,8 +428,8 @@ template ReferenceVault
 -- Helpers
 -----------
 
-recordEvent : ReferenceVault -> Party -> [Party] -> Party -> VaultEvent -> Update ()
-recordEvent vault owner actors receiver event = report vault.vaultRegistrar vault.vaultId [Report with owner; receiver; actors; event]
+recordEvent : ReferenceVault -> V2.Account -> [Party] -> V2.Account -> VaultEvent -> Update ()
+recordEvent vault owner actors receiver event = report vault.vaultRegistrar vault.vaultId [Report with owner; receiver; actors; event; meta = emptyMetadata]
 
 -- | The view's rate: an oracle-priced vault names the attestation its totals rest on.
 rateOf : ReferenceVault -> Rate
@@ -511,7 +516,7 @@ sumPool vault holdingCids = do
     require' ("holding.instrumentId", holding.instrumentId)
       isEqualR ("underlyingInstrument", vault.underlyingInstrument)
     require' ("holding.account", holding.account)
-      isEqualR ("custodian account", basicAccount vault.custodian)
+      isEqualR ("custodian account", vault.custodian)
     require "pool holding is unlocked" (holding.lock == None)
     pure holding.amount
   pure (sum amounts)
@@ -523,9 +528,9 @@ payableFrom vault extraArgs = case vault.pricing of
   PoolPricing -> pure uncapped
   OraclePricing {} -> sumPool vault =<< getUnderlyingHoldings extraArgs.context
 
--- | Shares the party holds among the holdings they named; unnamed ones do not count.
-heldShares : ReferenceVault -> ExtraArgs -> Party -> Update Decimal
-heldShares vault extraArgs party = do
+-- | Shares the account holds among the holdings named; unnamed ones do not count.
+heldShares : ReferenceVault -> ExtraArgs -> V2.Account -> Update Decimal
+heldShares vault extraArgs account = do
   holdingCids <- getShareHoldings extraArgs.context
   require "share holdings are distinct" (length (dedup holdingCids) == length holdingCids)
   amounts <- forA holdingCids $ \cid -> do
@@ -533,7 +538,7 @@ heldShares vault extraArgs party = do
     require' ("holding.instrumentId", holding.instrumentId)
       isEqualR ("shareInstrument", vault.shareInstrument)
     require' ("holding.account", holding.account)
-      isEqualR ("party account", basicAccount party)
+      isEqualR ("account", account)
     require "share holding is unlocked" (holding.lock == None)
     pure holding.amount
   pure (sum amounts)
@@ -546,24 +551,30 @@ currentAssets vault = case vault.accrual of
     now <- getTime
     pure (accrue vault.accrual vault.totalAssets vault.rateValidFrom now)
 
--- | A clear failure for a receiver outside the actors, who could not sign their shares.
-requireReceiverAuthorizes : Party -> [Party] -> Update ()
-requireReceiverAuthorizes receiver actors =
-  require' ("receiver", receiver) isMemberR ("actors", actors)
+-- | Refuses an account the token standard reserves for the instrument admin.
+requireRegular : Text -> V2.Account -> Update ()
+requireRegular what account = require (what <> " has an owner") (isRegularAccount account)
+
+-- | A deposit's accounts: the actors are exactly the sender's parties, and include the receiver's, who sign their shares.
+requirePayIn : V2.Account -> V2.Account -> [Party] -> Update ()
+requirePayIn sender receiver actors = do
+  requireRegular "sender" sender
+  requireRegular "receiver" receiver
+  checkActors actors [regularAccountParties sender]
+  forA_ (regularAccountParties receiver) $ \p -> require' ("receiver", p) isMemberR ("actors", actors)
+
+-- | A redemption's accounts: the actors are exactly the owner's parties.
+requirePayOut : V2.Account -> V2.Account -> [Party] -> Update ()
+requirePayOut owner receiver actors = do
+  requireRegular "owner" owner
+  requireRegular "receiver" receiver
+  checkActors actors [regularAccountParties owner]
 
 -- | Refuses to transact against a rate period that has ended.
 requirePeriodOpen : ReferenceVault -> Update ()
 requirePeriodOpen vault = do
   open <- isLedgerTimeLT vault.rateValidUntil
   require "rate period is still open" open
-
--- | The deposit's funding account; the actors must be exactly its parties.
-fundingAccount : [Party] -> ExtraArgs -> Update V2.Account
-fundingAccount actors extraArgs = do
-  require "deposit names an actor" (actors /= [])
-  let account = accountFromMeta (head actors) "sender" extraArgs.meta
-  checkActors actors [regularAccountParties account]
-  pure account
 
 checkMinSharesOut : Optional Decimal -> Decimal -> Update ()
 checkMinSharesOut limit shares = case limit of
@@ -589,18 +600,19 @@ checkMinAssetsOut limit assets = case limit of
 pullUnderlying : ReferenceVault -> ExtraArgs -> V2.Account -> Decimal -> Update ()
 pullUnderlying vault extraArgs from amount = do
   inputHoldingCids <- getUnderlyingHoldings extraArgs.context
-  _ <- transferUnderlying vault extraArgs (regularAccountParties from) from (basicAccount vault.custodian) amount inputHoldingCids
+  _ <- transferUnderlying vault extraArgs (regularAccountParties from) from vault.custodian amount inputHoldingCids
   pure ()
 
--- A payout the registry leaves pending is accepted by the receiver, if they are acting in this choice.
-pushUnderlying : ReferenceVault -> ExtraArgs -> [Party] -> Party -> Decimal -> Update [ContractId V2.Holding]
+-- A payout the registry leaves pending is accepted by the receiver's parties, if they are acting in this choice.
+pushUnderlying : ReferenceVault -> ExtraArgs -> [Party] -> V2.Account -> Decimal -> Update [ContractId V2.Holding]
 pushUnderlying vault extraArgs callerActors to amount = do
   named <- getUnderlyingHoldings extraArgs.context
   inputHoldingCids <- coveringHoldings amount named
-  output <- transferOutput vault extraArgs [vault.custodian] (basicAccount vault.custodian) (basicAccount to) amount inputHoldingCids
+  output <- transferOutput vault extraArgs (custodianOwner vault.custodian) vault.custodian to amount inputHoldingCids
+  let toParties = regularAccountParties to
   case output of
-    V2.TransferInstructionResult_Pending with transferInstructionCid | to `elem` callerActors -> do
-      accepted <- exercise transferInstructionCid V2.TransferInstruction_Accept with actors = [to]; extraArgs
+    V2.TransferInstructionResult_Pending with transferInstructionCid | all (`elem` callerActors) toParties -> do
+      accepted <- exercise transferInstructionCid V2.TransferInstruction_Accept with actors = toParties; extraArgs
       completed accepted.output
     _ -> completed output
 
@@ -639,10 +651,10 @@ transferOutput vault extraArgs actors sender receiver amount inputHoldingCids = 
     extraArgs
   pure result.output
 
-burnFrom : ReferenceVault -> ExtraArgs -> Party -> Decimal -> Update ()
+burnFrom : ReferenceVault -> ExtraArgs -> V2.Account -> Decimal -> Update ()
 burnFrom vault extraArgs owner amount = do
   holdingCids <- getShareHoldings extraArgs.context
-  burnAcross vault.shareInstrument (basicAccount owner) amount holdingCids
+  burnAcross vault.shareInstrument owner amount holdingCids
 
 burnAcross : V2.InstrumentId -> V2.Account -> Decimal -> [ContractId ShareHolding] -> Update ()
 burnAcross _instrumentId _account remaining [] =

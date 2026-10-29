@@ -7,26 +7,29 @@ import Canton.Vault.V1
 import Canton.Vault.Reference.V1
 
 import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.HoldingV2 (Account)
 import Splice.TokenStandard.Utils
 
 data CommandAction
   = DepositCommand with
       assets : Decimal
-      receiver : Party
+      sender : Account
+      receiver : Account
       minSharesOut : Optional Decimal
   | MintCommand with
       shares : Decimal
-      receiver : Party
+      sender : Account
+      receiver : Account
       maxAssetsIn : Optional Decimal
   | WithdrawCommand with
       assets : Decimal
-      owner : Party
-      receiver : Party
+      owner : Account
+      receiver : Account
       maxSharesIn : Optional Decimal
   | RedeemCommand with
       shares : Decimal
-      owner : Party
-      receiver : Party
+      owner : Account
+      receiver : Account
       minAssetsOut : Optional Decimal
   deriving (Eq, Show, Serializable)
 
@@ -60,8 +63,8 @@ template VaultCommand
         require' ("vault.vaultRegistrar", vault.vaultRegistrar) isEqualR ("vaultRegistrar", vaultRegistrar)
         let cid : ContractId Vault = toInterfaceContractId vaultCid
         case action of
-          DepositCommand{..} -> exercise cid Vault_Deposit with assets; receiver; minSharesOut; actors; extraArgs
-          MintCommand{..} -> exercise cid Vault_Mint with shares; receiver; maxAssetsIn; actors; extraArgs
+          DepositCommand{..} -> exercise cid Vault_Deposit with assets; sender; receiver; minSharesOut; actors; extraArgs
+          MintCommand{..} -> exercise cid Vault_Mint with shares; sender; receiver; maxAssetsIn; actors; extraArgs
           WithdrawCommand{..} -> exercise cid Vault_Withdraw with assets; owner; receiver; maxSharesIn; actors; extraArgs
           RedeemCommand{..} -> exercise cid Vault_Redeem with shares; owner; receiver; minAssetsOut; actors; extraArgs
 

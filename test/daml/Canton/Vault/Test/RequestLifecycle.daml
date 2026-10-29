@@ -1,0 +1,155 @@
+-- | What a request publishes, and why each ends unfilled, in both directions.
+module Canton.Vault.Test.RequestLifecycle where
+
+import DA.Assert ((===))
+import DA.TextMap qualified as TextMap
+import DA.Time (addRelTime)
+import Daml.Script
+
+import Canton.Vault.AsyncDeposit.V1
+import Canton.Vault.AsyncRedeem.V1
+import Canton.Vault.EventLog.V1
+import Canton.Vault.Reference.Queue qualified as Q
+import Canton.Vault.Reference.QueuedDeposit qualified as Q
+import Canton.Vault.Reference.QueuedRedeem qualified as R
+import Canton.Vault.Test.QueueSupport (failsWith, fakeAllocation)
+import Canton.Vault.Test.QueuedDeposit qualified as QD
+import Canton.Vault.Test.QueuedRedeem qualified as QR
+import Canton.Vault.Test.Reports (vaultReports)
+
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.HoldingV2 qualified as V2
+import Splice.Api.Token.AllocationRequestV2 qualified as AR
+import Splice.Testing.Tokens.TestTokenV2.Holding (Token(..))
+import Splice.TokenStandard.Utils (basicAccount)
+
+-- | The reasons a transaction reported for requests leaving the queue.
+reasons : TransactionTree -> [CloseReason]
+reasons tree = [reason | RequestClosed _ _ reason <- map (.event) (vaultReports tree)]
+
+-- | The allocation request names the vault's executors, and each allocation's deadline is the end of the request's
+-- period plus the vault's window.
+depositRequestCarriesTheExecutorsAndDeadline : Script ()
+depositRequestCarriesTheExecutorsAndDeadline = script do
+  env <- QD.setup
+  Right _ <- QD.requestTerms env env.alice "r1" 10.0 env.alice None
+  (cid, _) <- QD.published env env.alice "r1"
+  Some async <- queryInterfaceContractId @VaultAsyncDeposit env.registrar (toInterfaceContractId env.vaultCid)
+  Some vault <- queryContractId env.registrar env.vaultCid
+  Some request <- queryInterfaceContractId @AR.AllocationRequest env.alice (toInterfaceContractId cid)
+  request.settlement.executors === async.executors
+  map (.settlementDeadline) request.allocations
+    === [Some (addRelTime vault.rateValidUntil async.settlementDeadlineWindow) | _ <- request.allocations]
+
+redeemRequestCarriesTheExecutorsAndDeadline : Script ()
+redeemRequestCarriesTheExecutorsAndDeadline = script do
+  env <- QR.setup
+  Right _ <- QR.requestTerms env env.alice "r1" 10.0 env.alice None
+  (cid, _) <- QR.published env env.alice "r1"
+  Some async <- queryInterfaceContractId @VaultAsyncRedeem env.registrar (toInterfaceContractId env.vaultCid)
+  Some vault <- queryContractId env.registrar env.vaultCid
+  Some request <- queryInterfaceContractId @AR.AllocationRequest env.alice (toInterfaceContractId cid)
+  request.settlement.executors === async.executors
+  map (.settlementDeadline) request.allocations
+    === [Some (addRelTime vault.rateValidUntil async.settlementDeadlineWindow) | _ <- request.allocations]
+
+-- | A dropped request is cancelled by its requester, rejected by an executor, and expired by the registrar.
+droppedDepositsSayWhoEndedThem : Script ()
+droppedDepositsSayWhoEndedThem = script do
+  env <- QD.setup
+  (_, r1) <- QD.queueRequest env env.alice "r1" 10.0
+  (_, r2) <- QD.queueRequest env env.alice "r2" 10.0
+  (_, r3) <- QD.queueRequest env env.alice "r3" 10.0
+  byRequester <- submitTree env.alice (exerciseCmd r1.requestCid Q.QueuedDepositRequest_Archive with actor = env.alice)
+  byExecutor <- submitTree env.venue (exerciseCmd r2.requestCid Q.QueuedDepositRequest_Archive with actor = env.venue)
+  Some expiring <- queryContractId env.registrar r3.requestCid
+  setTime expiring.expiresAt
+  byRegistrar <- submitTree env.registrar (exerciseCmd r3.requestCid Q.QueuedDepositRequest_Archive with actor = env.registrar)
+  map reasons [byRequester, byExecutor, byRegistrar] === [[CR_Cancelled], [CR_Rejected], [CR_Expired]]
+
+droppedRedemptionsSayWhoEndedThem : Script ()
+droppedRedemptionsSayWhoEndedThem = script do
+  env <- QR.setup
+  (_, r1) <- QR.queueRequest env env.alice "r1" 10.0
+  (_, r2) <- QR.queueRequest env env.alice "r2" 10.0
+  (_, r3) <- QR.queueRequest env env.alice "r3" 10.0
+  byOwner <- submitTree env.alice (exerciseCmd r1.requestCid R.QueuedRedeemRequest_Archive with actor = env.alice)
+  byExecutor <- submitTree env.venue (exerciseCmd r2.requestCid R.QueuedRedeemRequest_Archive with actor = env.venue)
+  Some expiring <- queryContractId env.registrar r3.requestCid
+  setTime expiring.expiresAt
+  byRegistrar <- submitTree env.registrar (exerciseCmd r3.requestCid R.QueuedRedeemRequest_Archive with actor = env.registrar)
+  map reasons [byOwner, byExecutor, byRegistrar] === [[CR_Cancelled], [CR_Rejected], [CR_Expired]]
+
+-- | The executors' rejection is `CR_Rejected`, with their own words in the event's metadata.
+rejectionKeepsTheExecutorsWords : Script ()
+rejectionKeepsTheExecutorsWords = script do
+  env <- QD.setup
+  (_, req) <- QD.queueRequest env env.alice "r1" 10.0
+  Right tree <- QD.rejectTreeAs env env.venue [req] "receiver blocked"
+  [(reasons tree, TextMap.lookup Q.rejectionKey r.extraArgs.meta.values) | r <- vaultReports tree]
+    === [([CR_Rejected], Some "receiver blocked")]
+
+  renv <- QR.setup
+  (_, rreq) <- QR.queueRequest renv renv.alice "r1" 10.0
+  Right rtree <- QR.rejectTreeAs renv renv.venue [rreq] "receiver blocked"
+  [(reasons rtree, TextMap.lookup Q.rejectionKey r.extraArgs.meta.values) | r <- vaultReports rtree]
+    === [([CR_Rejected], Some "receiver blocked")]
+
+-- | On the redemption side too, the receiver declines through the allocation request and the executors withdraw it.
+redeemRequestIsDeclinedOrWithdrawn : Script ()
+redeemRequestIsDeclinedOrWithdrawn = script do
+  env <- QR.setup
+  bob <- allocateParty "bob"
+  let none = ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata
+  Right _ <- QR.requestTerms env env.alice "r1" 10.0 bob None
+  (c1, _) <- QR.published env env.alice "r1"
+  declined <- submitTree bob do
+    exerciseCmd (toInterfaceContractId @AR.AllocationRequest c1) AR.AllocationRequest_Reject with actors = [bob]; extraArgs = none
+  Right _ <- QR.requestTerms env env.alice "r2" 10.0 env.alice None
+  (c2, _) <- QR.published env env.alice "r2"
+  withdrawn <- submitTree env.venue do
+    exerciseCmd (toInterfaceContractId @AR.AllocationRequest c2) AR.AllocationRequest_Withdraw with actors = [env.venue]; extraArgs = none
+  map reasons [declined, withdrawn] === [[CR_Cancelled], [CR_Rejected]]
+
+-- | A redemption's escrow binds only if the share registry signed it.
+redeemEscrowMustBeSignedByTheShareRegistry : Script ()
+redeemEscrowMustBeSignedByTheShareRegistry = script do
+  env <- QR.setup
+  Right _ <- QR.requestTerms env env.alice "r1" 10.0 env.alice None
+  (cid, r) <- QR.published env env.alice "r1"
+  receiving <- QR.receiptAsRequested env r
+  fake <- fakeAllocation env.alice r.settlement r.escrow
+  failsWith "escrow is signed by its registry" =<< QR.bindAs env env.venue cid fake receiving
+
+-- | A request's events reach the provider of the account it is funded from, though the provider is not acting.
+eventsReachTheAccountsProviders : Script ()
+eventsReachTheAccountsProviders = script do
+  env <- QD.setup
+  bank <- allocateParty "bank"
+  (account, args, cfgD) <- QD.providerAccount env.usd env.alice bank
+  funds <- submit (actAs [env.alice, bank, env.usd.admin]) do
+    createCmd Token with holding = V2.HoldingView with account; instrumentId = QD.usdId env; amount = 100.0; lock = None; meta = emptyMetadata
+  vd <- QD.vaultDisclosure env
+  _ <- submit (actAs [env.alice, bank] <> discloseMany [vd]) do
+    exerciseCmd (toInterfaceContractId env.vaultCid : ContractId VaultAsyncDeposit) Vault_RequestDeposit with
+      sender = account; label = "r1"; assets = 100.0; receiver = basicAccount env.alice; minSharesOut = None
+      actors = [env.alice, bank]; extraArgs = ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata
+  (cid, r) <- QD.published env env.alice "r1"
+  escrowed <- QD.allocateApproved env.usd env.alice bank args cfgD r.escrow r.settlement [toInterfaceContractId funds]
+  receiving <- QD.authorizationAsRequested env r
+  bound <- submitTree (actAs env.venue <> discloseMany [vd, env.usd.disclosure, env.shares.disclosure]) do
+    exerciseCmd env.vaultCid Q.ReferenceQueuedDepositVault_Bind with
+      requestCid = cid; underlyingAllocation = escrowed; shareAllocation = receiving
+  [(r.actors, r.observers) | r <- vaultReports bound] === [([env.venue], [env.alice, bank, env.venue])]
+
+-- | A deposit's receiver, not its requester, declines through the allocation request.
+depositReceiverDeclines : Script ()
+depositReceiverDeclines = script do
+  env <- QD.setup
+  bob <- allocateParty "bob"
+  Right _ <- QD.requestTerms env env.alice "r1" 10.0 bob None
+  (cid, _) <- QD.published env env.alice "r1"
+  declined <- submitTree bob do
+    exerciseCmd (toInterfaceContractId @AR.AllocationRequest cid) AR.AllocationRequest_Reject with
+      actors = [bob]; extraArgs = ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata
+  reasons declined === [CR_Cancelled]

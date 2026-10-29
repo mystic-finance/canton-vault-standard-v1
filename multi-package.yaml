@@ -4,5 +4,7 @@ packages:
   - api/canton-vault-async-redeem-v1
   - api/canton-vault-event-log-v1
   - api/canton-vault-delegation-v1
+  - api/canton-vault-test-conformance-v1
+  - api/canton-vault-test-minimal-vault-v1
   - reference
   - test

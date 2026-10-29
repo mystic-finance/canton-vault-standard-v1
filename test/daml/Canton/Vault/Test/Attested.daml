@@ -16,6 +16,7 @@ import Canton.Vault.Test.MockToken
 import Canton.Vault.Test.Periods
 
 import Splice.Api.Token.MetadataV1 (ExtraArgs)
+import Splice.TokenStandard.Utils (basicAccount)
 
 -- | The fixture's vault, re-created to be priced by a new oracle party.
 setupOracleVault : Script (Fixture, Party)
@@ -55,7 +56,7 @@ redeemFrom f vaultCid shares = do
   poolDs <- poolDisclosures f
   trySubmit (actAs f.alice <> discloseMany (ds <> poolDs)) do
     exerciseCmd (toInterfaceContractId vaultCid : ContractId Vault) Vault_Redeem with
-      shares; receiver = f.alice; owner = f.alice; minAssetsOut = None; actors = [f.alice]
+      shares; receiver = basicAccount f.alice; owner = basicAccount f.alice; minAssetsOut = None; actors = [f.alice]
       extraArgs = redeemArgs f (map (toInterfaceContractId . fst) pool) (map fst held)
 
 -- | The roll prices the vault at the oracle's word, and the view says whose word it is.
@@ -73,8 +74,9 @@ attestedRollPricesTheVault = script do
   v.rate === Rate with
     asOf = vault.rateValidFrom; accrual = None
     inputs = [PriceInput with authority = oracle; subject = "reference-1"; effectiveAt = now; attestationId = "nav-1"]
-  v.totalShares === 101.0
-  v.totalAssets === 151.5
+  v.totalShares === 100.0
+  v.totalAssets === 150.5
+  (v.virtualShares, v.virtualAssets) === (1.0, 1.0)
 
 -- | Reads the vault's on-ledger conversions, which only its stakeholders can call.
 template ConvertProbe
@@ -108,7 +110,7 @@ viewPricesAsTheVaultDoes = script do
       (onAssets, onShares) <- submit f.registrar do
         createAndExerciseCmd (ConvertProbe with registrar = f.registrar) ConvertProbe_Convert with
           vaultCid = toInterfaceContractId rolled; shares = x; assets = x
-      (onAssets, onShares) === (mulDivDown x v.totalAssets v.totalShares, mulDivDown x v.totalShares v.totalAssets)
+      (onAssets, onShares) === (mulDivDown x (v.totalAssets + v.virtualAssets) (v.totalShares + v.virtualShares), mulDivDown x (v.totalShares + v.virtualShares) (v.totalAssets + v.virtualAssets))
 
 -- | Assets outside the pool are priced but not paid out: redemptions are paid while the pool lasts.
 instantRedemptionsArePaidWhileThePoolLasts : Script ()
@@ -137,7 +139,7 @@ template ExitProbe
       controller registrar
       do
         vault <- fetch vaultCid
-        (,) <$> maxWithdraw vault party extraArgs <*> maxRedeem vault party extraArgs
+        (,) <$> maxWithdraw vault (basicAccount party) extraArgs <*> maxRedeem vault (basicAccount party) extraArgs
 
 -- | Alice's most withdrawable assets and redeemable shares, naming her shares and the pool.
 maxExits : Fixture -> ContractId ReferenceVault -> Script (Decimal, Decimal)

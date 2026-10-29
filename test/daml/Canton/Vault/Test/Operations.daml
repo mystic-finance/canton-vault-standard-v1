@@ -14,6 +14,7 @@ import Canton.Vault.Test.Deposit
 import Canton.Vault.Test.MockToken
 import Canton.Vault.Test.Periods
 import Canton.Vault.Test.Reports
+import Splice.TokenStandard.Utils (basicAccount)
 
 setPaused : Fixture -> ContractId ReferenceVault -> Bool -> Script (ContractId ReferenceVault)
 setPaused f vaultCid paused = submit f.registrar do
@@ -30,15 +31,17 @@ pauseStopsEntriesNotExits = script do
   let vaultCid : ContractId Vault = toInterfaceContractId paused
   submitMustFail (actAs f.alice <> discloseMany ds) do
     exerciseCmd vaultCid Vault_Deposit with
+      sender = basicAccount f.alice
       assets = 100.0
-      receiver = f.alice
+      receiver = basicAccount f.alice
       minSharesOut = None
       actors = [f.alice]
       extraArgs = depositArgs f [funds]
   submitMustFail (actAs f.alice <> discloseMany ds) do
     exerciseCmd vaultCid Vault_Mint with
+      sender = basicAccount f.alice
       shares = 10.0
-      receiver = f.alice
+      receiver = basicAccount f.alice
       maxAssetsIn = None
       actors = [f.alice]
       extraArgs = depositArgs f [funds]
@@ -49,8 +52,8 @@ pauseStopsEntriesNotExits = script do
   _ <- submit (actAs f.alice <> discloseMany (ds <> poolDs)) do
     exerciseCmd vaultCid Vault_Redeem with
       shares = 100.0
-      owner = f.alice
-      receiver = f.alice
+      owner = basicAccount f.alice
+      receiver = basicAccount f.alice
       minAssetsOut = None
       actors = [f.alice]
       extraArgs = redeemArgs f (map (toInterfaceContractId . fst) pool) aliceShares
@@ -83,8 +86,9 @@ actionsAfterTheCloseAreRefused = script do
   _ <- closePeriod f f.vaultTemplateCid
   submitMustFail (actAs f.alice <> discloseMany ds) do
     exerciseCmd f.vaultCid Vault_Deposit with
+      sender = basicAccount f.alice
       assets = 100.0
-      receiver = f.alice
+      receiver = basicAccount f.alice
       minSharesOut = None
       actors = [f.alice]
       extraArgs = depositArgs f [funds]
@@ -138,12 +142,13 @@ actionsReportEventsToTheirParties = script do
   funds <- fund f f.alice 100.0
   minted <- submitTree (actAs f.alice <> discloseMany ds) do
     exerciseCmd vaultCid Vault_Mint with
+      sender = basicAccount f.alice
       shares = 10.0
-      receiver = f.alice
+      receiver = basicAccount f.alice
       maxAssetsIn = None
       actors = [f.alice]
       extraArgs = depositArgs f [funds]
-  reported minted === [((Deposited with assets = 10.0; shares = 10.0; fromRequest = None), f.alice, f.alice, [f.alice])]
+  reported minted === [((Deposited with assets = 10.0; shares = 10.0; fromRequest = None), basicAccount f.alice, basicAccount f.alice, [f.alice])]
 
   pool <- query @MockHolding f.custodian
   poolDs <- poolDisclosures f
@@ -151,12 +156,12 @@ actionsReportEventsToTheirParties = script do
   withdrew <- submitTree (actAs f.alice <> discloseMany (ds <> poolDs)) do
     exerciseCmd vaultCid Vault_Withdraw with
       assets = 5.0
-      owner = f.alice
-      receiver = f.alice
+      owner = basicAccount f.alice
+      receiver = basicAccount f.alice
       maxSharesIn = None
       actors = [f.alice]
       extraArgs = redeemArgs f (map (toInterfaceContractId . fst) pool) aliceShares
-  reported withdrew === [((Withdrew with assets = 5.0; shares = 5.0; fromRequest = None), f.alice, f.alice, [f.alice])]
+  reported withdrew === [((Withdrew with assets = 5.0; shares = 5.0; fromRequest = None), basicAccount f.alice, basicAccount f.alice, [f.alice])]
 
   pool' <- query @MockHolding f.custodian
   poolDs' <- poolDisclosures f
@@ -164,12 +169,12 @@ actionsReportEventsToTheirParties = script do
   redeemed <- submitTree (actAs f.alice <> discloseMany (ds <> poolDs')) do
     exerciseCmd vaultCid Vault_Redeem with
       shares = 5.0
-      owner = f.alice
-      receiver = bob
+      owner = basicAccount f.alice
+      receiver = basicAccount bob
       minAssetsOut = None
       actors = [f.alice]
       extraArgs = redeemArgs f (map (toInterfaceContractId . fst) pool') aliceShares'
-  reported redeemed === [((Withdrew with assets = 5.0; shares = 5.0; fromRequest = None), f.alice, bob, [f.alice, bob])]
+  reported redeemed === [((Withdrew with assets = 5.0; shares = 5.0; fromRequest = None), basicAccount f.alice, basicAccount bob, [f.alice, bob])]
 
   query @VaultLog f.registrar >>= (=== []) . map snd
 
@@ -186,8 +191,9 @@ repinnedFactoryCarriesTheTransfers = script do
   funds <- fund g g.alice 100.0
   submitMustFail (actAs g.alice <> discloseMany [vaultD, pendingD, oldD]) do
     exerciseCmd g.vaultCid Vault_Deposit with
+      sender = basicAccount g.alice
       assets = 100.0
-      receiver = g.alice
+      receiver = basicAccount g.alice
       minSharesOut = None
       actors = [g.alice]
       extraArgs = depositArgs g [funds]

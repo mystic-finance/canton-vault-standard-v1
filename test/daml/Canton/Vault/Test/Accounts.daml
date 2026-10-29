@@ -1,0 +1,235 @@
+-- | Choices move the accounts they name, and refuse an account with no owner; the pool sits in the custodian account.
+module Canton.Vault.Test.Accounts where
+
+import DA.Assert ((===))
+import DA.Foldable (forA_)
+import DA.List (sort)
+import Daml.Script
+
+import Canton.Vault.V1
+import Canton.Vault.AsyncDeposit.V1
+import Canton.Vault.AsyncRedeem.V1
+import Canton.Vault.Reference.Share
+import Canton.Vault.Test.Deposit
+import Canton.Vault.Test.MockToken
+import Canton.Vault.Test.Periods (poolDisclosures, rollPeriod)
+import Canton.Vault.Test.QueueSupport (failsWith)
+import Canton.Vault.Test.QueuedDeposit qualified as QD
+import Canton.Vault.Test.QueuedRedeem qualified as QR
+
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.HoldingV2 qualified as V2
+import Splice.TokenStandard.Utils (basicAccount)
+
+-- | The account the token standard reserves for the instrument admin.
+noOwner : V2.Account
+noOwner = V2.Account with owner = None; provider = None; id = ""
+
+-- | Alice's account other than her basic one.
+savings : Fixture -> V2.Account
+savings f = V2.Account with owner = Some f.alice; provider = None; id = "savings"
+
+payout : Fixture -> V2.Account
+payout f = V2.Account with owner = Some f.alice; provider = None; id = "payout"
+
+-- | Alice's shares, by account.
+sharesByAccount : Fixture -> Script [(V2.Account, Decimal)]
+sharesByAccount f = do
+  held <- query @ShareHolding f.alice
+  pure [(h.holding.account, h.holding.amount) | (_, h) <- held]
+
+depositTo : Fixture -> V2.Account -> Decimal -> Script ()
+depositTo f receiver assets = do
+  funds <- fund f f.alice assets
+  ds <- vaultDisclosure f
+  _ <- submit (actAs f.alice <> discloseMany ds) do
+    exerciseCmd f.vaultCid Vault_Deposit with
+      sender = basicAccount f.alice; assets; receiver; minSharesOut = None; actors = [f.alice]
+      extraArgs = depositArgs f [funds]
+  pure ()
+
+-- | Every max method's answer for an account.
+template AccountProbe
+  with
+    caller : Party
+  where
+    signatory caller
+    choice Probe_Maxes : (Decimal, Decimal, Decimal, Decimal)
+      with
+        vaultCid : ContractId Vault
+        account : V2.Account
+        extraArgs : ExtraArgs
+      controller caller
+      do
+        vault <- fetch vaultCid
+        (,,,) <$> maxDeposit vault account extraArgs <*> maxMint vault account extraArgs
+              <*> maxWithdraw vault account extraArgs <*> maxRedeem vault account extraArgs
+
+maxesFor : Fixture -> V2.Account -> ExtraArgs -> Script (Decimal, Decimal, Decimal, Decimal)
+maxesFor f account extraArgs = submit f.registrar do
+  createAndExerciseCmd (AccountProbe with caller = f.registrar) Probe_Maxes with vaultCid = f.vaultCid; account; extraArgs
+
+-- | A deposit and a mint issue shares to the account named, not the receiver's basic one.
+sharesGoToTheNamedAccount : Script ()
+sharesGoToTheNamedAccount = script do
+  f <- setupVault
+  depositTo f (savings f) 100.0
+  funds <- fund f f.alice 10.0
+  ds <- vaultDisclosure f
+  _ <- submit (actAs f.alice <> discloseMany ds) do
+    exerciseCmd f.vaultCid Vault_Mint with
+      sender = basicAccount f.alice; shares = 10.0; receiver = savings f; maxAssetsIn = None; actors = [f.alice]
+      extraArgs = depositArgs f [funds]
+  sort <$> sharesByAccount f >>= (=== [(savings f, 10.0), (savings f, 100.0)])
+
+-- | A redemption and a withdrawal burn from the account named and pay the account named; max methods count only
+-- the named account's holdings.
+exitsUseTheNamedAccounts : Script ()
+exitsUseTheNamedAccounts = script do
+  f <- setupVault
+  depositTo f (basicAccount f.alice) 50.0
+  depositTo f (savings f) 100.0
+  held <- query @ShareHolding f.alice
+  pool <- query @MockHolding f.custodian
+  let poolCids = map (toInterfaceContractId . fst) pool
+      ownedBy account = [cid | (cid, h) <- held, h.holding.account == account]
+      owned = ownedBy (savings f)
+      args = redeemArgs f poolCids owned
+  (_, _, _, fromSavings) <- maxesFor f (savings f) args
+  (_, _, _, fromBasic) <- maxesFor f (basicAccount f.alice) (redeemArgs f poolCids (ownedBy (basicAccount f.alice)))
+  (fromSavings, fromBasic) === (100.0, 50.0)
+
+  ds <- vaultDisclosure f
+  poolDs <- poolDisclosures f
+  ownedDs <- forA owned $ \cid -> queryDisclosure f.alice cid
+  _ <- submit (actAs f.alice <> discloseMany (ds <> poolDs <> [d | Some d <- ownedDs])) do
+    exerciseCmd f.vaultCid Vault_Redeem with
+      shares = 40.0; owner = savings f; receiver = payout f; minAssetsOut = None; actors = [f.alice]
+      extraArgs = args
+  remaining <- sharesByAccount f
+  [a | (a, n) <- remaining, a == savings f, n == 60.0] === [savings f]
+  sum [n | (a, n) <- remaining, a == basicAccount f.alice] === 50.0
+
+  owned' <- (\hs -> [cid | (cid, h) <- hs, h.holding.account == savings f]) <$> query @ShareHolding f.alice
+  pool' <- query @MockHolding f.custodian
+  poolDs' <- poolDisclosures f
+  ownedDs' <- forA owned' $ \cid -> queryDisclosure f.alice cid
+  _ <- submit (actAs f.alice <> discloseMany (ds <> poolDs' <> [d | Some d <- ownedDs'])) do
+    exerciseCmd f.vaultCid Vault_Withdraw with
+      assets = 10.0; owner = savings f; receiver = payout f; maxSharesIn = None; actors = [f.alice]
+      extraArgs = redeemArgs f (map (toInterfaceContractId . fst) pool') owned'
+  after <- sharesByAccount f
+  (sum [n | (a, n) <- after, a == savings f], sum [n | (a, n) <- after, a == basicAccount f.alice]) === (50.0, 50.0)
+  paid <- query @MockHolding f.alice
+  sum [h.holding.amount | (_, h) <- paid, h.holding.account == payout f, h.holding.instrumentId == f.underlying] === 50.0
+
+-- | Every instant choice refuses an account with no owner, and the deposit side's max methods return zero for one.
+instantChoicesRefuseAnAccountWithNoOwner : Script ()
+instantChoicesRefuseAnAccountWithNoOwner = script do
+  f <- setupVault
+  depositTo f (basicAccount f.alice) 50.0
+  let alice = basicAccount f.alice
+  (deposit, mint, _, _) <- maxesFor f noOwner (depositArgs f [])
+  (deposit, mint) === (0.0, 0.0)
+
+  funds <- fund f f.alice 10.0
+  ds <- vaultDisclosure f
+  let pay sender receiver = trySubmit (actAs f.alice <> discloseMany ds) do
+        exerciseCmd f.vaultCid Vault_Deposit with
+          sender; assets = 10.0; receiver; minSharesOut = None; actors = [f.alice]; extraArgs = depositArgs f [funds]
+      mintTo receiver = trySubmit (actAs f.alice <> discloseMany ds) do
+        exerciseCmd f.vaultCid Vault_Mint with
+          sender = alice; shares = 10.0; receiver; maxAssetsIn = None; actors = [f.alice]; extraArgs = depositArgs f [funds]
+  failsWith "sender has an owner" =<< pay noOwner alice
+  failsWith "receiver has an owner" =<< pay alice noOwner
+  failsWith "receiver has an owner" =<< mintTo noOwner
+
+  owned <- map fst <$> query @ShareHolding f.alice
+  pool <- query @MockHolding f.custodian
+  poolDs <- poolDisclosures f
+  let args = redeemArgs f (map (toInterfaceContractId . fst) pool) owned
+      redeem owner receiver = trySubmit (actAs f.alice <> discloseMany (ds <> poolDs)) do
+        exerciseCmd f.vaultCid Vault_Redeem with
+          shares = 10.0; owner; receiver; minAssetsOut = None; actors = [f.alice]; extraArgs = args
+      withdraw owner receiver = trySubmit (actAs f.alice <> discloseMany (ds <> poolDs)) do
+        exerciseCmd f.vaultCid Vault_Withdraw with
+          assets = 10.0; owner; receiver; maxSharesIn = None; actors = [f.alice]; extraArgs = args
+  forA_ [redeem, withdraw] $ \exit -> do
+    failsWith "owner has an owner" =<< exit noOwner alice
+    failsWith "receiver has an owner" =<< exit alice noOwner
+
+-- | Both request choices refuse an account with no owner.
+requestsRefuseAnAccountWithNoOwner : Script ()
+requestsRefuseAnAccountWithNoOwner = script do
+  env <- QD.setup
+  let alice = basicAccount env.alice
+      none = ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata
+  vd <- QD.vaultDisclosure env
+  let requestDeposit sender receiver = trySubmit (actAs env.alice <> discloseMany [vd]) do
+        exerciseCmd (toInterfaceContractId env.vaultCid : ContractId VaultAsyncDeposit) Vault_RequestDeposit with
+          label = "r1"; assets = 10.0; sender; receiver; minSharesOut = None; actors = [env.alice]; extraArgs = none
+  failsWith "sender has an owner" =<< requestDeposit noOwner alice
+  failsWith "receiver has an owner" =<< requestDeposit alice noOwner
+
+  renv <- QR.setup
+  rvd <- QR.vaultDisclosure renv
+  let ralice = basicAccount renv.alice
+      requestRedeem owner receiver = trySubmit (actAs renv.alice <> discloseMany [rvd]) do
+        exerciseCmd (toInterfaceContractId renv.vaultCid : ContractId VaultAsyncRedeem) Vault_RequestRedeem with
+          label = "r1"; shares = 10.0; owner; receiver; minAssetsOut = None; actors = [renv.alice]; extraArgs = none
+  failsWith "owner has an owner" =<< requestRedeem noOwner ralice
+  failsWith "receiver has an owner" =<< requestRedeem ralice noOwner
+
+-- | The custodian's account other than its basic one.
+poolAccount : Party -> V2.Account
+poolAccount custodian = V2.Account with owner = Some custodian; provider = None; id = "pool"
+
+-- | The custodian's underlying, by account.
+custodianHoldings : Fixture -> Script [(V2.Account, Decimal)]
+custodianHoldings f = do
+  held <- query @MockHolding f.custodian
+  pure [(h.holding.account, h.holding.amount) | (_, h) <- held, h.holding.instrumentId == f.underlying]
+
+-- | A custodian account with an id receives deposits, pays exits, and is the pool a roll counts.
+aCustodianAccountWithAnIdHoldsThePool : Script ()
+aCustodianAccountWithAnIdHoldsThePool = script do
+  base <- setupVault
+  let pool = poolAccount base.custodian
+  Some v <- queryContractId base.registrar base.vaultTemplateCid
+  t <- submit (actAs [base.registrar, base.custodian]) do
+    archiveCmd base.vaultTemplateCid *> createCmd v with custodian = pool
+  let f = base with vaultTemplateCid = t; vaultCid = toInterfaceContractId t
+  depositTo f (basicAccount f.alice) 100.0
+  custodianHoldings f >>= (=== [(pool, 100.0)])
+
+  owned <- map fst <$> query @ShareHolding f.alice
+  held <- query @MockHolding f.custodian
+  ds <- vaultDisclosure f
+  poolDs <- poolDisclosures f
+  _ <- submit (actAs f.alice <> discloseMany (ds <> poolDs)) do
+    exerciseCmd f.vaultCid Vault_Redeem with
+      shares = 40.0; owner = basicAccount f.alice; receiver = basicAccount f.alice; minAssetsOut = None
+      actors = [f.alice]; extraArgs = redeemArgs f (map (toInterfaceContractId . fst) held) owned
+  custodianHoldings f >>= (=== [(pool, 60.0)])
+
+  rolled <- rollPeriod f t
+  Some after <- queryContractId f.registrar rolled
+  after.totalAssets === 60.0
+
+-- | Each reference vault refuses a custodian account with no owner.
+aCustodianAccountWithNoOwnerIsRefused : Script ()
+aCustodianAccountWithNoOwnerIsRefused = script do
+  f <- setupVault
+  Some v <- queryContractId f.registrar f.vaultTemplateCid
+  failsWith "Template precondition violated" =<< trySubmit (actAs [f.registrar, f.custodian]) do
+    createCmd v with vaultId = "no-owner"; custodian = noOwner; shareInstrument = v.shareInstrument with id = "no-owner"
+
+  env <- QD.setup
+  Some qd <- queryContractId env.registrar env.vaultCid
+  failsWith "Template precondition violated" =<< trySubmit (actAs [env.registrar, env.custodian]) do
+    createCmd qd with vaultId = "no-owner"; custodian = noOwner; shareInstrument = qd.shareInstrument with id = "no-owner"
+
+  renv <- QR.setup
+  Some qr <- queryContractId renv.registrar renv.vaultCid
+  failsWith "Template precondition violated" =<< trySubmit (actAs [renv.registrar, renv.custodian]) do
+    createCmd qr with vaultId = "no-owner"; custodian = noOwner; shareInstrument = qr.shareInstrument with id = "no-owner"

@@ -13,6 +13,7 @@ import Canton.Vault.Reference.V1
 import Canton.Vault.Test.Deposit
 import Canton.Vault.Test.MockToken
 import Canton.Vault.Test.Periods
+import Splice.TokenStandard.Utils (basicAccount)
 
 next : Int -> Int
 next s = (s * 1103515245 + 12345) % 2147483648
@@ -85,8 +86,9 @@ depositAs : State -> Party -> Decimal -> Script (Either SubmitError VaultActionR
 depositAs st party assets = do
   funds <- fund st.f party assets
   act st party $ exerciseCmd (vaultOf st) Vault_Deposit with
+    sender = basicAccount party
     assets
-    receiver = party
+    receiver = basicAccount party
     minSharesOut = None
     actors = [party]
     extraArgs = depositArgs st.f [funds]
@@ -95,8 +97,9 @@ mintAs : State -> Party -> Decimal -> Decimal -> Script (Either SubmitError Vaul
 mintAs st party shares budget = do
   funds <- fund st.f party budget
   act st party $ exerciseCmd (vaultOf st) Vault_Mint with
+    sender = basicAccount party
     shares
-    receiver = party
+    receiver = basicAccount party
     maxAssetsIn = None
     actors = [party]
     extraArgs = depositArgs st.f [funds]
@@ -107,8 +110,8 @@ withdrawAs st party assets = do
   held <- sharesOf st party
   act st party $ exerciseCmd (vaultOf st) Vault_Withdraw with
     assets
-    owner = party
-    receiver = party
+    owner = basicAccount party
+    receiver = basicAccount party
     maxSharesIn = None
     actors = [party]
     extraArgs = redeemArgs st.f (map (toInterfaceContractId . fst) pool) held
@@ -119,8 +122,8 @@ redeemAs st party shares = do
   held <- sharesOf st party
   act st party $ exerciseCmd (vaultOf st) Vault_Redeem with
     shares
-    owner = party
-    receiver = party
+    owner = basicAccount party
+    receiver = basicAccount party
     minAssetsOut = None
     actors = [party]
     extraArgs = redeemArgs st.f (map (toInterfaceContractId . fst) pool) held
@@ -247,10 +250,10 @@ viewQuotesEveryPath = script do
     alice <- allocateParty "alice"
     forA_ [1.0, 33.3333333333, 777.777] $ \x -> do
       q <- quote st alice x x
-      q.depositPreview === mulDivDown (deductFeeBps v.depositFeeBps x) v.totalShares v.totalAssets
-      q.mintPreview === grossUpFeeBps v.mintFeeBps (mulDivUp x v.totalAssets v.totalShares)
-      q.withdrawPreview === mulDivUp (grossUpFeeBps v.withdrawFeeBps x) v.totalShares v.totalAssets
-      q.redeemPreview === deductFeeBps v.redeemFeeBps (mulDivDown x v.totalAssets v.totalShares)
+      q.depositPreview === mulDivDown (deductFeeBps v.depositFeeBps x) (v.totalShares + v.virtualShares) (v.totalAssets + v.virtualAssets)
+      q.mintPreview === grossUpFeeBps v.mintFeeBps (mulDivUp x (v.totalAssets + v.virtualAssets) (v.totalShares + v.virtualShares))
+      q.withdrawPreview === mulDivUp (grossUpFeeBps v.withdrawFeeBps x) (v.totalShares + v.virtualShares) (v.totalAssets + v.virtualAssets)
+      q.redeemPreview === deductFeeBps v.redeemFeeBps (mulDivDown x (v.totalAssets + v.virtualAssets) (v.totalShares + v.virtualShares))
 
 -- | A full fee leaves nothing to take, so mint and withdraw are refused as deposit and redeem are.
 fullFeesRefuseEveryPath : Script ()

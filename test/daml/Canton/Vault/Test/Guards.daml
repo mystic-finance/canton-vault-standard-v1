@@ -48,7 +48,7 @@ rollRejectsFlowsFromAnotherVault = script do
     createCmd ReferenceVault with
       vaultId = "reference-2"
       vaultRegistrar = f.registrar
-      custodian = f.custodian
+      custodian = basicAccount f.custodian
       underlyingInstrument = f.underlying
       shareInstrument = f.shares with id = "reference-2"
       totalShares = 0.0
@@ -134,8 +134,9 @@ actionsFailAfterThePeriodEnds = script do
   setTime vault.rateValidUntil
   failsWith "rate period is still open" =<< trySubmit (actAs f.alice <> discloseMany ds) do
     exerciseCmd (toInterfaceContractId f.vaultTemplateCid : ContractId Vault) Vault_Deposit with
+      sender = basicAccount f.alice
       assets = 100.0
-      receiver = f.alice
+      receiver = basicAccount f.alice
       minSharesOut = None
       actors = [f.alice]
       extraArgs = depositArgs f [funds]
@@ -151,8 +152,9 @@ depositOverTheCapIsRejected = script do
   funds <- fund f f.alice 100.0
   submitMustFail (actAs f.alice <> discloseMany ds) do
     exerciseCmd (toInterfaceContractId f.vaultTemplateCid : ContractId Vault) Vault_Deposit with
+      sender = basicAccount f.alice
       assets = 100.0
-      receiver = f.alice
+      receiver = basicAccount f.alice
       minSharesOut = None
       actors = [f.alice]
       extraArgs = depositArgs f [funds]
@@ -167,8 +169,9 @@ nonPositiveAmountsAreRejected = script do
 
   submitMustFail (actAs f.alice <> discloseMany ds) do
     exerciseCmd vaultCid Vault_Mint with
+      sender = basicAccount f.alice
       shares = 0.0
-      receiver = f.alice
+      receiver = basicAccount f.alice
       maxAssetsIn = None
       actors = [f.alice]
       extraArgs = depositArgs f [funds]
@@ -176,8 +179,8 @@ nonPositiveAmountsAreRejected = script do
   submitMustFail (actAs f.alice <> discloseMany ds) do
     exerciseCmd vaultCid Vault_Withdraw with
       assets = 0.0
-      owner = f.alice
-      receiver = f.alice
+      owner = basicAccount f.alice
+      receiver = basicAccount f.alice
       maxSharesIn = None
       actors = [f.alice]
       extraArgs = depositArgs f [funds]
@@ -185,8 +188,8 @@ nonPositiveAmountsAreRejected = script do
   submitMustFail (actAs f.alice <> discloseMany ds) do
     exerciseCmd vaultCid Vault_Redeem with
       shares = 0.0
-      owner = f.alice
-      receiver = f.alice
+      owner = basicAccount f.alice
+      receiver = basicAccount f.alice
       minAssetsOut = None
       actors = [f.alice]
       extraArgs = depositArgs f [funds]
@@ -203,8 +206,9 @@ depositMintingZeroSharesIsRejected = script do
   funds <- fund f f.alice 0.0000000001
   submitMustFail (actAs f.alice <> discloseMany ds) do
     exerciseCmd (toInterfaceContractId rolled : ContractId Vault) Vault_Deposit with
+      sender = basicAccount f.alice
       assets = 0.0000000001
-      receiver = f.alice
+      receiver = basicAccount f.alice
       minSharesOut = None
       actors = [f.alice]
       extraArgs = depositArgs f [funds]
@@ -232,8 +236,8 @@ withdrawRequiresTheOwner = script do
   submitMustFail (actAs mallory <> discloseMany (ds <> poolDs <> shareDs)) do
     exerciseCmd (toInterfaceContractId rolled : ContractId Vault) Vault_Withdraw with
       assets = 50.0
-      owner = f.alice
-      receiver = mallory
+      owner = basicAccount f.alice
+      receiver = basicAccount mallory
       maxSharesIn = None
       actors = [mallory]
       extraArgs = redeemArgs f
@@ -257,8 +261,8 @@ redeemBeyondTheNamedHoldingsIsRejected = script do
   submitMustFail (actAs f.alice <> discloseMany (ds <> poolDs)) do
     exerciseCmd (toInterfaceContractId rolled : ContractId Vault) Vault_Redeem with
       shares = first.shares
-      owner = f.alice
-      receiver = f.alice
+      owner = basicAccount f.alice
+      receiver = basicAccount f.alice
       minAssetsOut = None
       actors = [f.alice]
       -- Names no share holdings at all.
@@ -293,8 +297,8 @@ lockedSharesCannotBeRedeemed = script do
   submitMustFail (actAs f.alice <> discloseMany (ds <> poolDs)) do
     exerciseCmd (toInterfaceContractId rolled : ContractId Vault) Vault_Redeem with
       shares = first.shares
-      owner = f.alice
-      receiver = f.alice
+      owner = basicAccount f.alice
+      receiver = basicAccount f.alice
       minAssetsOut = None
       actors = [f.alice]
       extraArgs = redeemArgs f (map (toInterfaceContractId . fst) pool) [lockedCid]
@@ -307,8 +311,9 @@ mintOverTheCapIsRejected = script do
   funds <- fund f f.alice 100.0
   submitMustFail (actAs f.alice <> discloseMany ds) do
     exerciseCmd (toInterfaceContractId f.vaultTemplateCid : ContractId Vault) Vault_Mint with
+      sender = basicAccount f.alice
       shares = 100.0
-      receiver = f.alice
+      receiver = basicAccount f.alice
       maxAssetsIn = None
       actors = [f.alice]
       extraArgs = depositArgs f [funds]
@@ -371,8 +376,8 @@ burningTheWrongInstrumentIsRejected = script do
   submitMustFail (actAs f.alice <> discloseMany (ds <> poolDs)) do
     exerciseCmd (toInterfaceContractId rolled : ContractId Vault) Vault_Redeem with
       shares = first.shares
-      owner = f.alice
-      receiver = f.alice
+      owner = basicAccount f.alice
+      receiver = basicAccount f.alice
       minAssetsOut = None
       actors = [f.alice]
       extraArgs = redeemArgs f (map (toInterfaceContractId . fst) pool) [otherCid]
@@ -404,8 +409,8 @@ redemptionReturningNothingIsRejected = script do
   submitMustFail (actAs f.alice <> discloseMany (ds <> poolDs)) do
     exerciseCmd (toInterfaceContractId rolled : ContractId Vault) Vault_Redeem with
       shares = 0.0000000001
-      owner = f.alice
-      receiver = f.alice
+      owner = basicAccount f.alice
+      receiver = basicAccount f.alice
       minAssetsOut = None
       actors = [f.alice]
       extraArgs = redeemArgs f
@@ -500,8 +505,8 @@ rollRejectsNegativeShares = script do
   _ <- submit (actAs f.alice <> discloseMany (ds <> poolDs)) do
     exerciseCmd (toInterfaceContractId f.vaultTemplateCid : ContractId Vault) Vault_Redeem with
       shares = first.shares
-      owner = f.alice
-      receiver = f.alice
+      owner = basicAccount f.alice
+      receiver = basicAccount f.alice
       minAssetsOut = None
       actors = [f.alice]
       extraArgs = redeemArgs f (map (toInterfaceContractId . fst) pool) aliceShares
@@ -535,8 +540,9 @@ mintWithdrawAndRedeemFailAfterThePeriodEnds = script do
 
   submitMustFail (actAs f.alice <> discloseMany (ds <> poolDs)) do
     exerciseCmd vaultCid Vault_Mint with
+      sender = basicAccount f.alice
       shares = 10.0
-      receiver = f.alice
+      receiver = basicAccount f.alice
       maxAssetsIn = None
       actors = [f.alice]
       extraArgs = depositArgs f [funds]
@@ -544,8 +550,8 @@ mintWithdrawAndRedeemFailAfterThePeriodEnds = script do
   submitMustFail (actAs f.alice <> discloseMany (ds <> poolDs)) do
     exerciseCmd vaultCid Vault_Withdraw with
       assets = 10.0
-      owner = f.alice
-      receiver = f.alice
+      owner = basicAccount f.alice
+      receiver = basicAccount f.alice
       maxSharesIn = None
       actors = [f.alice]
       extraArgs = redeemArgs f poolCids aliceShares
@@ -553,8 +559,8 @@ mintWithdrawAndRedeemFailAfterThePeriodEnds = script do
   submitMustFail (actAs f.alice <> discloseMany (ds <> poolDs)) do
     exerciseCmd vaultCid Vault_Redeem with
       shares = 10.0
-      owner = f.alice
-      receiver = f.alice
+      owner = basicAccount f.alice
+      receiver = basicAccount f.alice
       minAssetsOut = None
       actors = [f.alice]
       extraArgs = redeemArgs f poolCids aliceShares
@@ -606,8 +612,8 @@ burningFromAnotherAccountIsRejected = script do
   submitMustFail (actAs f.alice <> discloseMany (ds <> poolDs)) do
     exerciseCmd (toInterfaceContractId rolled : ContractId Vault) Vault_Redeem with
       shares = 10.0
-      owner = f.alice
-      receiver = f.alice
+      owner = basicAccount f.alice
+      receiver = basicAccount f.alice
       minAssetsOut = None
       actors = [f.alice]
       extraArgs = redeemArgs f (map (toInterfaceContractId . fst) pool) [otherCid]
@@ -629,8 +635,8 @@ payoutTakesOnlyTheHoldingsItNeeds = script do
   _ <- submit (actAs bob <> discloseMany (ds <> poolDs)) do
     exerciseCmd (toInterfaceContractId f.vaultTemplateCid : ContractId Vault) Vault_Redeem with
       shares = 1.0
-      owner = bob
-      receiver = bob
+      owner = basicAccount bob
+      receiver = basicAccount bob
       minAssetsOut = None
       actors = [bob]
       extraArgs = redeemArgs f (map (toInterfaceContractId . fst) pool) bobShares
@@ -647,8 +653,9 @@ callerNamedFactoryCannotFakeADeposit = script do
     createCmd ForgedFactory with owner = mallory; claimedAdmin = f.underlyingAdmin; drain = None
   submitMustFail (actAs mallory <> discloseMany ds) do
     exerciseCmd f.vaultCid Vault_Deposit with
+      sender = basicAccount mallory
       assets = 1000.0
-      receiver = mallory
+      receiver = basicAccount mallory
       minSharesOut = None
       actors = [mallory]
       extraArgs = withFactory (toInterfaceContractId forged) (depositArgs f [])
@@ -673,8 +680,8 @@ callerNamedFactoryCannotDrainThePool = script do
   _ <- submit (actAs mallory <> discloseMany (ds <> poolDs)) do
     exerciseCmd f.vaultCid Vault_Redeem with
       shares = 0.5
-      owner = mallory
-      receiver = mallory
+      owner = basicAccount mallory
+      receiver = basicAccount mallory
       minAssetsOut = None
       actors = [mallory]
       extraArgs = withFactory (toInterfaceContractId forged) (redeemArgs f poolCids malloryShares)
@@ -707,7 +714,7 @@ mergeRefusesAnotherVaultsFlow = script do
     createCmd ReferenceVault with
       vaultId = "reference-2"
       vaultRegistrar = f.registrar
-      custodian = f.custodian
+      custodian = basicAccount f.custodian
       underlyingInstrument = f.underlying
       shareInstrument = f.shares with id = "reference-2"
       totalShares = 0.0

@@ -14,6 +14,7 @@ import Canton.Vault.Test.Deposit
 import Canton.Vault.Test.Limits (failsWith)
 
 import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.HoldingV2 (Account)
 import Splice.TokenStandard.Utils
 
 -- | A credential an issuer gives a holder, as ERC-3643's claims are.
@@ -45,7 +46,8 @@ template VaultAccess
         extraArgs : ExtraArgs
       controller holder
       do exercise vaultCid Vault_Deposit with
-           assets; receiver = holder; minSharesOut; actors = [holder]
+           sender = basicAccount holder
+           assets; receiver = basicAccount holder; minSharesOut; actors = [holder]
            extraArgs = withEvidence [toAnyContractId self] extraArgs
 
 -- | What a gated vault accepts.
@@ -62,19 +64,19 @@ template GatedVault
     vault : ReferenceVault
     gate : Gate
   where
-    signatory vault.vaultRegistrar, vault.custodian
+    signatory vault.vaultRegistrar, custodianOwner vault.custodian
 
     interface instance Vault for GatedVault where
       view = let v = view (inner this) in v with
         meta = Metadata with values = TextMap.insert eligibilityKey (accepted gate) v.meta.values
       convertToShares = convertToShares (inner this)
       convertToAssets = convertToAssets (inner this)
-      maxDeposit party extraArgs = do
-        ok <- eligible this party extraArgs
-        if ok then maxDeposit (inner this) party extraArgs else pure 0.0
-      maxMint party extraArgs = do
-        ok <- eligible this party extraArgs
-        if ok then maxMint (inner this) party extraArgs else pure 0.0
+      maxDeposit account extraArgs = do
+        ok <- eligibleAccount this account extraArgs
+        if ok then maxDeposit (inner this) account extraArgs else pure 0.0
+      maxMint account extraArgs = do
+        ok <- eligibleAccount this account extraArgs
+        if ok then maxMint (inner this) account extraArgs else pure 0.0
       maxWithdraw = maxWithdraw (inner this)
       maxRedeem = maxRedeem (inner this)
       previewDeposit = previewDeposit (inner this)
@@ -122,9 +124,15 @@ eligible v party extraArgs = case v.gate of
       pure (a.vaultRegistrar == v.vault.vaultRegistrar && a.vaultId == v.vault.vaultId && a.holder == party)
     pure (or oks)
 
-requireEligible : GatedVault -> Party -> ExtraArgs -> Update ()
-requireEligible v party extraArgs = do
-  ok <- eligible v party extraArgs
+-- | Whether the account's owner is eligible; an account with no owner never is.
+eligibleAccount : GatedVault -> Account -> ExtraArgs -> Update Bool
+eligibleAccount v account extraArgs = case account.owner of
+  None -> pure False
+  Some party -> eligible v party extraArgs
+
+requireEligible : GatedVault -> Account -> ExtraArgs -> Update ()
+requireEligible v account extraArgs = do
+  ok <- eligibleAccount v account extraArgs
   assertMsg "the party is not eligible" ok
 
 withEvidence : [AnyContractId] -> ExtraArgs -> ExtraArgs
@@ -146,7 +154,7 @@ template MaxDepositReader
       controller readers
       do
         vault <- fetch vaultCid
-        maxDeposit vault party extraArgs
+        maxDeposit vault (basicAccount party) extraArgs
 
 -- Helpers
 -----------
@@ -181,7 +189,8 @@ depositInto f g party amount evidence extra = do
   ds <- disclosed f g
   trySubmit (actAs party <> discloseMany (ds <> extra)) do
     exerciseCmd (toInterfaceContractId @Vault g) Vault_Deposit with
-      assets = amount; receiver = party; minSharesOut = None; actors = [party]
+      sender = basicAccount party
+      assets = amount; receiver = basicAccount party; minSharesOut = None; actors = [party]
       extraArgs = withEvidence evidence (depositArgs f [funds])
 
 credential : Party -> Party -> Text -> Script (ContractId Credential)

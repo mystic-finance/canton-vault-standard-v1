@@ -29,7 +29,7 @@ template ReferenceQueuedRedeemVault
   with
     vaultId : Text
     vaultRegistrar : Party
-    custodian : Party
+    custodian : V2.Account
     underlyingInstrument : V2.InstrumentId
     shareInstrument : V2.InstrumentId
     totalShares : Decimal
@@ -44,7 +44,7 @@ template ReferenceQueuedRedeemVault
     rateValidFrom : Time
     rateValidUntil : Time
     epoch : Int
-      -- ^ The current period's number, counting rolls; a request made in it carries it as its id.
+      -- ^ The current period's number, counting rolls from 1; a request made in it carries it as its id.
     depositCap : Optional Decimal
       -- ^ The most one deposit may bring in; `None` for no limit.
     executors : [Party]
@@ -64,10 +64,12 @@ template ReferenceQueuedRedeemVault
     allotments : [(Int, Decimal)]
       -- ^ The share of each earlier period's unfilled requests this period fills, for a vault priced by its oracle.
   where
-    signatory vaultRegistrar, custodian
+    signatory vaultRegistrar, custodianOwner custodian
     observer executors
 
     ensure totalShares >= 0.0 && totalAssets >= 0.0
+        && epoch >= 1
+        && isSome custodian.owner
         && rateValidUntil > rateValidFrom
         && shareInstrument == V2.InstrumentId with admin = vaultRegistrar; id = vaultId
         && depositFeeBps >= 0 && depositFeeBps <= 10000
@@ -84,8 +86,8 @@ template ReferenceQueuedRedeemVault
       convertToAssets = convertToAssets (instantOf this)
       maxDeposit = maxDeposit (instantOf this)
       maxMint = maxMint (instantOf this)
-      maxWithdraw _party _extraArgs = pure 0.0
-      maxRedeem _party _extraArgs = pure 0.0
+      maxWithdraw _account _extraArgs = pure 0.0
+      maxRedeem _account _extraArgs = pure 0.0
       previewDeposit = previewDeposit (instantOf this)
       previewMint = previewMint (instantOf this)
       previewWithdraw _assets = fail "redemptions are queued: use Vault_RequestRedeem"
@@ -110,36 +112,39 @@ template ReferenceQueuedRedeemVault
         meta = requestPolicies
 
       -- A request's id is the period it was made in.
-      pendingRedeemRequest requestId party extraArgs = do
+      pendingRedeemRequest requestId account extraArgs = do
         requestCids : [ContractId QueuedRedeemRequest] <- dedup <$> getContractIds redeemRequestsKey extraArgs.context
         amounts <- forA requestCids $ \cid -> do
           r <- fetch cid
           live <- if isSome r.filledIn then pure True else isLedgerTimeLT r.expiresAt
-          pure $ if r.vaultRegistrar == vaultRegistrar && r.vaultId == vaultId && r.owner == party
+          pure $ if r.vaultRegistrar == vaultRegistrar && r.vaultId == vaultId && r.sender == account
                       && r.epoch == requestId && live
             then r.shares else 0.0
         pure (sum amounts)
 
       vault_requestRedeemExtraObservers _arg = []
       vault_publicPendingRedeemRequestImpl _self arg = do
-        require "a party reads only its own requests" (arg.party `elem` arg.actors)
-        pendingRedeemRequest (toInterface @VaultAsyncRedeem this) arg.requestId arg.party arg.extraArgs
+        require "a party reads only its own requests" (any (\p -> arg.account.owner == Some p) arg.actors)
+        pendingRedeemRequest (toInterface @VaultAsyncRedeem this) arg.requestId arg.account arg.extraArgs
 
       vault_requestRedeemImpl _self arg = do
         requirePeriodOpen (instantOf' this)
         assets' <- currentAssets (instantOf' this)
         require "the redemption pays out at the current rate"
           (deductFeeBps redeemFeeBps (sharesToAssets totalShares assets' arg.shares) > 0.0)
-        from <- fundingAccount arg.actors arg.extraArgs
-        let owner = regularAccountOwner from
+        requireRegular "owner" arg.owner
+        requireRegular "receiver" arg.receiver
+        checkActors arg.actors [regularAccountParties arg.owner]
+        let from = arg.owner
+            owner = regularAccountOwner from
             deadline = addRelTime rateValidUntil settlementDeadlineWindow
         -- Each request is its own settlement, so an allocation made for it can settle nothing else.
-        anchor <- create RequestAnchor with vaultId; vaultRegistrar; executors; requester = owner
+        anchor <- create RequestAnchor with vaultId; vaultRegistrar; executors; requester = owner; receiver = regularAccountOwner arg.receiver
         let settlement = settlementOf this anchor
         _ <- create RequestAllocations with
           vaultId; vaultRegistrar; executors
           requester = owner
-          receiver = arg.receiver
+          receiver = regularAccountOwner arg.receiver
           label = arg.label
           amount = arg.shares
           minOut = arg.minAssetsOut
@@ -161,7 +166,7 @@ template ReferenceQueuedRedeemVault
           -- The payout is set at fulfilment, which adds the receiving leg.
           authorization = V2.AllocationSpecification with
             admin = underlyingInstrument.admin
-            authorizer = accountFromMeta arg.receiver "receiver" arg.extraArgs.meta
+            authorizer = arg.receiver
             transferLegSides = []
             settlementDeadline = Some deadline
             nextIterationFunding = Some TextMap.empty
@@ -169,7 +174,7 @@ template ReferenceQueuedRedeemVault
             meta = emptyMetadata
           requestedAt = rateValidFrom
           fundBy = rateValidUntil
-        pure epoch
+        pure Vault_RequestRedeemResult with requestId = epoch; meta = emptyMetadata
 
     nonconsuming choice ReferenceQueuedRedeemVault_Bind : ContractId QueuedRedeemRequest
       -- ^ Bind a request's allocations, once made exactly as requested, before the request's period ends.
@@ -190,18 +195,21 @@ template ReferenceQueuedRedeemVault
         requireRequested "escrow" vaultRegistrar r.settlement r.escrow shareAllocation
         requireRequested "receipt authorization" underlyingInstrument.admin r.settlement r.authorization underlyingAllocation
         archive requestCid
+        let expiresAt = fromOptional r.fundBy r.escrow.settlementDeadline
         report vaultRegistrar vaultId [Report with
-          owner = r.requester; receiver = r.receiver; actors = executors
-          event = RedeemRequested with requestId = r.epoch; label = r.label; shares = r.amount]
+          owner = r.escrow.authorizer; receiver = r.authorization.authorizer; actors = executors; meta = emptyMetadata
+          event = RedeemRequested with request = RequestRef r.epoch r.label; shares = r.amount; deadline = expiresAt]
         create QueuedRedeemRequest with
           vaultId; vaultRegistrar; executors
           owner = r.requester
           receiver = r.receiver
+          sender = r.escrow.authorizer
+          receiverAccount = r.authorization.authorizer
           label = r.label
           shares = r.amount
           anchor = r.anchor
           shareAllocation; underlyingAllocation
-          expiresAt = fromOptional r.fundBy r.escrow.settlementDeadline
+          expiresAt
           epoch = r.epoch
           minAssetsOut = r.minOut
           filledIn = None
@@ -277,7 +285,7 @@ template ReferenceQueuedRedeemVault
               meta = emptyMetadata
             payoutLeg f = V2.TransferLeg with
               transferLegId = requestLegId f.request.owner f.request.label "underlying"
-              sender = basicAccount custodian
+              sender = custodian
               receiver = f.receiving
               amount = f.assets
               instrumentId = underlyingInstrument.id
@@ -316,7 +324,7 @@ template ReferenceQueuedRedeemVault
               extraArgs = shareExtraArgs
             used <- coveringHoldings f.assets pool
             (custodianSide, change) <- allocateSidesWithChange underlyingFactories underlyingExtraArgs settlement rateValidFrom
-              underlyingInstrument.admin (basicAccount custodian) [custodian] used [senderSide (payoutLeg f)]
+              underlyingInstrument.admin custodian (custodianOwner custodian) used [senderSide (payoutLeg f)]
             settled <- exercise underlyingFactories.settlementFactory V2.SettlementFactory_SettleBatch with
               settlement
               transferLegs = [payoutLeg f]
@@ -341,7 +349,7 @@ template ReferenceQueuedRedeemVault
           (poolHoldingCids, heldHoldingCids) fills
         recordFlow (instantOf' this) (negate payout) (negate burned)
         report vaultRegistrar vaultId
-          [ reportOf f.request executors (Withdrew with assets = f.assets; shares = f.filled; fromRequest = Some f.request.epoch)
+          [ reportOf f.request executors (Withdrew with assets = f.assets; shares = f.filled; fromRequest = Some (requestRef f.request))
           | f <- fills ]
 
     nonconsuming choice ReferenceQueuedRedeemVault_Reject : ()
@@ -362,14 +370,14 @@ template ReferenceQueuedRedeemVault
           archive cid
           archive request.anchor
           _ <- exercise request.shareAllocation V2.Allocation_Cancel with actors = executors; extraArgs = shareExtraArgs
-          pure (reportOf request executors (closed request reason))
+          pure (rejected request executors reason)
         report vaultRegistrar vaultId reports
 
     choice ReferenceQueuedRedeemVault_SetPriceLimits : ContractId ReferenceQueuedRedeemVault
       -- ^ Change the price limits, which the custodian must agree to.
       with
         limits : PriceLimits
-      controller vaultRegistrar, custodian
+      controller vaultRegistrar, custodianOwner custodian
       do create this with priceLimits = limits
 
     choice ReferenceQueuedRedeemVault_SetPaused : ContractId ReferenceQueuedRedeemVault
@@ -407,7 +415,7 @@ template ClosedQueuedRedeemPeriod
   with
     vault : ReferenceQueuedRedeemVault
   where
-    signatory vault.vaultRegistrar, vault.custodian
+    signatory vault.vaultRegistrar, custodianOwner vault.custodian
 
     choice ClosedQueuedRedeemPeriod_Open : ContractId ReferenceQueuedRedeemVault
       -- ^ Open the next period, folding in the flows not yet counted and pricing it from the evidence.
@@ -430,7 +438,7 @@ template ClosedQueuedRedeemPeriod
         evidence : PriceEvidence
         validUntil : Time
         allotments : [(Int, Decimal)]
-      controller vault.vaultRegistrar, vault.custodian
+      controller vault.vaultRegistrar, custodianOwner vault.custodian
       do
         (shares, assets, pricing, now) <- rollTotals (instantOf' vault) flowCids evidence validUntil
         openNext vault shares assets pricing allotments now validUntil
@@ -448,6 +456,10 @@ template QueuedRedeemRequest
     executors : [Party]
     owner : Party
     receiver : Party
+    sender : V2.Account
+      -- ^ The account the escrowed shares came from.
+    receiverAccount : V2.Account
+      -- ^ The account paid the underlying.
     label : Text
     shares : Decimal
     anchor : ContractId RequestAnchor
@@ -480,7 +492,7 @@ template QueuedRedeemRequest
           require "the owner or an executor drops a request, or the registrar once it has expired"
             (actor == vaultRegistrar && expired)
         archive anchor
-        report vaultRegistrar vaultId [reportOf this [actor] (closed this "dropped")]
+        report vaultRegistrar vaultId [reportOf this [actor] (closed this (droppedBy owner executors actor))]
 
     choice QueuedRedeemRequest_Reclaim : ()
       -- ^ Return the shares not yet filled of a request filled in part to its owner, ending the request.
@@ -517,7 +529,7 @@ template QueuedRedeemRequest
           allocations = [finalized from [], finalized to []]
           actors = [vaultRegistrar]
           extraArgs = shareExtraArgs
-        report vaultRegistrar vaultId [reportOf this [owner] (closed this "reclaimed")]
+        report vaultRegistrar vaultId [reportOf this [owner] (closed this CR_Cancelled)]
 
 -- | The same vault as an instant one, for everything but redemptions.
 instantOf' : ReferenceQueuedRedeemVault -> ReferenceVault
@@ -608,7 +620,15 @@ receivedHoldings instrumentId result = case result.allocationSettleResults of
   [] -> []
 
 reportOf : QueuedRedeemRequest -> [Party] -> VaultEvent -> Report
-reportOf r actors event = Report with owner = r.owner; receiver = r.receiver; actors; event
+reportOf r actors event = Report with owner = r.sender; receiver = r.receiverAccount; actors; event; meta = emptyMetadata
 
-closed : QueuedRedeemRequest -> Text -> VaultEvent
-closed r reason = RequestClosed with requestId = r.epoch; label = r.label; amount = r.shares; reason
+-- | The executors' rejection, keeping their words in the event's metadata.
+rejected : QueuedRedeemRequest -> [Party] -> Text -> Report
+rejected r actors reason = (reportOf r actors (closed r CR_Rejected)) with
+  meta = Metadata with values = TextMap.fromList [(rejectionKey, reason)]
+
+requestRef : QueuedRedeemRequest -> RequestRef
+requestRef r = RequestRef with requestId = r.epoch; label = r.label
+
+closed : QueuedRedeemRequest -> CloseReason -> VaultEvent
+closed r reason = RequestClosed with request = requestRef r; amount = r.shares; reason

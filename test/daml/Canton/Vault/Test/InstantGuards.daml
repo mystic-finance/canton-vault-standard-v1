@@ -1,0 +1,105 @@
+-- | Instant actions: slippage limits, actors beyond the account, and the queued vaults' missing instant paths.
+module Canton.Vault.Test.InstantGuards where
+
+import DA.Assert ((===))
+import Daml.Script
+
+import Canton.Vault.V1
+import Canton.Vault.Reference.Share
+import Canton.Vault.Test.Accounts (depositTo)
+import Canton.Vault.Test.Deposit
+import Canton.Vault.Test.MockToken
+import Canton.Vault.Test.Periods (poolDisclosures)
+import Canton.Vault.Test.QueueSupport (failsWith)
+import Canton.Vault.Test.QueuedDeposit qualified as QD
+import Canton.Vault.Test.QueuedRedeem qualified as QR
+
+import Splice.Api.Token.MetadataV1
+import Splice.TokenStandard.Utils (basicAccount)
+
+-- | Alice's shares, Alice's underlying and the pool.
+balances : Fixture -> Script (Decimal, Decimal, Decimal)
+balances f = do
+  shares <- query @ShareHolding f.alice
+  held <- query @MockHolding f.alice
+  pool <- query @MockHolding f.custodian
+  let underlying hs = sum [h.holding.amount | (_, h) <- hs, h.holding.instrumentId == f.underlying]
+  pure (sum [h.holding.amount | (_, h) <- shares], underlying held, underlying pool)
+
+-- | The context and disclosures for an exit naming all of Alice's shares and the whole pool.
+exitContext : Fixture -> Script (ExtraArgs, [Disclosure])
+exitContext f = do
+  owned <- map fst <$> query @ShareHolding f.alice
+  pool <- query @MockHolding f.custodian
+  ds <- vaultDisclosure f
+  poolDs <- poolDisclosures f
+  pure (redeemArgs f (map (toInterfaceContractId . fst) pool) owned, ds <> poolDs)
+
+-- | Each instant action just past its caller's limit fails with `vaultSlippageExceeded` and moves nothing.
+slippageLimitsRefuseAndMoveNothing : Script ()
+slippageLimitsRefuseAndMoveNothing = script do
+  f <- setupVault
+  depositTo f (basicAccount f.alice) 100.0
+  funds <- fund f f.alice 10.0
+  ds <- vaultDisclosure f
+  before <- balances f
+  let alice = basicAccount f.alice
+      entry = trySubmit (actAs f.alice <> discloseMany ds)
+  failsWith vaultSlippageExceeded =<< entry do
+    exerciseCmd f.vaultCid Vault_Deposit with
+      sender = alice; assets = 10.0; receiver = alice; minSharesOut = Some 10.0000000001; actors = [f.alice]
+      extraArgs = depositArgs f [funds]
+  failsWith vaultSlippageExceeded =<< entry do
+    exerciseCmd f.vaultCid Vault_Mint with
+      sender = alice; shares = 10.0; receiver = alice; maxAssetsIn = Some 9.9999999999; actors = [f.alice]
+      extraArgs = depositArgs f [funds]
+  (args, exitDs) <- exitContext f
+  let exit = trySubmit (actAs f.alice <> discloseMany exitDs)
+  failsWith vaultSlippageExceeded =<< exit do
+    exerciseCmd f.vaultCid Vault_Withdraw with
+      assets = 10.0; owner = alice; receiver = alice; maxSharesIn = Some 9.9999999999; actors = [f.alice]; extraArgs = args
+  failsWith vaultSlippageExceeded =<< exit do
+    exerciseCmd f.vaultCid Vault_Redeem with
+      shares = 10.0; owner = alice; receiver = alice; minAssetsOut = Some 10.0000000001; actors = [f.alice]; extraArgs = args
+  balances f >>= (=== before)
+
+-- | The actors must be exactly the sender's or the owner's parties; one more, though they authorize too, is refused.
+actorsBeyondTheAccountAreRefused : Script ()
+actorsBeyondTheAccountAreRefused = script do
+  f <- setupVault
+  carol <- allocateParty "carol"
+  depositTo f (basicAccount f.alice) 100.0
+  funds <- fund f f.alice 10.0
+  ds <- vaultDisclosure f
+  let alice = basicAccount f.alice
+      both = [f.alice, carol]
+  failsWith "allowed actors" =<< trySubmit (actAs both <> discloseMany ds) do
+    exerciseCmd f.vaultCid Vault_Deposit with
+      sender = alice; assets = 10.0; receiver = alice; minSharesOut = None; actors = both; extraArgs = depositArgs f [funds]
+  failsWith "allowed actors" =<< trySubmit (actAs both <> discloseMany ds) do
+    exerciseCmd f.vaultCid Vault_Mint with
+      sender = alice; shares = 10.0; receiver = alice; maxAssetsIn = None; actors = both; extraArgs = depositArgs f [funds]
+  (args, exitDs) <- exitContext f
+  failsWith "allowed actors" =<< trySubmit (actAs both <> discloseMany exitDs) do
+    exerciseCmd f.vaultCid Vault_Withdraw with
+      assets = 10.0; owner = alice; receiver = alice; maxSharesIn = None; actors = both; extraArgs = args
+  failsWith "allowed actors" =<< trySubmit (actAs both <> discloseMany exitDs) do
+    exerciseCmd f.vaultCid Vault_Redeem with
+      shares = 10.0; owner = alice; receiver = alice; minAssetsOut = None; actors = both; extraArgs = args
+
+-- | A queued-deposit vault refuses an instant mint, and a queued-redemption vault an instant withdrawal.
+queuedDirectionsRefuseEveryInstantAction : Script ()
+queuedDirectionsRefuseEveryInstantAction = script do
+  let none = ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata
+  env <- QD.setup
+  vd <- QD.vaultDisclosure env
+  failsWith "deposits are queued" =<< trySubmit (actAs env.alice <> discloseMany [vd]) do
+    exerciseCmd (toInterfaceContractId env.vaultCid : ContractId Vault) Vault_Mint with
+      sender = basicAccount env.alice; shares = 10.0; receiver = basicAccount env.alice; maxAssetsIn = None
+      actors = [env.alice]; extraArgs = none
+  renv <- QR.setup
+  rvd <- QR.vaultDisclosure renv
+  failsWith "redemptions are queued" =<< trySubmit (actAs renv.alice <> discloseMany [rvd]) do
+    exerciseCmd (toInterfaceContractId renv.vaultCid : ContractId Vault) Vault_Withdraw with
+      assets = 10.0; owner = basicAccount renv.alice; receiver = basicAccount renv.alice; maxSharesIn = None
+      actors = [renv.alice]; extraArgs = none

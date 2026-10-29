@@ -48,9 +48,11 @@ template RequestAnchor
     vaultRegistrar : Party
     executors : [Party]
     requester : Party
+    receiver : Party
+      -- ^ Sees the anchor, so declining the request can end it.
   where
     signatory vaultRegistrar
-    observer requester, executors
+    observer requester, receiver, executors
 
 -- | The allocations a queued request needs, published for wallets as the token standard's allocation request.
 template RequestAllocations
@@ -85,7 +87,7 @@ template RequestAllocations
       do
         over <- isLedgerTimeGE fundBy
         require "the request's period has ended" over
-        endUnfunded this [vaultRegistrar] "not funded in its period"
+        endUnfunded this [vaultRegistrar] CR_Expired
 
     interface instance AR.AllocationRequest for RequestAllocations where
       view = AR.AllocationRequestView with
@@ -101,24 +103,24 @@ template RequestAllocations
       allocationRequest_rejectImpl self arg = do
         require "the requester or the receiver declines" (arg.actors `elem` [[requester], [receiver]])
         archive (fromInterfaceContractId @RequestAllocations self)
-        endUnfunded this arg.actors "declined"
+        endUnfunded this arg.actors CR_Cancelled
         pure AR.AllocationRequest_RejectResult with meta = emptyMetadata
       allocationRequest_withdrawImpl self arg = do
         require "the executors withdraw" (sort arg.actors == sort executors)
         archive (fromInterfaceContractId @RequestAllocations self)
-        endUnfunded this arg.actors "withdrawn by the executors"
+        endUnfunded this arg.actors CR_Rejected
         pure AR.AllocationRequest_WithdrawResult with meta = emptyMetadata
       allocationRequest_acceptExtraObservers _arg = []
       allocationRequest_rejectExtraObservers _arg = []
       allocationRequest_withdrawExtraObservers _arg = []
 
--- | Ends a request no allocation was bound to, reporting why.
-endUnfunded : RequestAllocations -> [Party] -> Text -> Update ()
+-- | Ends a request no allocation was bound to, reporting why; nothing was queued, so nothing leaves the queue.
+endUnfunded : RequestAllocations -> [Party] -> CloseReason -> Update ()
 endUnfunded r actors reason = do
   archive r.anchor
   report r.vaultRegistrar r.vaultId [Report with
-    owner = r.requester; receiver = r.receiver; actors
-    event = RequestClosed with requestId = r.epoch; label = r.label; amount = r.amount; reason]
+    owner = r.escrow.authorizer; receiver = r.authorization.authorizer; actors; meta = emptyMetadata
+    event = RequestClosed with request = RequestRef r.epoch r.label; amount = 0.0; reason]
 
 -- | Refuses an allocation that is not exactly the one requested, under the request's own settlement.
 requireRequested : Text -> Party -> V2.SettlementInfo -> V2.AllocationSpecification -> ContractId V2.Allocation -> Update ()
@@ -183,6 +185,17 @@ allocateSidesWithChange factories extraArgs settlement requestedAt admin authori
     V2.AllocationInstructionResult_Completed with allocationCid ->
       pure (allocationCid, concatMap snd (TextMap.toList result.authorizerChangeCids))
     _ -> fail "the vault's own allocation did not complete"
+
+-- | The reference's metadata key for the executors' own words on why they rejected a request.
+rejectionKey : Text
+rejectionKey = "cantonVaultV1/rejection"
+
+-- | Why a request was dropped: by its requester, by an executor, or by the registrar once it expired.
+droppedBy : Party -> [Party] -> Party -> CloseReason
+droppedBy requester executors actor
+  | actor == requester = CR_Cancelled
+  | actor `elem` executors = CR_Rejected
+  | otherwise = CR_Expired
 
 -- | The contract ids listed under the key in a choice context.
 getContractIds : Text -> ChoiceContext -> Update [ContractId t]
