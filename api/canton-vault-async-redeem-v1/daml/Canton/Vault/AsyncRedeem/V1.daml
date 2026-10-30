@@ -67,7 +67,8 @@ interface VaultAsyncRedeem requires Vault where
         -- ^ The parties executing the request.
         --
         -- Implementations MUST check these parties against `owner`, to avoid
-        -- unauthorized requests.
+        -- unauthorized requests, unless a delegate acts as the `Vault`
+        -- interface describes.
       extraArgs : ExtraArgs
         -- ^ Additional context required in order to exercise the choice.
     observer vault_requestRedeemExtraObservers this arg

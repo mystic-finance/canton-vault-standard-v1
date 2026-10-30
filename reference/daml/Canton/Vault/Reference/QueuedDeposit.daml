@@ -9,6 +9,7 @@ import DA.TextMap qualified as TextMap
 import DA.Time (RelTime, addRelTime, isLedgerTimeGE, isLedgerTimeLT)
 
 import Canton.Vault.V1
+import Canton.Vault.Delegation.V1
 import Canton.Vault.AsyncDeposit.V1
 import Canton.Vault.EventLog.V1
 import Canton.Vault.Reference.Log
@@ -122,7 +123,9 @@ template ReferenceQueuedDepositVault
         require "a party reads only its own requests" (any (\p -> arg.account.owner == Some p) arg.actors)
         pendingDepositRequest (toInterface @VaultAsyncDeposit this) arg.requestId arg.account arg.extraArgs
 
-      vault_requestDepositImpl _self arg = do
+      vault_requestDepositImpl self arg = orDelegated (delegation arg.actors arg.sender arg.extraArgs)
+        (\auth -> snd <$> exercise auth VaultDelegateAuth_RequestDeposit with
+          vaultCid = self; label = arg.label; assets = arg.assets; sender = arg.sender; receiver = arg.receiver; minSharesOut = arg.minSharesOut; extraArgs = arg.extraArgs) do
         requirePeriodOpen (instantOf' this)
         require "vault is not paused" (not paused)
         assets' <- currentAssets (instantOf' this)

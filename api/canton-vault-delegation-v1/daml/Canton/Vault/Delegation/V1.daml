@@ -20,13 +20,18 @@ import Canton.Vault.V1
 import Canton.Vault.AsyncDeposit.V1
 import Canton.Vault.AsyncRedeem.V1
 
--- | An owner's authorization for a delegate to act for them in one vault.
+-- | An owner's authorization for a delegate to act for them in one vault, as
+-- an ERC-7540 operator, within allowances and until an expiry.
 --
--- The delegate's actions reach the vault as the owner's, with `actors` set to
--- the owner, so a vault needs nothing to support it; they pay in only from
--- accounts the owner owns, and a vault whose registry needs an account's
--- provider to act may refuse them. Each allowance is spent by every action it
--- covers. The owner revokes it by archiving it, which takes effect at once.
+-- The delegate exercises the vault's own choice, naming this authorization
+-- under `delegationKey`, and the vault exercises the matching choice here,
+-- passing itself; that choice acts as the owner. Each choice needs both the
+-- vault's registrar and the delegate, so only the vault, on the delegate's
+-- call, can use it. The delegate pays in only from accounts the owner owns, and
+-- chooses the receiver, as with an ERC-4626 allowance; a vault whose registry
+-- needs an account's provider to act may refuse it. Each allowance is spent by
+-- every action it covers. The owner revokes it by archiving it, which takes
+-- effect at once.
 template VaultDelegateAuth
   with
     owner : Party
@@ -49,7 +54,7 @@ template VaultDelegateAuth
       -- ^ Additional metadata, used for extensibility.
   where
     signatory owner
-    observer delegate
+    observer delegate, vaultRegistrar
     ensure all (>= 0.0) (optionalToList depositAllowance <> optionalToList redeemAllowance)
 
     choice VaultDelegateAuth_Deposit : (ContractId VaultDelegateAuth, VaultActionResult)
@@ -61,7 +66,7 @@ template VaultDelegateAuth
         receiver : Account
         minSharesOut : Optional Decimal
         extraArgs : ExtraArgs
-      controller delegate
+      controller vaultRegistrar, delegate
       do
         requireVault this vaultCid
         requireOwned this sender
@@ -79,7 +84,7 @@ template VaultDelegateAuth
         receiver : Account
         maxAssetsIn : Optional Decimal
         extraArgs : ExtraArgs
-      controller delegate
+      controller vaultRegistrar, delegate
       do
         requireVault this vaultCid
         requireOwned this sender
@@ -97,7 +102,7 @@ template VaultDelegateAuth
         receiver : Account
         maxSharesIn : Optional Decimal
         extraArgs : ExtraArgs
-      controller delegate
+      controller vaultRegistrar, delegate
       do
         requireVault this vaultCid
         requireOwned this from
@@ -115,7 +120,7 @@ template VaultDelegateAuth
         receiver : Account
         minAssetsOut : Optional Decimal
         extraArgs : ExtraArgs
-      controller delegate
+      controller vaultRegistrar, delegate
       do
         requireVault this vaultCid
         requireOwned this from
@@ -134,7 +139,7 @@ template VaultDelegateAuth
         receiver : Account
         minSharesOut : Optional Decimal
         extraArgs : ExtraArgs
-      controller delegate
+      controller vaultRegistrar, delegate
       do
         requireVault this (toInterfaceContractId vaultCid)
         requireOwned this sender
@@ -153,7 +158,7 @@ template VaultDelegateAuth
         receiver : Account
         minAssetsOut : Optional Decimal
         extraArgs : ExtraArgs
-      controller delegate
+      controller vaultRegistrar, delegate
       do
         requireVault this (toInterfaceContractId vaultCid)
         requireOwned this from
@@ -167,7 +172,7 @@ requireVault : VaultDelegateAuth -> ContractId Vault -> Update ()
 requireVault auth vaultCid = do
   live <- isLedgerTimeLT auth.expiresAt
   assertMsg "the authorization has expired" live
-  v <- exercise vaultCid Vault_PublicFetch with actors = [auth.owner]
+  v <- view <$> fetch vaultCid
   assertMsg "the authorization is for another vault" (v.vaultId == auth.vaultId && v.vaultRegistrar == auth.vaultRegistrar)
 
 -- | Fails unless the owner owns the account paid in from.

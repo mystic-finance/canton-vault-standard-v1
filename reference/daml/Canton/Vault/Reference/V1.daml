@@ -2,12 +2,13 @@
 module Canton.Vault.Reference.V1 where
 
 import DA.Foldable (forA_)
-import DA.List (dedup)
+import DA.List (dedup, sort)
 import DA.Optional (fromOptional, isNone, isSome, optionalToList)
 import DA.TextMap qualified as TextMap
 import DA.Time (isLedgerTimeLT)
 
 import Canton.Vault.V1
+import Canton.Vault.Delegation.V1
 import Canton.Vault.EventLog.V1
 import Canton.Vault.Reference.Log
 import Canton.Vault.Reference.Math
@@ -290,7 +291,9 @@ template ReferenceVault
       vault_withdrawExtraObservers _arg = []
       vault_redeemExtraObservers _arg = []
 
-      vault_depositImpl _self arg = do
+      vault_depositImpl self arg = orDelegated (delegation arg.actors arg.sender arg.extraArgs)
+        (\auth -> snd <$> exercise auth VaultDelegateAuth_Deposit with
+          vaultCid = self; assets = arg.assets; sender = arg.sender; receiver = arg.receiver; minSharesOut = arg.minSharesOut; extraArgs = arg.extraArgs) do
         requirePayIn arg.sender arg.receiver arg.actors
         requirePeriodOpen this
         require "vault is not paused" (not paused)
@@ -313,7 +316,9 @@ template ReferenceVault
           holdingCids = [toInterfaceContractId holdingCid]
           meta = emptyMetadata
 
-      vault_mintImpl _self arg = do
+      vault_mintImpl self arg = orDelegated (delegation arg.actors arg.sender arg.extraArgs)
+        (\auth -> snd <$> exercise auth VaultDelegateAuth_Mint with
+          vaultCid = self; shares = arg.shares; sender = arg.sender; receiver = arg.receiver; maxAssetsIn = arg.maxAssetsIn; extraArgs = arg.extraArgs) do
         requirePayIn arg.sender arg.receiver arg.actors
         requirePeriodOpen this
         require "vault is not paused" (not paused)
@@ -335,7 +340,9 @@ template ReferenceVault
           holdingCids = [toInterfaceContractId holdingCid]
           meta = emptyMetadata
 
-      vault_withdrawImpl _self arg = do
+      vault_withdrawImpl self arg = orDelegated (delegation arg.actors arg.owner arg.extraArgs)
+        (\auth -> snd <$> exercise auth VaultDelegateAuth_Withdraw with
+          vaultCid = self; assets = arg.assets; from = arg.owner; receiver = arg.receiver; maxSharesIn = arg.maxSharesIn; extraArgs = arg.extraArgs) do
         requirePayOut arg.owner arg.receiver arg.actors
         requirePeriodOpen this
         require "withdrawal is positive" (arg.assets > 0.0)
@@ -355,7 +362,9 @@ template ReferenceVault
           holdingCids
           meta = emptyMetadata
 
-      vault_redeemImpl _self arg = do
+      vault_redeemImpl self arg = orDelegated (delegation arg.actors arg.owner arg.extraArgs)
+        (\auth -> snd <$> exercise auth VaultDelegateAuth_Redeem with
+          vaultCid = self; shares = arg.shares; from = arg.owner; receiver = arg.receiver; minAssetsOut = arg.minAssetsOut; extraArgs = arg.extraArgs) do
         requirePayOut arg.owner arg.receiver arg.actors
         requirePeriodOpen this
         require "redemption is positive" (arg.shares > 0.0)
@@ -552,6 +561,19 @@ currentAssets vault = case vault.accrual of
   Some _ -> do
     now <- getTime
     pure (accrue vault.accrual vault.totalAssets vault.rateValidFrom now)
+
+-- | The authorization a delegate names, when the actors are not the account's own parties.
+delegation : [Party] -> V2.Account -> ExtraArgs -> Update (Optional (ContractId VaultDelegateAuth))
+delegation actors account extraArgs
+  | not (isRegularAccount account) || sort (dedup actors) == sort (dedup (regularAccountParties account)) = pure None
+  | otherwise = case TextMap.lookup delegationKey extraArgs.context.values of
+      Some (AV_ContractId cid) -> pure (Some (fromAnyContractId cid))
+      Some v -> fail ("Failed to decode the delegation under '" <> delegationKey <> "': " <> show v)
+      None -> pure None
+
+-- | Acts through the delegation if there is one, or as the account's own parties otherwise.
+orDelegated : Update (Optional a) -> (a -> Update b) -> Update b -> Update b
+orDelegated found delegated own = found >>= optional own delegated
 
 -- | Refuses an account the token standard reserves for the instrument admin.
 requireRegular : Text -> V2.Account -> Update ()

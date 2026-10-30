@@ -9,6 +9,7 @@ import DA.TextMap qualified as TextMap
 import DA.Time (RelTime, addRelTime, isLedgerTimeGE, isLedgerTimeLT)
 
 import Canton.Vault.V1
+import Canton.Vault.Delegation.V1
 import Canton.Vault.AsyncRedeem.V1
 import Canton.Vault.EventLog.V1
 import Canton.Vault.Reference.Log
@@ -127,7 +128,9 @@ template ReferenceQueuedRedeemVault
         require "a party reads only its own requests" (any (\p -> arg.account.owner == Some p) arg.actors)
         pendingRedeemRequest (toInterface @VaultAsyncRedeem this) arg.requestId arg.account arg.extraArgs
 
-      vault_requestRedeemImpl _self arg = do
+      vault_requestRedeemImpl self arg = orDelegated (delegation arg.actors arg.owner arg.extraArgs)
+        (\auth -> snd <$> exercise auth VaultDelegateAuth_RequestRedeem with
+          vaultCid = self; label = arg.label; shares = arg.shares; from = arg.owner; receiver = arg.receiver; minAssetsOut = arg.minAssetsOut; extraArgs = arg.extraArgs) do
         requirePeriodOpen (instantOf' this)
         assets' <- currentAssets (instantOf' this)
         require "the redemption pays out at the current rate"

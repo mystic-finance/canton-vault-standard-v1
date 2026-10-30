@@ -127,6 +127,11 @@ data VaultView = VaultView with
 eligibilityKey : Text
 eligibilityKey = "canton-vault/eligibility"
 
+-- | The `extraArgs` context key naming the `VaultDelegateAuth` a delegate acts
+-- under.
+delegationKey : Text
+delegationKey = "canton-vault/delegation"
+
 -- | The result of an instant deposit, mint, withdrawal or redemption.
 data VaultActionResult = VaultActionResult with
     vaultCid : Optional (ContractId Vault)
@@ -235,6 +240,15 @@ requestPricingKey = "canton-vault/request-pricing"
 -- Choices a vault adds for its own roles, such as filling requests or
 -- publishing a price, MUST take their controllers from the vault contract
 -- rather than from an argument.
+--
+-- A delegate acts through the vault, as an ERC-7540 operator does: it
+-- exercises the vault's choice as the actor, naming a `VaultDelegateAuth`
+-- (package `canton-vault-delegation-v1`) under `delegationKey` in `extraArgs`.
+-- When the actors of `Vault_Deposit`, `Vault_Mint`, `Vault_Withdraw`,
+-- `Vault_Redeem`, `Vault_RequestDeposit` or `Vault_RequestRedeem` are not the
+-- parties of the account it pays from and that key is present, a vault MUST
+-- exercise the authorization's choice for the action, passing itself, and
+-- return its result; the authorization then acts as the owner.
 interface Vault where
   viewtype VaultView
 
@@ -333,7 +347,8 @@ interface Vault where
         -- ^ The parties executing the deposit.
         --
         -- Implementations MUST check these parties against `sender`, to avoid
-        -- unauthorized deposits.
+        -- unauthorized deposits, unless a delegate acts as the `Vault` interface
+        -- describes.
       extraArgs : ExtraArgs
         -- ^ Additional context required in order to exercise the choice.
     observer vault_depositExtraObservers this arg
@@ -360,7 +375,8 @@ interface Vault where
         -- ^ The parties executing the mint.
         --
         -- Implementations MUST check these parties against `sender`, to avoid
-        -- unauthorized mints.
+        -- unauthorized mints, unless a delegate acts as the `Vault` interface
+        -- describes.
       extraArgs : ExtraArgs
         -- ^ Additional context required in order to exercise the choice.
     observer vault_mintExtraObservers this arg
@@ -390,7 +406,8 @@ interface Vault where
         -- ^ The parties executing the withdrawal.
         --
         -- Implementations MUST check these parties against `owner`, to avoid
-        -- unauthorized withdrawals.
+        -- unauthorized withdrawals, unless a delegate acts as the `Vault` interface
+        -- describes.
       extraArgs : ExtraArgs
         -- ^ Additional context required in order to exercise the choice.
     observer vault_withdrawExtraObservers this arg
@@ -418,7 +435,8 @@ interface Vault where
         -- ^ The parties executing the redemption.
         --
         -- Implementations MUST check these parties against `owner`, to avoid
-        -- unauthorized redemptions.
+        -- unauthorized redemptions, unless a delegate acts as the `Vault` interface
+        -- describes.
       extraArgs : ExtraArgs
         -- ^ Additional context required in order to exercise the choice.
     observer vault_redeemExtraObservers this arg

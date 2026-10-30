@@ -2,11 +2,15 @@
 module Canton.Vault.Test.Delegation where
 
 import DA.Assert ((===))
+import DA.Foldable (forA_)
 import DA.Optional (fromSome)
+import DA.TextMap qualified as TextMap
 import DA.Time (RelTime, addRelTime, days, minutes)
 import Daml.Script
 
 import Canton.Vault.V1
+import Canton.Vault.AsyncDeposit.V1
+import Canton.Vault.AsyncRedeem.V1
 import Canton.Vault.Delegation.V1
 import Canton.Vault.Reference.Share
 import Canton.Vault.Test.Deposit
@@ -17,7 +21,7 @@ import Canton.Vault.Test.QueuedDeposit qualified as Q
 import Canton.Vault.Test.QueuedRedeem qualified as R
 
 import Splice.Api.Token.MetadataV1
-import Splice.TokenStandard.Utils (basicAccount)
+import Splice.TokenStandard.Utils (basicAccount, toAnyContractId)
 
 -- | The owner's authorization for the delegate in the vault, until `ttl` from now.
 authorize : Party -> Party -> Party -> Text -> Optional Decimal -> Optional Decimal -> RelTime -> Script (ContractId VaultDelegateAuth)
@@ -28,18 +32,28 @@ authorize owner delegate vaultRegistrar vaultId depositAllowance redeemAllowance
     expiresAt = addRelTime now ttl
     meta = emptyMetadata
 
-depositAs : Fixture -> Party -> ContractId VaultDelegateAuth -> Decimal -> Script (Either SubmitError (ContractId VaultDelegateAuth, VaultActionResult))
+-- | The vault's arguments, naming the authorization the delegate acts under.
+under : ContractId VaultDelegateAuth -> ExtraArgs -> ExtraArgs
+under auth args = args with
+  context = args.context with values = TextMap.insert delegationKey (AV_ContractId (toAnyContractId auth)) args.context.values
+
+-- | The owner's authorization as it stands, after the actions that spent it.
+authOf : Party -> Script (ContractId VaultDelegateAuth)
+authOf owner = do
+  [(cid, _)] <- query @VaultDelegateAuth owner
+  pure cid
+
+depositAs : Fixture -> Party -> ContractId VaultDelegateAuth -> Decimal -> Script (Either SubmitError VaultActionResult)
 depositAs f delegate auth amount = do
   funds <- fund f f.alice amount
   fundsD <- fromSome <$> queryDisclosure f.alice (fromInterfaceContractId @MockHolding funds)
   ds <- vaultDisclosure f
   trySubmit (actAs delegate <> discloseMany (fundsD :: ds)) do
-    exerciseCmd auth VaultDelegateAuth_Deposit with
-      sender = basicAccount f.alice
-      vaultCid = f.vaultCid; assets = amount; receiver = basicAccount f.alice; minSharesOut = None
-      extraArgs = depositArgs f [funds]
+    exerciseCmd f.vaultCid Vault_Deposit with
+      sender = basicAccount f.alice; assets = amount; receiver = basicAccount f.alice; minSharesOut = None
+      actors = [delegate]; extraArgs = under auth (depositArgs f [funds])
 
-redeemAs : Fixture -> Party -> ContractId VaultDelegateAuth -> Decimal -> Party -> Script (Either SubmitError (ContractId VaultDelegateAuth, VaultActionResult))
+redeemAs : Fixture -> Party -> ContractId VaultDelegateAuth -> Decimal -> Party -> Script (Either SubmitError VaultActionResult)
 redeemAs f delegate auth shares receiver = do
   pool <- query @MockHolding f.custodian
   poolDs <- poolDisclosures f
@@ -47,10 +61,9 @@ redeemAs f delegate auth shares receiver = do
   ownedDs <- forA owned $ \cid -> fromSome <$> queryDisclosure f.alice cid
   ds <- vaultDisclosure f
   trySubmit (actAs delegate <> discloseMany (ds <> poolDs <> ownedDs)) do
-    exerciseCmd auth VaultDelegateAuth_Redeem with
-      from = basicAccount f.alice
-      vaultCid = f.vaultCid; shares; receiver = basicAccount receiver; minAssetsOut = None
-      extraArgs = redeemArgs f (map (toInterfaceContractId . fst) pool) owned
+    exerciseCmd f.vaultCid Vault_Redeem with
+      owner = basicAccount f.alice; shares; receiver = basicAccount receiver; minAssetsOut = None
+      actors = [delegate]; extraArgs = under auth (redeemArgs f (map (toInterfaceContractId . fst) pool) owned)
 
 allowances : Party -> ContractId VaultDelegateAuth -> Script (Optional Decimal, Optional Decimal)
 allowances owner auth = do
@@ -65,18 +78,21 @@ unitsOf party = do
 -- Tests
 ---------
 
--- | Bob deposits and redeems for Alice, paying himself, until each allowance runs out across calls.
+-- | Bob deposits and redeems for Alice through the vault, paying himself as an ERC-4626 spender may, until each
+-- allowance runs out across calls.
 aDelegateActsForTheOwnerWithinItsAllowances : Script ()
 aDelegateActsForTheOwnerWithinItsAllowances = script do
   f <- setupVault
   bob <- allocateParty "bob"
   auth <- authorize f.alice bob f.registrar "reference-1" (Some 100.0) (Some 50.0) (days 1)
-  Right (auth, deposited) <- depositAs f bob auth 60.0
+  Right deposited <- depositAs f bob auth 60.0
   deposited.shares === 60.0
+  auth <- authOf f.alice
   failsWith "the deposit allowance is exceeded" =<< depositAs f bob auth 50.0
-  Right (auth, redeemed) <- redeemAs f bob auth 30.0 bob
+  Right redeemed <- redeemAs f bob auth 30.0 bob
   redeemed.assets === 30.0
   unitsOf bob >>= (=== 30.0)
+  auth <- authOf f.alice
   failsWith "the redeem allowance is exceeded" =<< redeemAs f bob auth 30.0 bob
   allowances f.alice auth >>= (=== (Some 40.0, Some 20.0))
 
@@ -89,22 +105,22 @@ mintAndWithdrawSpendWhatTheyMove = script do
   funds <- fund f f.alice 20.0
   fundsD <- fromSome <$> queryDisclosure f.alice (fromInterfaceContractId @MockHolding funds)
   ds <- vaultDisclosure f
-  (auth, minted) <- submit (actAs bob <> discloseMany (fundsD :: ds)) do
-    exerciseCmd auth VaultDelegateAuth_Mint with
-      sender = basicAccount f.alice
-      vaultCid = f.vaultCid; shares = 20.0; receiver = basicAccount f.alice; maxAssetsIn = None
-      extraArgs = depositArgs f [funds]
+  minted <- submit (actAs bob <> discloseMany (fundsD :: ds)) do
+    exerciseCmd f.vaultCid Vault_Mint with
+      sender = basicAccount f.alice; shares = 20.0; receiver = basicAccount f.alice; maxAssetsIn = None
+      actors = [bob]; extraArgs = under auth (depositArgs f [funds])
   minted.assets === 20.0
+  auth <- authOf f.alice
   pool <- query @MockHolding f.custodian
   poolDs <- poolDisclosures f
   owned <- map fst <$> query @ShareHolding f.alice
   ownedDs <- forA owned $ \cid -> fromSome <$> queryDisclosure f.alice cid
-  (auth, withdrew) <- submit (actAs bob <> discloseMany (ds <> poolDs <> ownedDs)) do
-    exerciseCmd auth VaultDelegateAuth_Withdraw with
-      from = basicAccount f.alice
-      vaultCid = f.vaultCid; assets = 5.0; receiver = basicAccount bob; maxSharesIn = None
-      extraArgs = redeemArgs f (map (toInterfaceContractId . fst) pool) owned
+  withdrew <- submit (actAs bob <> discloseMany (ds <> poolDs <> ownedDs)) do
+    exerciseCmd f.vaultCid Vault_Withdraw with
+      owner = basicAccount f.alice; assets = 5.0; receiver = basicAccount bob; maxSharesIn = None
+      actors = [bob]; extraArgs = under auth (redeemArgs f (map (toInterfaceContractId . fst) pool) owned)
   withdrew.shares === 5.0
+  auth <- authOf f.alice
   allowances f.alice auth >>= (=== (Some 80.0, Some 45.0))
 
 -- | A delegate given no redeem allowance cannot redeem.
@@ -113,7 +129,8 @@ aDelegateWithoutARedeemAllowanceCannotRedeem = script do
   f <- setupVault
   bob <- allocateParty "bob"
   auth <- authorize f.alice bob f.registrar "reference-1" (Some 100.0) None (days 1)
-  Right (auth, _) <- depositAs f bob auth 60.0
+  Right _ <- depositAs f bob auth 60.0
+  auth <- authOf f.alice
   failsWith "the delegate may not redeem" =<< redeemAs f bob auth 10.0 bob
 
 -- | An authorization stops working at its expiry.
@@ -133,7 +150,7 @@ anAuthorizationIsForOneVault = script do
   other <- authorize f.alice bob f.registrar "reference-2" (Some 100.0) None (days 1)
   failsWith "the authorization is for another vault" =<< depositAs f bob other 10.0
   foreign <- authorize f.alice bob bob "reference-1" (Some 100.0) None (days 1)
-  failsWith "the authorization is for another vault" =<< depositAs f bob foreign 10.0
+  failsWith "of the fetched contract to be an authorizer" =<< depositAs f bob foreign 10.0
 
 -- | The owner revokes by archiving, and the delegate can act no more.
 aRevokedAuthorizationIsRefused : Script ()
@@ -145,7 +162,7 @@ aRevokedAuthorizationIsRefused = script do
   Left _ <- depositAs f bob auth 10.0
   pure ()
 
--- | Only the delegate acts on the authorization.
+-- | Only the delegate acts on the authorization, even through the vault.
 onlyTheDelegateActs : Script ()
 onlyTheDelegateActs = script do
   f <- setupVault
@@ -157,10 +174,52 @@ onlyTheDelegateActs = script do
   fundsD <- fromSome <$> queryDisclosure f.alice (fromInterfaceContractId @MockHolding funds)
   ds <- vaultDisclosure f
   failsWith "requires authorizers" =<< trySubmit (actAs carol <> discloseMany (authD :: fundsD :: ds)) do
-    exerciseCmd auth VaultDelegateAuth_Deposit with
-      sender = basicAccount f.alice
-      vaultCid = f.vaultCid; assets = 10.0; receiver = basicAccount f.alice; minSharesOut = None
-      extraArgs = depositArgs f [funds]
+    exerciseCmd f.vaultCid Vault_Deposit with
+      sender = basicAccount f.alice; assets = 10.0; receiver = basicAccount f.alice; minSharesOut = None
+      actors = [carol]; extraArgs = under auth (depositArgs f [funds])
+
+-- | Each of the authorization's choices, tried by `party` alone; the ledger refuses them before they run.
+tryAlone : Fixture -> Party -> ContractId VaultDelegateAuth -> Script [Either SubmitError ()]
+tryAlone f party auth = do
+  ds <- vaultDisclosure f
+  let me = basicAccount f.alice
+      args = ExtraArgs emptyChoiceContext emptyMetadata
+      attempt : Commands a -> Script (Either SubmitError ())
+      attempt cmd = trySubmit (actAs party <> discloseMany ds) (() <$ cmd)
+  sequence
+    [ attempt $ exerciseCmd auth VaultDelegateAuth_Deposit with
+        vaultCid = f.vaultCid; assets = 1.0; sender = me; receiver = me; minSharesOut = None; extraArgs = args
+    , attempt $ exerciseCmd auth VaultDelegateAuth_Mint with
+        vaultCid = f.vaultCid; shares = 1.0; sender = me; receiver = me; maxAssetsIn = None; extraArgs = args
+    , attempt $ exerciseCmd auth VaultDelegateAuth_Withdraw with
+        vaultCid = f.vaultCid; assets = 1.0; from = me; receiver = me; maxSharesIn = None; extraArgs = args
+    , attempt $ exerciseCmd auth VaultDelegateAuth_Redeem with
+        vaultCid = f.vaultCid; shares = 1.0; from = me; receiver = me; minAssetsOut = None; extraArgs = args
+    , attempt $ exerciseCmd auth VaultDelegateAuth_RequestDeposit with
+        vaultCid = coerceContractId f.vaultCid; label = "x"; assets = 1.0; sender = me; receiver = me
+        minSharesOut = None; extraArgs = args
+    , attempt $ exerciseCmd auth VaultDelegateAuth_RequestRedeem with
+        vaultCid = coerceContractId f.vaultCid; label = "x"; shares = 1.0; from = me; receiver = me
+        minAssetsOut = None; extraArgs = args ]
+
+-- | Without the registrar, the delegate cannot use the authorization: a vault of its own, which the registrar did not
+-- sign, has only the delegate's authority.
+theDelegateAloneCannotUseTheAuthorization : Script ()
+theDelegateAloneCannotUseTheAuthorization = script do
+  f <- setupVault
+  bob <- allocateParty "bob"
+  auth <- authorize f.alice bob f.registrar "reference-1" (Some 100.0) (Some 100.0) (days 1)
+  tries <- tryAlone f bob auth
+  forA_ tries (failsWith "requires authorizers")
+
+-- | Without the delegate, the registrar cannot use the authorization either.
+theRegistrarAloneCannotUseTheAuthorization : Script ()
+theRegistrarAloneCannotUseTheAuthorization = script do
+  f <- setupVault
+  bob <- allocateParty "bob"
+  auth <- authorize f.alice bob f.registrar "reference-1" (Some 100.0) (Some 100.0) (days 1)
+  tries <- tryAlone f f.registrar auth
+  forA_ tries (failsWith "requires authorizers")
 
 -- | A delegate queues a deposit as the owner's own request, spending the allowance as it requests.
 aDelegateQueuesADepositForTheOwner : Script ()
@@ -170,13 +229,13 @@ aDelegateQueuesADepositForTheOwner = script do
   auth <- authorize env.alice bob env.registrar env.vaultId (Some 100.0) None (days 1)
   vd <- Q.vaultDisclosure env
   let requestAs auth label assets = trySubmit (actAs bob <> discloseMany [vd]) do
-        exerciseCmd auth VaultDelegateAuth_RequestDeposit with
-          sender = basicAccount env.alice
-          vaultCid = toInterfaceContractId env.vaultCid; label; assets; receiver = basicAccount env.alice; minSharesOut = None
-          extraArgs = ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata
-  Right (auth, rid) <- requestAs auth "r1" 60.0
+        exerciseCmd (toInterfaceContractId @VaultAsyncDeposit env.vaultCid) Vault_RequestDeposit with
+          label; assets; sender = basicAccount env.alice; receiver = basicAccount env.alice; minSharesOut = None
+          actors = [bob]; extraArgs = under auth (ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata)
+  Right rid <- requestAs auth "r1" 60.0
   (_, r) <- Q.published env env.alice "r1"
   (r.requester, r.amount, rid.requestId) === (env.alice, 60.0, 1)
+  auth <- authOf env.alice
   failsWith "the deposit allowance is exceeded" =<< requestAs auth "r2" 50.0
   allowances env.alice auth >>= (=== (Some 40.0, None))
 
@@ -188,26 +247,27 @@ aDelegateQueuesARedemptionForTheOwner = script do
   auth <- authorize env.alice bob env.registrar env.vaultId None (Some 50.0) (days 1)
   vd <- R.vaultDisclosure env
   let requestAs auth label shares = trySubmit (actAs bob <> discloseMany [vd]) do
-        exerciseCmd auth VaultDelegateAuth_RequestRedeem with
-          from = basicAccount env.alice
-          vaultCid = toInterfaceContractId env.vaultCid; label; shares; receiver = basicAccount bob; minAssetsOut = None
-          extraArgs = ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata
-  Right (auth, _) <- requestAs auth "r1" 30.0
+        exerciseCmd (toInterfaceContractId @VaultAsyncRedeem env.vaultCid) Vault_RequestRedeem with
+          label; shares; owner = basicAccount env.alice; receiver = basicAccount bob; minAssetsOut = None
+          actors = [bob]; extraArgs = under auth (ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata)
+  Right _ <- requestAs auth "r1" 30.0
   (_, r) <- R.published env env.alice "r1"
   (r.requester, r.receiver, r.amount) === (env.alice, bob, 30.0)
+  auth <- authOf env.alice
   failsWith "the redeem allowance is exceeded" =<< requestAs auth "r2" 30.0
   allowances env.alice auth >>= (=== (None, Some 20.0))
 
--- | A delegate pays in only from the owner's own accounts, whatever the vault would let through.
+-- | A delegate pays in only from the owner's own accounts.
 aDelegatePaysInOnlyFromTheOwnersAccounts : Script ()
 aDelegatePaysInOnlyFromTheOwnersAccounts = script do
   f <- setupVault
   bob <- allocateParty "bob"
+  carol <- allocateParty "carol"
   auth <- authorize f.alice bob f.registrar "reference-1" (Some 100.0) (Some 100.0) (days 1)
-  funds <- fund f bob 10.0
-  fundsD <- fromSome <$> queryDisclosure bob (fromInterfaceContractId @MockHolding funds)
+  funds <- fund f carol 10.0
+  fundsD <- fromSome <$> queryDisclosure carol (fromInterfaceContractId @MockHolding funds)
   ds <- vaultDisclosure f
   failsWith "the account is not the owner's" =<< trySubmit (actAs bob <> discloseMany (fundsD :: ds)) do
-    exerciseCmd auth VaultDelegateAuth_Deposit with
-      vaultCid = f.vaultCid; assets = 10.0; sender = basicAccount bob; receiver = basicAccount bob; minSharesOut = None
-      extraArgs = depositArgs f [funds]
+    exerciseCmd f.vaultCid Vault_Deposit with
+      sender = basicAccount carol; assets = 10.0; receiver = basicAccount carol; minSharesOut = None
+      actors = [bob]; extraArgs = under auth (depositArgs f [funds])
