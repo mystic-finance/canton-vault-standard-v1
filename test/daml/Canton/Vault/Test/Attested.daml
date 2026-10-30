@@ -3,7 +3,7 @@ module Canton.Vault.Test.Attested where
 
 import DA.Assert ((===))
 import DA.Foldable (forA_)
-import DA.Time (addRelTime, hours, microseconds)
+import DA.Time (addRelTime, days, hours, microseconds)
 import Daml.Script
 
 import Canton.Vault.V1
@@ -25,7 +25,7 @@ setupOracleVault = do
   oracle <- allocateParty "oracle"
   Some vault <- queryContractId f.registrar f.vaultTemplateCid
   vaultTemplateCid <- submit (actAs [f.registrar, f.custodian]) $
-    archiveCmd f.vaultTemplateCid *> createCmd vault with pricing = OraclePricing with oracle; latest = None
+    archiveCmd f.vaultTemplateCid *> createCmd vault with pricing = OraclePricing with oracle; latest = None; maxAge = days 1
   let f' = f with vaultTemplateCid; vaultCid = toInterfaceContractId vaultTemplateCid
   pure (f', oracle)
 
@@ -198,6 +198,15 @@ attestationForAnotherRegistrarIsRefused = script do
     exerciseCmd closed ClosedPeriod_Open with
       flowCids = map fst flows; evidence = Attestation other; validUntil = addRelTime now (hours 2)
 
+-- | A roll refuses an attestation older than the vault's limit allows.
+staleAttestationIsRefused : Script ()
+staleAttestationIsRefused = script do
+  (f, oracle) <- setupOracleVault
+  now <- getTime
+  a <- attest f oracle 1.0 now "nav-1"
+  passTime (days 2)
+  failsWith "the attested price is recent enough" =<< rollAttested f f.vaultTemplateCid a
+
 -- | A roll uses its attestation up, so the next roll cannot price from it again.
 attestationIsUsedOnce : Script ()
 attestationIsUsedOnce = script do
@@ -226,7 +235,7 @@ attestationFromTheFutureIsRefused = script do
   (f, oracle) <- setupOracleVault
   now <- getTime
   failsWith "the attested price is not from the future" =<<
-    rollAttested f f.vaultTemplateCid =<< attest f oracle 1.0 (addRelTime now (microseconds 1)) "nav-1"
+    rollAttested f f.vaultTemplateCid =<< attest f oracle 1.0 (addRelTime now (hours 1)) "nav-1"
   Some closed <- (fmap fst . headOf) <$> query @ClosedPeriod f.registrar
   Right reopened <- trySubmit f.registrar (exerciseCmd closed ClosedPeriod_Reopen)
   Right _ <- rollAttested f reopened =<< attest f oracle 1.0 now "nav-2"
@@ -276,7 +285,7 @@ registrarCannotBeItsOwnOracle = script do
   Some vault <- queryContractId f.registrar f.vaultTemplateCid
   failsWith "Template precondition violated" =<< trySubmit (actAs [f.registrar, f.custodian]) do
     createCmd vault with vaultId = "reference-2"; shareInstrument = vault.shareInstrument with id = "reference-2"
-                         pricing = OraclePricing with oracle = f.registrar; latest = None
+                         pricing = OraclePricing with oracle = f.registrar; latest = None; maxAge = days 1
 
 headOf : [a] -> Optional a
 headOf (x :: _) = Some x

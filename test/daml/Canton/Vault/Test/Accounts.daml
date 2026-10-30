@@ -4,6 +4,7 @@ module Canton.Vault.Test.Accounts where
 import DA.Assert ((===))
 import DA.Foldable (forA_)
 import DA.List (sort)
+import DA.Time (hours)
 import Daml.Script
 
 import Canton.Vault.V1
@@ -68,6 +69,19 @@ template AccountProbe
 maxesFor : Fixture -> V2.Account -> ExtraArgs -> Script (Decimal, Decimal, Decimal, Decimal)
 maxesFor f account extraArgs = submit f.registrar do
   createAndExerciseCmd (AccountProbe with caller = f.registrar) Probe_Maxes with vaultCid = f.vaultCid; account; extraArgs
+
+-- | Once the period has ended every action fails, so every max method returns zero.
+maxesAreZeroOnceThePeriodEnds : Script ()
+maxesAreZeroOnceThePeriodEnds = script do
+  f <- setupVault
+  depositTo f (basicAccount f.alice) 50.0
+  pool <- query @MockHolding f.custodian
+  owned <- map fst <$> query @ShareHolding f.alice
+  let args = redeemArgs f (map (toInterfaceContractId . fst) pool) owned
+  (deposit, _, withdraw, _) <- maxesFor f (basicAccount f.alice) args
+  assertMsg "the period is open" (deposit > 0.0 && withdraw > 0.0)
+  passTime (hours 2)
+  maxesFor f (basicAccount f.alice) args >>= (=== (0.0, 0.0, 0.0, 0.0))
 
 -- | A deposit and a mint issue shares to the account named, not the receiver's basic one.
 sharesGoToTheNamedAccount : Script ()

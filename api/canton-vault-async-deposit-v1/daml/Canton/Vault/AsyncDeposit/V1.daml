@@ -66,9 +66,9 @@ interface VaultAsyncDeposit requires Vault where
       actors : [Party]
         -- ^ The parties executing the request.
         --
-        -- Implementations MUST check these parties against `sender`, to avoid
-        -- unauthorized requests, unless a delegate acts as the `Vault`
-        -- interface describes.
+        -- Implementations MUST check that these parties include those of
+        -- `sender`, to avoid unauthorized requests, unless a delegate
+        -- acts as the `Vault` interface describes.
       extraArgs : ExtraArgs
         -- ^ Additional context required in order to exercise the choice.
     observer vault_requestDepositExtraObservers this arg

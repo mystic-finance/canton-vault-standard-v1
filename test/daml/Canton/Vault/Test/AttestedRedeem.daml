@@ -28,7 +28,7 @@ setupOracle = do
   oracle <- allocateParty "oracle"
   Some vault <- queryContractId env.registrar env.vaultCid
   vaultCid <- submit (actAs [env.registrar, env.custodian]) $
-    archiveCmd env.vaultCid *> createCmd vault with pricing = OraclePricing with oracle; latest = None
+    archiveCmd env.vaultCid *> createCmd vault with pricing = OraclePricing with oracle; latest = None; maxAge = days 1
   let env' = env with vaultCid
   pure (env', oracle)
 
@@ -217,10 +217,13 @@ pendingCountsTheHeldRest = script do
   passTime (window + days 1)
   pending env 1 env.alice [rest.requestCid] >>= (=== 60.0)
 
--- | The owner takes back the held rest, and the request ends, reported as closed.
+-- | The owner takes back the held rest once the request's deadline has passed, and the request ends, reported as
+-- closed; before it, the rest is still the executors' to fill.
 ownerReclaimsTheHeldRest : Script ()
 ownerReclaimsTheHeldRest = script do
   (env, _, rest) <- partlyFilled
+  failsWith "the rest is reclaimed only after the request's deadline" =<< reclaimAs env env.alice rest
+  passTime (window + days 1)
   Right tree <- reclaimAs env env.alice rest
   reported tree === [RequestClosed with request = RequestRef 1 "r1"; amount = 60.0; reason = CR_Cancelled]
   unlocked env (sharesId env) env.alice >>= (=== 60.0)
@@ -260,7 +263,7 @@ reclaimNamesThisVault = script do
   foreign <- submit mallory do
     createCmd vault with vaultRegistrar = mallory; custodian = basicAccount mallory; vaultId = "queued-redeem-1"
                          shareInstrument = vault.shareInstrument with admin = mallory
-                         pricing = OraclePricing with oracle = env.registrar; latest = None
+                         pricing = OraclePricing with oracle = env.registrar; latest = None; maxAge = days 1
                          executors = [env.registrar]
   forA_ [(sibling, env.registrar, "vault.vaultId"), (foreign, mallory, "vault.vaultRegistrar")] $ \(other, keeper, reason) -> do
     d <- queryDisclosure keeper other

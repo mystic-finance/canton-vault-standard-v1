@@ -4,7 +4,7 @@ module Canton.Vault.Testing.Minimal.Vault where
 
 import DA.Action (when)
 import DA.Foldable (forA_)
-import DA.List (dedup, sort)
+import DA.List (dedup)
 import DA.Numeric qualified as N
 import DA.Optional (isNone, isSome, optionalToList)
 import DA.TextMap qualified as TextMap
@@ -89,28 +89,28 @@ template MinimalVault
 
       vault_depositImpl self arg = orDelegated arg.actors arg.sender arg.extraArgs
         (\auth -> snd <$> exercise auth VaultDelegateAuth_Deposit with
-          vaultCid = self; assets = arg.assets; sender = arg.sender; receiver = arg.receiver; minSharesOut = arg.minSharesOut; extraArgs = arg.extraArgs) do
+          vaultCid = self; assets = arg.assets; sender = arg.sender; receiver = arg.receiver; minSharesOut = arg.minSharesOut; actors = arg.actors; extraArgs = arg.extraArgs) do
         let issued = toShares this arg.assets
         forA_ arg.minSharesOut $ \m -> when (issued < m) (fail vaultSlippageExceeded)
         enter this self arg.sender arg.receiver arg.actors arg.extraArgs arg.assets issued
 
       vault_mintImpl self arg = orDelegated arg.actors arg.sender arg.extraArgs
         (\auth -> snd <$> exercise auth VaultDelegateAuth_Mint with
-          vaultCid = self; shares = arg.shares; sender = arg.sender; receiver = arg.receiver; maxAssetsIn = arg.maxAssetsIn; extraArgs = arg.extraArgs) do
+          vaultCid = self; shares = arg.shares; sender = arg.sender; receiver = arg.receiver; maxAssetsIn = arg.maxAssetsIn; actors = arg.actors; extraArgs = arg.extraArgs) do
         let cost = roundUp arg.shares (totalAssets + offset) (totalShares + offset)
         forA_ arg.maxAssetsIn $ \m -> when (cost > m) (fail vaultSlippageExceeded)
         enter this self arg.sender arg.receiver arg.actors arg.extraArgs cost arg.shares
 
       vault_withdrawImpl self arg = orDelegated arg.actors arg.owner arg.extraArgs
         (\auth -> snd <$> exercise auth VaultDelegateAuth_Withdraw with
-          vaultCid = self; assets = arg.assets; from = arg.owner; receiver = arg.receiver; maxSharesIn = arg.maxSharesIn; extraArgs = arg.extraArgs) do
+          vaultCid = self; assets = arg.assets; from = arg.owner; receiver = arg.receiver; maxSharesIn = arg.maxSharesIn; actors = arg.actors; extraArgs = arg.extraArgs) do
         let burned = roundUp arg.assets (totalShares + offset) (totalAssets + offset)
         forA_ arg.maxSharesIn $ \m -> when (burned > m) (fail vaultSlippageExceeded)
         leave this self arg.owner arg.receiver arg.actors arg.extraArgs arg.assets burned
 
       vault_redeemImpl self arg = orDelegated arg.actors arg.owner arg.extraArgs
         (\auth -> snd <$> exercise auth VaultDelegateAuth_Redeem with
-          vaultCid = self; shares = arg.shares; from = arg.owner; receiver = arg.receiver; minAssetsOut = arg.minAssetsOut; extraArgs = arg.extraArgs) do
+          vaultCid = self; shares = arg.shares; from = arg.owner; receiver = arg.receiver; minAssetsOut = arg.minAssetsOut; actors = arg.actors; extraArgs = arg.extraArgs) do
         let paid = toAssets this arg.shares
         forA_ arg.minAssetsOut $ \m -> when (paid < m) (fail vaultSlippageExceeded)
         leave this self arg.owner arg.receiver arg.actors arg.extraArgs paid arg.shares
@@ -149,16 +149,16 @@ requireOpen v = do
   open <- isLedgerTimeLT v.validUntil
   assertMsg "the rate period has ended" open
 
--- | Acts through the authorization a delegate names, when the actors are not the account's parties.
+-- | Acts through the authorization a delegate names, when the actors do not include the account's parties.
 orDelegated : [Party] -> Account -> ExtraArgs -> (ContractId VaultDelegateAuth -> Update a) -> Update a -> Update a
 orDelegated actors from args delegated own = case TextMap.lookup delegationKey args.context.values of
-  Some (AV_ContractId cid) | isSome from.owner && sort (dedup actors) /= sort (parties from) -> delegated (coerceContractId cid)
+  Some (AV_ContractId cid) | isSome from.owner && not (all (`elem` actors) (parties from)) -> delegated (coerceContractId cid)
   _ -> own
 
 requireAccounts : Account -> Account -> [Party] -> Update ()
 requireAccounts from to actors = do
   assertMsg "an account with no owner" (isSome from.owner && isSome to.owner)
-  assertMsg "the actors are the account's parties" (sort (dedup actors) == sort (parties from))
+  assertMsg "the actors include the account's parties" (all (`elem` actors) (parties from))
 
 -- | The sender instructs the transfer; if the registry leaves it pending, the receiver's parties accept it.
 transferUnderlying : MinimalVault -> ExtraArgs -> Account -> Account -> Decimal -> [ContractId Holding] -> Update ()

@@ -2,10 +2,10 @@
 module Canton.Vault.Reference.V1 where
 
 import DA.Foldable (forA_)
-import DA.List (dedup, sort)
+import DA.List (dedup)
 import DA.Optional (fromOptional, isNone, isSome, optionalToList)
 import DA.TextMap qualified as TextMap
-import DA.Time (isLedgerTimeLT)
+import DA.Time (RelTime, addRelTime, isLedgerTimeLT, seconds)
 
 import Canton.Vault.V1
 import Canton.Vault.Delegation.V1
@@ -75,6 +75,8 @@ data Pricing
         -- ^ The party whose attestations price the vault.
       latest : Optional AttestedPrice
         -- ^ The attestation the current price rests on, once one has been used.
+      maxAge : RelTime
+        -- ^ The oldest an attestation may be when a roll uses it.
   deriving (Eq, Show, Serializable)
 
 data AttestedPrice = AttestedPrice with
@@ -86,7 +88,7 @@ data AttestedPrice = AttestedPrice with
 validPricing : Party -> Pricing -> Bool
 validPricing registrar pricing = case pricing of
   PoolPricing -> True
-  OraclePricing {oracle} -> oracle /= registrar
+  OraclePricing {oracle, maxAge} -> oracle /= registrar && maxAge > seconds 0
 
 -- | An oracle's price for one share of a vault, used up by the roll that opens a period at it.
 template RateAttestation
@@ -239,11 +241,15 @@ template ReferenceVault
         assets' <- currentAssets this
         pure (sharesToAssets totalShares assets' shares)
 
-      maxDeposit account _extraArgs = pure (if paused || isNone account.owner then 0.0 else fromOptional uncapped depositCap)
+      maxDeposit account _extraArgs = do
+        open <- isLedgerTimeLT rateValidUntil
+        pure (if paused || not open || isNone account.owner then 0.0 else fromOptional uncapped depositCap)
 
       -- The most shares whose cost, fee included, fits under the cap.
-      maxMint account _extraArgs = case depositCap of
-        _ | paused || isNone account.owner || depositFeeBps >= 10000 -> pure 0.0
+      maxMint account _extraArgs = do
+       open <- isLedgerTimeLT rateValidUntil
+       case depositCap of
+        _ | paused || not open || isNone account.owner || depositFeeBps >= 10000 -> pure 0.0
         None -> pure uncapped
         Some cap -> do
           assets' <- currentAssets this
@@ -252,6 +258,8 @@ template ReferenceVault
 
       -- The most assets whose shares, fee included, the party holds, and that the pool can pay.
       maxWithdraw account extraArgs = do
+       open <- isLedgerTimeLT rateValidUntil
+       if not open then pure 0.0 else do
         assets' <- currentAssets this
         held <- heldShares this extraArgs account
         payable <- payableFrom this extraArgs
@@ -260,6 +268,8 @@ template ReferenceVault
 
       -- The shares the party holds, as many as the pool can pay for.
       maxRedeem account extraArgs = do
+       open <- isLedgerTimeLT rateValidUntil
+       if not open then pure 0.0 else do
         held <- heldShares this extraArgs account
         payable <- payableFrom this extraArgs
         if payable >= uncapped || redeemFeeBps >= 10000 then pure held else do
@@ -293,7 +303,7 @@ template ReferenceVault
 
       vault_depositImpl self arg = orDelegated (delegation arg.actors arg.sender arg.extraArgs)
         (\auth -> snd <$> exercise auth VaultDelegateAuth_Deposit with
-          vaultCid = self; assets = arg.assets; sender = arg.sender; receiver = arg.receiver; minSharesOut = arg.minSharesOut; extraArgs = arg.extraArgs) do
+          vaultCid = self; assets = arg.assets; sender = arg.sender; receiver = arg.receiver; minSharesOut = arg.minSharesOut; actors = arg.actors; extraArgs = arg.extraArgs) do
         requirePayIn arg.sender arg.receiver arg.actors
         requirePeriodOpen this
         require "vault is not paused" (not paused)
@@ -318,7 +328,7 @@ template ReferenceVault
 
       vault_mintImpl self arg = orDelegated (delegation arg.actors arg.sender arg.extraArgs)
         (\auth -> snd <$> exercise auth VaultDelegateAuth_Mint with
-          vaultCid = self; shares = arg.shares; sender = arg.sender; receiver = arg.receiver; maxAssetsIn = arg.maxAssetsIn; extraArgs = arg.extraArgs) do
+          vaultCid = self; shares = arg.shares; sender = arg.sender; receiver = arg.receiver; maxAssetsIn = arg.maxAssetsIn; actors = arg.actors; extraArgs = arg.extraArgs) do
         requirePayIn arg.sender arg.receiver arg.actors
         requirePeriodOpen this
         require "vault is not paused" (not paused)
@@ -342,7 +352,7 @@ template ReferenceVault
 
       vault_withdrawImpl self arg = orDelegated (delegation arg.actors arg.owner arg.extraArgs)
         (\auth -> snd <$> exercise auth VaultDelegateAuth_Withdraw with
-          vaultCid = self; assets = arg.assets; from = arg.owner; receiver = arg.receiver; maxSharesIn = arg.maxSharesIn; extraArgs = arg.extraArgs) do
+          vaultCid = self; assets = arg.assets; from = arg.owner; receiver = arg.receiver; maxSharesIn = arg.maxSharesIn; actors = arg.actors; extraArgs = arg.extraArgs) do
         requirePayOut arg.owner arg.receiver arg.actors
         requirePeriodOpen this
         require "withdrawal is positive" (arg.assets > 0.0)
@@ -364,7 +374,7 @@ template ReferenceVault
 
       vault_redeemImpl self arg = orDelegated (delegation arg.actors arg.owner arg.extraArgs)
         (\auth -> snd <$> exercise auth VaultDelegateAuth_Redeem with
-          vaultCid = self; shares = arg.shares; from = arg.owner; receiver = arg.receiver; minAssetsOut = arg.minAssetsOut; extraArgs = arg.extraArgs) do
+          vaultCid = self; shares = arg.shares; from = arg.owner; receiver = arg.receiver; minAssetsOut = arg.minAssetsOut; actors = arg.actors; extraArgs = arg.extraArgs) do
         requirePayOut arg.owner arg.receiver arg.actors
         requirePeriodOpen this
         require "redemption is positive" (arg.shares > 0.0)
@@ -466,12 +476,13 @@ rollTotals vault flowCids evidence validUntil = do
     (PoolPricing, PoolHoldings poolHoldingCids) -> do
       assets <- sumPool vault poolHoldingCids
       pure (shares, assets, PoolPricing, now)
-    (OraclePricing {oracle, latest}, Attestation cid) -> do
+    (OraclePricing {oracle, latest, maxAge}, Attestation cid) -> do
       a <- exercise cid RateAttestation_Use
       require' ("attestation.oracle", a.oracle) isEqualR ("oracle", oracle)
       require' ("attestation.vaultId", a.vaultId) isEqualR ("vaultId", vault.vaultId)
       require' ("attestation.vaultRegistrar", a.vaultRegistrar) isEqualR ("vaultRegistrar", vault.vaultRegistrar)
       require "the attested price is not from the future" (a.effectiveAt <= now)
+      require "the attested price is recent enough" (addRelTime a.effectiveAt maxAge >= now)
       forA_ latest $ \l -> require "the attestation is newer than the last" (a.effectiveAt > l.effectiveAt)
       let assets = mulDivDown a.pricePerShare (shares + virtualOffset) 1.0 - virtualOffset
       require "the attested price values the vault at no less than nothing" (assets >= 0.0)
@@ -479,14 +490,14 @@ rollTotals vault flowCids evidence validUntil = do
             pricePerShare = a.pricePerShare
             effectiveAt = a.effectiveAt
             attestationId = a.attestationId
-      pure (shares, assets, (OraclePricing with oracle; latest = Some used), now)
+      pure (shares, assets, (OraclePricing with oracle; latest = Some used; maxAge), now)
     (PoolPricing, _) -> fail "the vault is priced from its pool"
     (OraclePricing {}, _) -> fail "the vault is priced by its oracle"
 
 -- | How far one roll may move the price per share before the custodian must agree.
 data PriceLimits = PriceLimits with
     maxIncreaseBpsPerYear : Int
-      -- ^ The most the price may rise, in basis points a year, pro rata for the closing period's length.
+      -- ^ The most the price may rise, in basis points a year, pro rata for the time the closing period ran.
     maxDecreaseBps : Int
       -- ^ The most the price may fall in one roll, in basis points.
   deriving (Eq, Show, Serializable)
@@ -498,9 +509,10 @@ validPriceLimits limits =
 -- | Refuses a roll whose price per share leaves the limits, measured against the closing period's opening price.
 requirePriceWithinLimits : PriceLimits -> ReferenceVault -> Decimal -> Decimal -> Update ()
 requirePriceWithinLimits limits vault shares assets = do
+  now <- getTime
   let before = sharePrice vault.totalShares vault.totalAssets
       after = sharePrice shares assets
-      years = elapsedSeconds vault.rateValidFrom vault.rateValidUntil / 31536000.0
+      years = elapsedSeconds vault.rateValidFrom (min now vault.rateValidUntil) / 31536000.0
       rise = intToDecimal limits.maxIncreaseBpsPerYear / 10000.0 * years
       fall = intToDecimal limits.maxDecreaseBps / 10000.0
   require "the price rises within the vault's limit" (after <= before * (1.0 + rise))
@@ -562,10 +574,10 @@ currentAssets vault = case vault.accrual of
     now <- getTime
     pure (accrue vault.accrual vault.totalAssets vault.rateValidFrom now)
 
--- | The authorization a delegate names, when the actors are not the account's own parties.
+-- | The authorization a delegate names, when the actors do not include the account's own parties.
 delegation : [Party] -> V2.Account -> ExtraArgs -> Update (Optional (ContractId VaultDelegateAuth))
 delegation actors account extraArgs
-  | not (isRegularAccount account) || sort (dedup actors) == sort (dedup (regularAccountParties account)) = pure None
+  | not (isRegularAccount account) || includesParties actors account = pure None
   | otherwise = case TextMap.lookup delegationKey extraArgs.context.values of
       Some (AV_ContractId cid) -> pure (Some (fromAnyContractId cid))
       Some v -> fail ("Failed to decode the delegation under '" <> delegationKey <> "': " <> show v)
@@ -575,24 +587,32 @@ delegation actors account extraArgs
 orDelegated : Update (Optional a) -> (a -> Update b) -> Update b -> Update b
 orDelegated found delegated own = found >>= optional own delegated
 
+-- | Whether the actors include all of the account's parties.
+includesParties : [Party] -> V2.Account -> Bool
+includesParties actors account = all (`elem` actors) (regularAccountParties account)
+
+-- | Refuses actors that leave out any of the account's parties.
+requireActing : Text -> V2.Account -> [Party] -> Update ()
+requireActing what account actors = forA_ (regularAccountParties account) $ \p -> require' (what, p) isMemberR ("actors", actors)
+
 -- | Refuses an account the token standard reserves for the instrument admin.
 requireRegular : Text -> V2.Account -> Update ()
 requireRegular what account = require (what <> " has an owner") (isRegularAccount account)
 
--- | A deposit's accounts: the actors are exactly the sender's parties, and include the receiver's, who sign their shares.
+-- | A deposit's accounts: the actors include the sender's parties, and the receiver's, who sign their shares.
 requirePayIn : V2.Account -> V2.Account -> [Party] -> Update ()
 requirePayIn sender receiver actors = do
   requireRegular "sender" sender
   requireRegular "receiver" receiver
-  checkActors actors [regularAccountParties sender]
+  requireActing "sender" sender actors
   forA_ (regularAccountParties receiver) $ \p -> require' ("receiver", p) isMemberR ("actors", actors)
 
--- | A redemption's accounts: the actors are exactly the owner's parties.
+-- | A redemption's accounts: the actors include the owner's parties.
 requirePayOut : V2.Account -> V2.Account -> [Party] -> Update ()
 requirePayOut owner receiver actors = do
   requireRegular "owner" owner
   requireRegular "receiver" receiver
-  checkActors actors [regularAccountParties owner]
+  requireActing "owner" owner actors
 
 -- | Refuses to transact against a rate period that has ended.
 requirePeriodOpen : ReferenceVault -> Update ()

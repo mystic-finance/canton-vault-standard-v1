@@ -125,7 +125,7 @@ template ReferenceQueuedDepositVault
 
       vault_requestDepositImpl self arg = orDelegated (delegation arg.actors arg.sender arg.extraArgs)
         (\auth -> snd <$> exercise auth VaultDelegateAuth_RequestDeposit with
-          vaultCid = self; label = arg.label; assets = arg.assets; sender = arg.sender; receiver = arg.receiver; minSharesOut = arg.minSharesOut; extraArgs = arg.extraArgs) do
+          vaultCid = self; label = arg.label; assets = arg.assets; sender = arg.sender; receiver = arg.receiver; minSharesOut = arg.minSharesOut; actors = arg.actors; extraArgs = arg.extraArgs) do
         requirePeriodOpen (instantOf' this)
         require "vault is not paused" (not paused)
         assets' <- currentAssets (instantOf' this)
@@ -133,7 +133,7 @@ template ReferenceQueuedDepositVault
           (assetsToShares totalShares assets' (deductFeeBps depositFeeBps arg.assets) > 0.0)
         requireRegular "sender" arg.sender
         requireRegular "receiver" arg.receiver
-        checkActors arg.actors [regularAccountParties arg.sender]
+        requireActing "sender" arg.sender arg.actors
         let from = arg.sender
             requester = regularAccountOwner from
             deadline = addRelTime rateValidUntil settlementDeadlineWindow
@@ -232,6 +232,7 @@ template ReferenceQueuedDepositVault
         requests <- forA requestCids $ \cid -> do
           request <- fetch cid
           require' ("request.vaultRegistrar", request.vaultRegistrar) isEqualR ("vaultRegistrar", vaultRegistrar)
+          require' ("request.vaultId", request.vaultId) isEqualR ("vaultId", vaultId)
           archive cid
           pure request
         requireDistinct [(r.requester, r.label) | r <- requests]
@@ -294,6 +295,23 @@ template ReferenceQueuedDepositVault
         report vaultRegistrar vaultId
           [ reportOf r executors (Deposited with assets = r.assets; shares = s; fromRequest = Some (requestRef r)) | (r, _, _, s) <- priced ]
 
+    nonconsuming choice ReferenceQueuedDepositVault_Cancel : ()
+      -- ^ The requester cancels their request while its period is open, before its price can be struck.
+      with
+        requestCid : ContractId QueuedDepositRequest
+        actor : Party
+      controller actor
+      do
+        requirePeriodOpen (instantOf' this)
+        request <- fetch requestCid
+        require' ("request.vaultRegistrar", request.vaultRegistrar) isEqualR ("vaultRegistrar", vaultRegistrar)
+        require' ("request.vaultId", request.vaultId) isEqualR ("vaultId", vaultId)
+        require' ("actor", actor) isEqualR ("requester", request.requester)
+        require "a request is cancelled only in the period it was made in" (request.epoch == epoch)
+        archive requestCid
+        archive request.anchor
+        report vaultRegistrar vaultId [reportOf request [actor] (closed request CR_Cancelled)]
+
     nonconsuming choice ReferenceQueuedDepositVault_Reject : ()
       -- ^ End requests that cannot settle, returning each escrow and recording why. A request that
       -- fails fails its whole batch, so executors dry-run a batch, settle the rest and reject it.
@@ -308,6 +326,7 @@ template ReferenceQueuedDepositVault
         reports <- forA requestCids $ \cid -> do
           request <- fetch cid
           require' ("request.vaultRegistrar", request.vaultRegistrar) isEqualR ("vaultRegistrar", vaultRegistrar)
+          require' ("request.vaultId", request.vaultId) isEqualR ("vaultId", vaultId)
           archive cid
           archive request.anchor
           _ <- exercise request.underlyingAllocation V2.Allocation_Cancel with actors = executors; extraArgs = underlyingExtraArgs
@@ -417,14 +436,15 @@ template QueuedDepositRequest
     observer requester, receiver, executors
 
     choice QueuedDepositRequest_Archive : ()
-      -- ^ Drop a request: the requester or an executor at any time, the registrar once it has expired.
+      -- ^ Drop a request: an executor at any time, the registrar once it has expired. The requester cancels through
+      -- the vault, while the request's period is open.
       with
         actor : Party
       controller actor
       do
-        unless (actor `elem` (requester :: executors)) do
+        unless (actor `elem` executors) do
           expired <- isLedgerTimeGE expiresAt
-          require "the requester or an executor drops a request, or the registrar once it has expired"
+          require "an executor drops a request, or the registrar once it has expired"
             (actor == vaultRegistrar && expired)
         archive anchor
         report vaultRegistrar vaultId [reportOf this [actor] (closed this (droppedBy requester executors actor))]

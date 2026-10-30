@@ -2,7 +2,7 @@
 module Canton.Vault.Test.Deposit where
 
 import DA.Assert ((===))
-import DA.Time (addRelTime, hours)
+import DA.Time (addRelTime, hours, seconds)
 import DA.Text qualified as T
 import DA.TextMap qualified as TextMap
 import Daml.Script
@@ -104,8 +104,11 @@ repin f factory factoryD = do
   pure f with vaultTemplateCid; vaultCid = toInterfaceContractId vaultTemplateCid; registryCid = factory
 
 -- | End the vault's period, so the next can be opened from its final flows.
+-- | Closes the period a second after it was last moved on, as some time always passes on a ledger.
 closePeriod : Fixture -> ContractId ReferenceVault -> Script (ContractId ClosedPeriod)
-closePeriod f vaultCid = submit f.registrar (exerciseCmd vaultCid ReferenceVault_ClosePeriod)
+closePeriod f vaultCid = do
+  passTime (seconds 1)
+  submit f.registrar (exerciseCmd vaultCid ReferenceVault_ClosePeriod)
 
 vaultDisclosure : Fixture -> Script [Disclosure]
 vaultDisclosure f = do
@@ -389,7 +392,7 @@ providerCanDepositForOwner = script do
   [(r.event, r.owner, r.actors) | r <- vaultReports tree]
     === [((Deposited with assets = 100.0; shares = 100.0; fromRequest = None), account, [f.alice, provider])]
 
--- | The actors must be exactly the funding account's parties; only the vault's check refuses this.
+-- | The actors must include the funding account's parties; only the vault's check refuses this.
 actorsMustMatchTheFundingAccount : Script ()
 actorsMustMatchTheFundingAccount = script do
   f <- setupVault
@@ -414,7 +417,7 @@ actorsMustMatchTheFundingAccount = script do
       minSharesOut = None
       actors = [f.alice]
       extraArgs = args
-  assertMsg ("refused by the vault's actors check: " <> show refused) ("allowed actors" `T.isInfixOf` show refused)
+  assertMsg ("refused by the vault's actors check: " <> show refused) ("'actors'" `T.isInfixOf` show refused)
 
 -- | The max methods answer for the party's own holdings, not the whole pool.
 maxRedeemCountsOnlyTheParty : Script ()

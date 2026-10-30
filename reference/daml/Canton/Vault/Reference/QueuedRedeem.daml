@@ -130,14 +130,14 @@ template ReferenceQueuedRedeemVault
 
       vault_requestRedeemImpl self arg = orDelegated (delegation arg.actors arg.owner arg.extraArgs)
         (\auth -> snd <$> exercise auth VaultDelegateAuth_RequestRedeem with
-          vaultCid = self; label = arg.label; shares = arg.shares; from = arg.owner; receiver = arg.receiver; minAssetsOut = arg.minAssetsOut; extraArgs = arg.extraArgs) do
+          vaultCid = self; label = arg.label; shares = arg.shares; from = arg.owner; receiver = arg.receiver; minAssetsOut = arg.minAssetsOut; actors = arg.actors; extraArgs = arg.extraArgs) do
         requirePeriodOpen (instantOf' this)
         assets' <- currentAssets (instantOf' this)
         require "the redemption pays out at the current rate"
           (deductFeeBps redeemFeeBps (sharesToAssets totalShares assets' arg.shares) > 0.0)
         requireRegular "owner" arg.owner
         requireRegular "receiver" arg.receiver
-        checkActors arg.actors [regularAccountParties arg.owner]
+        requireActing "owner" arg.owner arg.actors
         let from = arg.owner
             owner = regularAccountOwner from
             deadline = addRelTime rateValidUntil settlementDeadlineWindow
@@ -241,6 +241,7 @@ template ReferenceQueuedRedeemVault
         requests <- forA requestCids $ \cid -> do
           request <- fetch cid
           require' ("request.vaultRegistrar", request.vaultRegistrar) isEqualR ("vaultRegistrar", vaultRegistrar)
+          require' ("request.vaultId", request.vaultId) isEqualR ("vaultId", vaultId)
           archive cid
           pure request
         requireDistinct [(r.owner, r.label) | r <- requests]
@@ -355,6 +356,24 @@ template ReferenceQueuedRedeemVault
           [ reportOf f.request executors (Withdrew with assets = f.assets; shares = f.filled; fromRequest = Some (requestRef f.request))
           | f <- fills ]
 
+    nonconsuming choice ReferenceQueuedRedeemVault_Cancel : ()
+      -- ^ The owner cancels their request while its period is open, before its price can be struck.
+      with
+        requestCid : ContractId QueuedRedeemRequest
+        actor : Party
+      controller actor
+      do
+        requirePeriodOpen (instantOf' this)
+        request <- fetch requestCid
+        require' ("request.vaultRegistrar", request.vaultRegistrar) isEqualR ("vaultRegistrar", vaultRegistrar)
+        require' ("request.vaultId", request.vaultId) isEqualR ("vaultId", vaultId)
+        require' ("actor", actor) isEqualR ("owner", request.owner)
+        require "a request filled in part is closed by fulfilment or its owner's reclaim" (isNone request.filledIn)
+        require "a request is cancelled only in the period it was made in" (request.epoch == epoch)
+        archive requestCid
+        archive request.anchor
+        report vaultRegistrar vaultId [reportOf request [actor] (closed request CR_Cancelled)]
+
     nonconsuming choice ReferenceQueuedRedeemVault_Reject : ()
       -- ^ End requests that cannot settle, returning each escrow and recording why. A request that
       -- fails fails its whole batch, so executors dry-run a batch, settle the rest and reject it.
@@ -369,6 +388,7 @@ template ReferenceQueuedRedeemVault
         reports <- forA requestCids $ \cid -> do
           request <- fetch cid
           require' ("request.vaultRegistrar", request.vaultRegistrar) isEqualR ("vaultRegistrar", vaultRegistrar)
+          require' ("request.vaultId", request.vaultId) isEqualR ("vaultId", vaultId)
           require "a request filled in part is returned by its owner's reclaim" (isNone request.filledIn)
           archive cid
           archive request.anchor
@@ -484,21 +504,23 @@ template QueuedRedeemRequest
     observer owner, receiver, executors
 
     choice QueuedRedeemRequest_Archive : ()
-      -- ^ Drop a request: the owner or an executor at any time, the registrar once it has expired.
+      -- ^ Drop a request: an executor at any time, the registrar once it has expired. The owner cancels through the
+      -- vault, while the request's period is open.
       with
         actor : Party
       controller actor
       do
         require "a request filled in part is closed by fulfilment or its owner's reclaim" (isNone filledIn)
-        unless (actor `elem` (owner :: executors)) do
+        unless (actor `elem` executors) do
           expired <- isLedgerTimeGE expiresAt
-          require "the owner or an executor drops a request, or the registrar once it has expired"
+          require "an executor drops a request, or the registrar once it has expired"
             (actor == vaultRegistrar && expired)
         archive anchor
         report vaultRegistrar vaultId [reportOf this [actor] (closed this (droppedBy owner executors actor))]
 
     choice QueuedRedeemRequest_Reclaim : ()
-      -- ^ Return the shares not yet filled of a request filled in part to its owner, ending the request.
+      -- ^ Return the shares not yet filled of a request filled in part to its owner, ending the request, once its
+      -- deadline has passed.
       with
         vaultCid : ContractId ReferenceQueuedRedeemVault
         heldHoldingCids : [ContractId V2.Holding]
@@ -511,6 +533,8 @@ template QueuedRedeemRequest
         vault <- fetch vaultCid
         require' ("vault.vaultId", vault.vaultId) isEqualR ("vaultId", vaultId)
         require' ("vault.vaultRegistrar", vault.vaultRegistrar) isEqualR ("vaultRegistrar", vaultRegistrar)
+        expired <- isLedgerTimeGE expiresAt
+        require "the rest is reclaimed only after the request's deadline" expired
         let held = redemptionAccount vaultRegistrar
             settlement = V2.SettlementInfo with
               executors = [vaultRegistrar]; id = vaultId <> "/returns"; cid = None; meta = emptyMetadata

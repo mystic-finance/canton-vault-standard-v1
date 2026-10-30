@@ -20,18 +20,18 @@ import Canton.Vault.V1
 import Canton.Vault.AsyncDeposit.V1
 import Canton.Vault.AsyncRedeem.V1
 
--- | An owner's authorization for a delegate to act for them in one vault, as
--- an ERC-7540 operator, within allowances and until an expiry.
+-- | An owner's authorization for a delegate to act for them in one vault,
+-- within allowances and until an expiry.
 --
 -- The delegate exercises the vault's own choice, naming this authorization
 -- under `delegationKey`, and the vault exercises the matching choice here,
--- passing itself; that choice acts as the owner. Each choice needs both the
--- vault's registrar and the delegate, so only the vault, on the delegate's
--- call, can use it. The delegate pays in only from accounts the owner owns, and
--- chooses the receiver, as with an ERC-4626 allowance; a vault whose registry
--- needs an account's provider to act may refuse it. Each allowance is spent by
--- every action it covers. The owner revokes it by archiving it, which takes
--- effect at once.
+-- passing itself and its actors; that choice acts as the owner and the
+-- delegate. Each choice needs both the vault's registrar and the delegate, and
+-- the delegate among the actors, so only the vault, on the delegate's call, can
+-- use it. The delegate pays in only from accounts the owner owns, and chooses
+-- the receiver; a vault whose registry needs an account's provider to act may
+-- refuse it. Each allowance is spent by every action it covers. The owner
+-- revokes it by archiving it, which takes effect at once.
 template VaultDelegateAuth
   with
     owner : Party
@@ -65,12 +65,15 @@ template VaultDelegateAuth
         sender : Account
         receiver : Account
         minSharesOut : Optional Decimal
+        actors : [Party]
+          -- ^ The parties calling the vault, among whom the delegate must be.
         extraArgs : ExtraArgs
       controller vaultRegistrar, delegate
       do
+        requireCalledBy this actors
         requireVault this vaultCid
         requireOwned this sender
-        result <- exercise vaultCid Vault_Deposit with assets; sender; receiver; minSharesOut; actors = [owner]; extraArgs
+        result <- exercise vaultCid Vault_Deposit with assets; sender; receiver; minSharesOut; actors = [owner, delegate]; extraArgs
         left <- spend "deposit" depositAllowance result.assets
         next <- create this with depositAllowance = left
         pure (next, result)
@@ -83,12 +86,15 @@ template VaultDelegateAuth
         sender : Account
         receiver : Account
         maxAssetsIn : Optional Decimal
+        actors : [Party]
+          -- ^ The parties calling the vault, among whom the delegate must be.
         extraArgs : ExtraArgs
       controller vaultRegistrar, delegate
       do
+        requireCalledBy this actors
         requireVault this vaultCid
         requireOwned this sender
-        result <- exercise vaultCid Vault_Mint with shares; sender; receiver; maxAssetsIn; actors = [owner]; extraArgs
+        result <- exercise vaultCid Vault_Mint with shares; sender; receiver; maxAssetsIn; actors = [owner, delegate]; extraArgs
         left <- spend "deposit" depositAllowance result.assets
         next <- create this with depositAllowance = left
         pure (next, result)
@@ -101,12 +107,15 @@ template VaultDelegateAuth
         from : Account
         receiver : Account
         maxSharesIn : Optional Decimal
+        actors : [Party]
+          -- ^ The parties calling the vault, among whom the delegate must be.
         extraArgs : ExtraArgs
       controller vaultRegistrar, delegate
       do
+        requireCalledBy this actors
         requireVault this vaultCid
         requireOwned this from
-        result <- exercise vaultCid Vault_Withdraw with assets; owner = from; receiver; maxSharesIn; actors = [owner]; extraArgs
+        result <- exercise vaultCid Vault_Withdraw with assets; owner = from; receiver; maxSharesIn; actors = [owner, delegate]; extraArgs
         left <- spend "redeem" redeemAllowance result.shares
         next <- create this with redeemAllowance = left
         pure (next, result)
@@ -119,12 +128,15 @@ template VaultDelegateAuth
         from : Account
         receiver : Account
         minAssetsOut : Optional Decimal
+        actors : [Party]
+          -- ^ The parties calling the vault, among whom the delegate must be.
         extraArgs : ExtraArgs
       controller vaultRegistrar, delegate
       do
+        requireCalledBy this actors
         requireVault this vaultCid
         requireOwned this from
-        result <- exercise vaultCid Vault_Redeem with shares; owner = from; receiver; minAssetsOut; actors = [owner]; extraArgs
+        result <- exercise vaultCid Vault_Redeem with shares; owner = from; receiver; minAssetsOut; actors = [owner, delegate]; extraArgs
         left <- spend "redeem" redeemAllowance result.shares
         next <- create this with redeemAllowance = left
         pure (next, result)
@@ -138,13 +150,16 @@ template VaultDelegateAuth
         sender : Account
         receiver : Account
         minSharesOut : Optional Decimal
+        actors : [Party]
+          -- ^ The parties calling the vault, among whom the delegate must be.
         extraArgs : ExtraArgs
       controller vaultRegistrar, delegate
       do
+        requireCalledBy this actors
         requireVault this (toInterfaceContractId vaultCid)
         requireOwned this sender
         left <- spend "deposit" depositAllowance assets
-        result <- exercise vaultCid Vault_RequestDeposit with label; assets; sender; receiver; minSharesOut; actors = [owner]; extraArgs
+        result <- exercise vaultCid Vault_RequestDeposit with label; assets; sender; receiver; minSharesOut; actors = [owner, delegate]; extraArgs
         next <- create this with depositAllowance = left
         pure (next, result)
 
@@ -157,13 +172,16 @@ template VaultDelegateAuth
         from : Account
         receiver : Account
         minAssetsOut : Optional Decimal
+        actors : [Party]
+          -- ^ The parties calling the vault, among whom the delegate must be.
         extraArgs : ExtraArgs
       controller vaultRegistrar, delegate
       do
+        requireCalledBy this actors
         requireVault this (toInterfaceContractId vaultCid)
         requireOwned this from
         left <- spend "redeem" redeemAllowance shares
-        result <- exercise vaultCid Vault_RequestRedeem with label; shares; owner = from; receiver; minAssetsOut; actors = [owner]; extraArgs
+        result <- exercise vaultCid Vault_RequestRedeem with label; shares; owner = from; receiver; minAssetsOut; actors = [owner, delegate]; extraArgs
         next <- create this with redeemAllowance = left
         pure (next, result)
 
@@ -174,6 +192,10 @@ requireVault auth vaultCid = do
   assertMsg "the authorization has expired" live
   v <- view <$> fetch vaultCid
   assertMsg "the authorization is for another vault" (v.vaultId == auth.vaultId && v.vaultRegistrar == auth.vaultRegistrar)
+
+-- | Fails unless the delegate is among the parties calling the vault.
+requireCalledBy : VaultDelegateAuth -> [Party] -> Update ()
+requireCalledBy auth actors = assertMsg "the delegate is not among the actors" (auth.delegate `elem` actors)
 
 -- | Fails unless the owner owns the account paid in from.
 requireOwned : VaultDelegateAuth -> Account -> Update ()

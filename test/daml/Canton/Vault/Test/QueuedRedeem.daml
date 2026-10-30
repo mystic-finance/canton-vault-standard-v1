@@ -7,7 +7,7 @@ import DA.Foldable (forA_)
 import DA.List (head)
 import DA.Optional (fromSome, optionalToList)
 import DA.TextMap qualified as TextMap
-import DA.Time (RelTime, addRelTime, days, hours, microseconds)
+import DA.Time (RelTime, addRelTime, days, hours, microseconds, seconds)
 import Daml.Script
 
 import Canton.Vault.V1
@@ -578,16 +578,16 @@ queuedRedemptionsHaveNoInstantPath = script do
   refused "previewRedeem"
 
 -- | The funding account is Alice's, so only Alice may request from it, not Alice and a stranger.
-requestWithAStrangerIsRefused : Script ()
-requestWithAStrangerIsRefused = script do
+requestByAStrangerIsRefused : Script ()
+requestByAStrangerIsRefused = script do
   env <- setup
   carol <- allocateParty "carol"
   vd <- vaultDisclosure env
-  submitMustFail (actAs [env.alice, carol] <> discloseMany [vd]) do
+  submitMustFail (actAs carol <> discloseMany [vd]) do
     exerciseCmd (toInterfaceContractId env.vaultCid : ContractId VaultAsyncRedeem) Vault_RequestRedeem with
       owner = basicAccount env.alice
       label = "r1"; shares = 40.0; receiver = basicAccount env.alice; minAssetsOut = None
-      actors = [env.alice, carol]; extraArgs = ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata
+      actors = [carol]; extraArgs = ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata
 
 requestAfterThePeriodEndsIsRefused : Script ()
 requestAfterThePeriodEndsIsRefused = script do
@@ -697,6 +697,7 @@ pauseStopsDepositsNotRedemptions = script do
 closeQueued : Env -> Script (ContractId R.ClosedQueuedRedeemPeriod)
 closeQueued env = do
   now <- current env
+  passTime (seconds 1)
   submit env.registrar (exerciseCmd now.vaultCid R.ReferenceQueuedRedeemVault_ClosePeriod)
 
 -- | Opens the next period from the closed one's flows and the custodian's USD.
@@ -937,7 +938,7 @@ requestOfAnotherVaultIsRefused = script do
   env <- setup
   other <- anotherVault env "queued-redeem-2"
   (_, req) <- queueRequest other env.alice "r1" 40.0
-  Left _ <- fulfilAs env env.venue [req]
+  failsWith "request.vaultId" =<< fulfilAs env env.venue [req]
   Right () <- fulfilAs other env.venue [req]
   unlocked env (usdId env) env.alice >>= (=== 40.0)
 
@@ -959,9 +960,31 @@ ownerAndExecutorsArchiveRequests = script do
   env <- setup
   (_, r1) <- queueRequest env env.alice "r1" 40.0
   (_, r2) <- queueRequest env env.alice "r2" 20.0
-  submit env.alice (exerciseCmd r1.requestCid R.QueuedRedeemRequest_Archive with actor = env.alice)
+  Right _ <- cancelTreeAs env env.alice r1
   submit env.venue (exerciseCmd r2.requestCid R.QueuedRedeemRequest_Archive with actor = env.venue)
   query @R.QueuedRedeemRequest env.alice >>= (=== []) . map snd
+
+-- | Once the vault has moved past the request's period, whose price may now be struck, the owner can no longer
+-- cancel it, by the vault or directly; the executors still can drop it.
+ownerCancelsOnlyWhileThePeriodIsOpen : Script ()
+ownerCancelsOnlyWhileThePeriodIsOpen = script do
+  env <- setup
+  (_, req) <- queueRequest env env.alice "r1" 40.0
+  rolled <- nextPeriod env
+  failsWith "a request is cancelled only in the period it was made in" =<< cancelTreeAs rolled env.alice req
+  failsWith "an executor drops a request" =<< trySubmit env.alice (exerciseCmd req.requestCid R.QueuedRedeemRequest_Archive with actor = env.alice)
+  Right _ <- trySubmit env.venue (exerciseCmd req.requestCid R.QueuedRedeemRequest_Archive with actor = env.venue)
+  pure ()
+
+-- | Executors shared between vaults cannot reject one vault's request through another.
+anotherVaultsRequestIsNotRejected : Script ()
+anotherVaultsRequestIsNotRejected = script do
+  env <- setup
+  other <- anotherVault env "queued-redeem-2"
+  (_, req) <- queueRequest other env.alice "r1" 40.0
+  failsWith "request.vaultId" =<< rejectAs env env.venue [req] "receiver blocked"
+  Right () <- rejectAs other env.venue [req] "receiver blocked"
+  pure ()
 
 -- | A party shown a request cannot drop it.
 strangerCannotArchiveARequest : Script ()
@@ -1125,6 +1148,14 @@ requestExpiresWithItsEscrow = script do
 
 rejectAs : Env -> Party -> [Req] -> Text -> Script (Either SubmitError ())
 rejectAs env party requests reason = fmap (const ()) <$> rejectTreeAs env party requests reason
+
+-- | The owner cancels the request through the vault.
+cancelTreeAs : Env -> Party -> Req -> Script (Either SubmitError TransactionTree)
+cancelTreeAs env party req = do
+  now <- current env
+  vd <- vaultDisclosure now
+  trySubmitTree (actAs party <> discloseMany [vd]) do
+    exerciseCmd now.vaultCid R.ReferenceQueuedRedeemVault_Cancel with requestCid = req.requestCid; actor = party
 
 rejectTreeAs : Env -> Party -> [Req] -> Text -> Script (Either SubmitError TransactionTree)
 rejectTreeAs env party requests reason = do

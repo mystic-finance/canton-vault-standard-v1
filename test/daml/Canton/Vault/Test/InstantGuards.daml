@@ -63,9 +63,10 @@ slippageLimitsRefuseAndMoveNothing = script do
       shares = 10.0; owner = alice; receiver = alice; minAssetsOut = Some 10.0000000001; actors = [f.alice]; extraArgs = args
   balances f >>= (=== before)
 
--- | The actors must be exactly the sender's or the owner's parties; one more, though they authorize too, is refused.
-actorsBeyondTheAccountAreRefused : Script ()
-actorsBeyondTheAccountAreRefused = script do
+-- | The actors must include the sender's or the owner's parties; another party, who authorizes too, may act with them,
+-- but not instead of them.
+actorsMayIncludeMoreThanTheAccount : Script ()
+actorsMayIncludeMoreThanTheAccount = script do
   f <- setupVault
   carol <- allocateParty "carol"
   depositTo f (basicAccount f.alice) 100.0
@@ -73,19 +74,17 @@ actorsBeyondTheAccountAreRefused = script do
   ds <- vaultDisclosure f
   let alice = basicAccount f.alice
       both = [f.alice, carol]
-  failsWith "allowed actors" =<< trySubmit (actAs both <> discloseMany ds) do
+  Right _ <- trySubmit (actAs both <> discloseMany ds) do
     exerciseCmd f.vaultCid Vault_Deposit with
       sender = alice; assets = 10.0; receiver = alice; minSharesOut = None; actors = both; extraArgs = depositArgs f [funds]
-  failsWith "allowed actors" =<< trySubmit (actAs both <> discloseMany ds) do
-    exerciseCmd f.vaultCid Vault_Mint with
-      sender = alice; shares = 10.0; receiver = alice; maxAssetsIn = None; actors = both; extraArgs = depositArgs f [funds]
   (args, exitDs) <- exitContext f
-  failsWith "allowed actors" =<< trySubmit (actAs both <> discloseMany exitDs) do
-    exerciseCmd f.vaultCid Vault_Withdraw with
-      assets = 10.0; owner = alice; receiver = alice; maxSharesIn = None; actors = both; extraArgs = args
-  failsWith "allowed actors" =<< trySubmit (actAs both <> discloseMany exitDs) do
+  failsWith "'actors'" =<< trySubmit (actAs carol <> discloseMany exitDs) do
+    exerciseCmd f.vaultCid Vault_Redeem with
+      shares = 10.0; owner = alice; receiver = alice; minAssetsOut = None; actors = [carol]; extraArgs = args
+  Right _ <- trySubmit (actAs both <> discloseMany exitDs) do
     exerciseCmd f.vaultCid Vault_Redeem with
       shares = 10.0; owner = alice; receiver = alice; minAssetsOut = None; actors = both; extraArgs = args
+  pure ()
 
 -- | A queued-deposit vault refuses an instant mint, and a queued-redemption vault an instant withdrawal.
 queuedDirectionsRefuseEveryInstantAction : Script ()

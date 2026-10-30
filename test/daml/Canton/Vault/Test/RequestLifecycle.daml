@@ -60,7 +60,7 @@ droppedDepositsSayWhoEndedThem = script do
   (_, r1) <- QD.queueRequest env env.alice "r1" 10.0
   (_, r2) <- QD.queueRequest env env.alice "r2" 10.0
   (_, r3) <- QD.queueRequest env env.alice "r3" 10.0
-  byRequester <- submitTree env.alice (exerciseCmd r1.requestCid Q.QueuedDepositRequest_Archive with actor = env.alice)
+  Right byRequester <- QD.cancelTreeAs env env.alice r1
   byExecutor <- submitTree env.venue (exerciseCmd r2.requestCid Q.QueuedDepositRequest_Archive with actor = env.venue)
   Some expiring <- queryContractId env.registrar r3.requestCid
   setTime expiring.expiresAt
@@ -73,7 +73,7 @@ droppedRedemptionsSayWhoEndedThem = script do
   (_, r1) <- QR.queueRequest env env.alice "r1" 10.0
   (_, r2) <- QR.queueRequest env env.alice "r2" 10.0
   (_, r3) <- QR.queueRequest env env.alice "r3" 10.0
-  byOwner <- submitTree env.alice (exerciseCmd r1.requestCid R.QueuedRedeemRequest_Archive with actor = env.alice)
+  Right byOwner <- QR.cancelTreeAs env env.alice r1
   byExecutor <- submitTree env.venue (exerciseCmd r2.requestCid R.QueuedRedeemRequest_Archive with actor = env.venue)
   Some expiring <- queryContractId env.registrar r3.requestCid
   setTime expiring.expiresAt

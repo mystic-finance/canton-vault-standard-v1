@@ -6,7 +6,7 @@ import DA.Assert ((===))
 import DA.Foldable (forA_)
 import DA.List (dedup)
 import DA.Optional (fromSome)
-import DA.Time (addRelTime, hours)
+import DA.Time (addRelTime, days, hours, seconds)
 import Daml.Script
 
 import Canton.Vault.V1
@@ -166,7 +166,7 @@ setupMixed = do
   Some ref <- queryContractId f.registrar f.vaultTemplateCid
   vaultCid <- submit (actAs [f.registrar, f.custodian]) $
     archiveCmd f.vaultTemplateCid *> createCmd MixedVault with
-      vault = ref with pricing = OraclePricing with oracle = desk; latest = None
+      vault = ref with pricing = OraclePricing with oracle = desk; latest = None; maxAge = days 1
       prices = []
   now <- getTime
   otherCid <- submit (actAs [otherRegistrar, otherCustodian]) $ createCmd ref with
@@ -195,6 +195,7 @@ rollOther m = do
   _ <- fund m.f m.otherCustodian 10.0
   flows <- query @PeriodFlow m.otherRegistrar
   pool <- query @MockHolding m.otherCustodian
+  passTime (seconds 1)
   now <- getTime
   closed <- submit m.otherRegistrar (exerciseCmd m.otherCid ReferenceVault_ClosePeriod)
   submit (actAs [m.otherRegistrar, m.otherCustodian]) do

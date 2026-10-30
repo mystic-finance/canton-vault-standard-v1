@@ -6,7 +6,7 @@ import DA.Action (void)
 import DA.Foldable (forA_)
 import DA.Optional (fromSome)
 import DA.TextMap qualified as TextMap
-import DA.Time (RelTime, addRelTime, days, hours, microseconds, minutes)
+import DA.Time (RelTime, addRelTime, days, hours, microseconds, minutes, seconds)
 import Daml.Script
 
 import Canton.Vault.V1
@@ -492,16 +492,16 @@ executorsCancelBeforeTheDeadline = script do
   sum [h.holding.amount | (_, h) <- held, h.holding.instrumentId == usdId env, h.holding.lock == None] === 100.0
 
 -- | The funding account is Alice's, so only Alice may request from it, not Alice and a stranger.
-requestWithAStrangerIsRefused : Script ()
-requestWithAStrangerIsRefused = script do
+requestByAStrangerIsRefused : Script ()
+requestByAStrangerIsRefused = script do
   env <- setup
   carol <- allocateParty "carol"
   vd <- vaultDisclosure env
-  submitMustFail (actAs [env.alice, carol] <> discloseMany [vd]) do
+  submitMustFail (actAs carol <> discloseMany [vd]) do
     exerciseCmd (toInterfaceContractId env.vaultCid : ContractId VaultAsyncDeposit) Vault_RequestDeposit with
       sender = basicAccount env.alice
       label = "r1"; assets = 100.0; receiver = basicAccount env.alice; minSharesOut = None
-      actors = [env.alice, carol]; extraArgs = ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata
+      actors = [carol]; extraArgs = ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata
 
 requestAfterThePeriodEndsIsRefused : Script ()
 requestAfterThePeriodEndsIsRefused = script do
@@ -524,6 +524,7 @@ fulfilmentAfterThePeriodEndsIsRefused = script do
 closeQueued : Env -> Script (ContractId Q.ClosedQueuedPeriod)
 closeQueued env = do
   now <- current env
+  passTime (seconds 1)
   submit env.registrar (exerciseCmd now.vaultCid Q.ReferenceQueuedDepositVault_ClosePeriod)
 
 -- | Opens the next period from the closed one's flows and the custodian's USD.
@@ -895,7 +896,7 @@ requestOfAnotherVaultIsRefused = script do
   env <- setup
   other <- anotherVault env "queued-2"
   (_, req) <- queueRequest other env.alice "r1" 100.0
-  Left _ <- fulfilAs env env.venue [req]
+  failsWith "request.vaultId" =<< fulfilAs env env.venue [req]
   Right () <- fulfilAs other env.venue [req]
   tokens other (sharesId other) env.alice >>= (=== 100.0)
 
@@ -917,10 +918,32 @@ requesterAndExecutorsArchiveRequests = script do
   env <- setup
   (_, r1) <- queueRequest env env.alice "r1" 100.0
   (_, r2) <- queueRequest env env.alice "r2" 50.0
-  dropped <- submitTree env.alice (exerciseCmd r1.requestCid Q.QueuedDepositRequest_Archive with actor = env.alice)
+  Right dropped <- cancelTreeAs env env.alice r1
   reported dropped === [RequestClosed with request = RequestRef 1 "r1"; amount = 100.0; reason = CR_Cancelled]
   submit env.venue (exerciseCmd r2.requestCid Q.QueuedDepositRequest_Archive with actor = env.venue)
   query @Q.QueuedDepositRequest env.alice >>= (=== []) . map snd
+
+-- | Once the vault has moved past the request's period, whose price may now be struck, the requester can no longer
+-- cancel it, by the vault or directly; the executors still can drop it.
+requesterCancelsOnlyWhileThePeriodIsOpen : Script ()
+requesterCancelsOnlyWhileThePeriodIsOpen = script do
+  env <- setup
+  (_, req) <- queueRequest env env.alice "r1" 100.0
+  rolled <- nextPeriod env
+  failsWith "a request is cancelled only in the period it was made in" =<< cancelTreeAs rolled env.alice req
+  failsWith "an executor drops a request" =<< trySubmit env.alice (exerciseCmd req.requestCid Q.QueuedDepositRequest_Archive with actor = env.alice)
+  Right _ <- trySubmit env.venue (exerciseCmd req.requestCid Q.QueuedDepositRequest_Archive with actor = env.venue)
+  pure ()
+
+-- | Executors shared between vaults cannot reject one vault's request through another.
+anotherVaultsRequestIsNotRejected : Script ()
+anotherVaultsRequestIsNotRejected = script do
+  env <- setup
+  other <- anotherVault env "queued-2"
+  (_, req) <- queueRequest other env.alice "r1" 100.0
+  failsWith "request.vaultId" =<< rejectAs env env.venue [req] "receiver blocked"
+  Right () <- rejectAs other env.venue [req] "receiver blocked"
+  pure ()
 
 -- | A party shown a request cannot drop it.
 strangerCannotArchiveARequest : Script ()
@@ -1080,6 +1103,14 @@ requestExpiresWithItsEscrow = script do
 
 rejectAs : Env -> Party -> [Req] -> Text -> Script (Either SubmitError ())
 rejectAs env party requests reason = fmap (const ()) <$> rejectTreeAs env party requests reason
+
+-- | The requester cancels the request through the vault.
+cancelTreeAs : Env -> Party -> Req -> Script (Either SubmitError TransactionTree)
+cancelTreeAs env party req = do
+  now <- current env
+  vd <- vaultDisclosure now
+  trySubmitTree (actAs party <> discloseMany [vd]) do
+    exerciseCmd now.vaultCid Q.ReferenceQueuedDepositVault_Cancel with requestCid = req.requestCid; actor = party
 
 rejectTreeAs : Env -> Party -> [Req] -> Text -> Script (Either SubmitError TransactionTree)
 rejectTreeAs env party requests reason = do
@@ -1451,10 +1482,10 @@ anchorsGoWithTheirRequests = script do
   (_, filled) <- queueRequest env env.alice "r1" 10.0
   (_, rejected) <- queueRequest env env.alice "r2" 10.0
   (_, dropped) <- queueRequest env env.alice "r3" 10.0
+  Right _ <- cancelTreeAs env env.alice dropped
   ready <- readyToFill env [filled]
   Right () <- fulfilNow ready env.venue [filled]
   Right () <- rejectAs ready env.venue [rejected] "receiver blocked"
-  submit env.alice (exerciseCmd dropped.requestCid Q.QueuedDepositRequest_Archive with actor = env.alice)
   query @Q.RequestAnchor env.registrar >>= (=== []) . map snd
 
 -- | A period rolled early has struck the next price, so allocations are no longer bound to its requests.

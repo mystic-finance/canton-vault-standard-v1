@@ -241,14 +241,15 @@ requestPricingKey = "canton-vault/request-pricing"
 -- publishing a price, MUST take their controllers from the vault contract
 -- rather than from an argument.
 --
--- A delegate acts through the vault, as an ERC-7540 operator does: it
--- exercises the vault's choice as the actor, naming a `VaultDelegateAuth`
--- (package `canton-vault-delegation-v1`) under `delegationKey` in `extraArgs`.
--- When the actors of `Vault_Deposit`, `Vault_Mint`, `Vault_Withdraw`,
--- `Vault_Redeem`, `Vault_RequestDeposit` or `Vault_RequestRedeem` are not the
--- parties of the account it pays from and that key is present, a vault MUST
--- exercise the authorization's choice for the action, passing itself, and
--- return its result; the authorization then acts as the owner.
+-- A delegate acts through the vault: it exercises the vault's choice as the
+-- actor, naming a `VaultDelegateAuth` (package `canton-vault-delegation-v1`)
+-- under `delegationKey` in `extraArgs`. When the actors of `Vault_Deposit`,
+-- `Vault_Mint`, `Vault_Withdraw`, `Vault_Redeem`, `Vault_RequestDeposit` or
+-- `Vault_RequestRedeem` do not include the parties of the account it pays from
+-- and that key is present, a vault MUST exercise the authorization's choice for
+-- the action, passing itself and its actors, and return its result; the
+-- authorization then acts as the owner and the delegate, so the action's events
+-- name both.
 interface Vault where
   viewtype VaultView
 
@@ -346,9 +347,9 @@ interface Vault where
       actors : [Party]
         -- ^ The parties executing the deposit.
         --
-        -- Implementations MUST check these parties against `sender`, to avoid
-        -- unauthorized deposits, unless a delegate acts as the `Vault` interface
-        -- describes.
+        -- Implementations MUST check that these parties include those of
+        -- `sender`, to avoid unauthorized deposits, unless a delegate
+        -- acts as the `Vault` interface describes.
       extraArgs : ExtraArgs
         -- ^ Additional context required in order to exercise the choice.
     observer vault_depositExtraObservers this arg
@@ -374,9 +375,9 @@ interface Vault where
       actors : [Party]
         -- ^ The parties executing the mint.
         --
-        -- Implementations MUST check these parties against `sender`, to avoid
-        -- unauthorized mints, unless a delegate acts as the `Vault` interface
-        -- describes.
+        -- Implementations MUST check that these parties include those of
+        -- `sender`, to avoid unauthorized mints, unless a delegate
+        -- acts as the `Vault` interface describes.
       extraArgs : ExtraArgs
         -- ^ Additional context required in order to exercise the choice.
     observer vault_mintExtraObservers this arg
@@ -405,9 +406,9 @@ interface Vault where
       actors : [Party]
         -- ^ The parties executing the withdrawal.
         --
-        -- Implementations MUST check these parties against `owner`, to avoid
-        -- unauthorized withdrawals, unless a delegate acts as the `Vault` interface
-        -- describes.
+        -- Implementations MUST check that these parties include those of
+        -- `owner`, to avoid unauthorized withdrawals, unless a delegate
+        -- acts as the `Vault` interface describes.
       extraArgs : ExtraArgs
         -- ^ Additional context required in order to exercise the choice.
     observer vault_withdrawExtraObservers this arg
@@ -434,9 +435,9 @@ interface Vault where
       actors : [Party]
         -- ^ The parties executing the redemption.
         --
-        -- Implementations MUST check these parties against `owner`, to avoid
-        -- unauthorized redemptions, unless a delegate acts as the `Vault` interface
-        -- describes.
+        -- Implementations MUST check that these parties include those of
+        -- `owner`, to avoid unauthorized redemptions, unless a delegate
+        -- acts as the `Vault` interface describes.
       extraArgs : ExtraArgs
         -- ^ Additional context required in order to exercise the choice.
     observer vault_redeemExtraObservers this arg

@@ -3,7 +3,7 @@ module Canton.Vault.Test.Guards where
 
 import DA.Assert ((===))
 import DA.Foldable (forA_)
-import DA.Time (addRelTime, hours, microseconds, seconds)
+import DA.Time (addRelTime, days, hours, microseconds, seconds)
 import Daml.Script
 
 import Canton.Vault.V1
@@ -201,6 +201,7 @@ depositMintingZeroSharesIsRejected = script do
   f <- setupVault
   _ <- deposit f f.vaultTemplateCid f.alice 100.0
   _ <- fund f f.custodian 1000000000.0
+  passTime (days 1)
   rolled <- rollPeriod f f.vaultTemplateCid
   ds <- disclosuresFor f rolled
   funds <- fund f f.alice 0.0000000001

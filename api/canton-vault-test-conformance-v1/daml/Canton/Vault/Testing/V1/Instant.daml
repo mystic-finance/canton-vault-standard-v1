@@ -216,22 +216,21 @@ slippageLimitsRefuseAndMoveNothing h = withHistory h plainConfig 47 $ \d -> do
     refusedFor "a withdrawal above maxSharesIn" vaultSlippageExceeded =<< perform d [alice] (Withdraw 1.0 me me (Some (qw - ulp)))
   balancesOf d alice >>= (=== before)
 
--- | The actors must be the sender's or owner's parties: one more, though they authorize too, is refused.
-actorsBeyondTheAccountAreRefused : Harness -> Script ()
-actorsBeyondTheAccountAreRefused h = withHistory h plainConfig 53 $ \d -> do
+-- | The actors must include the sender's or owner's parties: another party acting alone is refused.
+actorsWithoutTheAccountAreRefused : Harness -> Script ()
+actorsWithoutTheAccountAreRefused h = withHistory h plainConfig 53 $ \d -> do
   alice <- allocateParty "alice"
   carol <- allocateParty "carol"
   let me = basic alice
-      both = [alice, carol]
   enter d alice "alice" 100.0
   d.fund alice 100.0
   before <- balancesOf d alice
   unless (depositsQueued d) do
-    refused "a deposit with an extra actor" =<< perform d both (Deposit 10.0 me me None)
-    refused "a mint with an extra actor" =<< perform d both (Mint 1.0 me me None)
+    refused "a deposit by another party" =<< perform d [carol] (Deposit 10.0 me me None)
+    refused "a mint by another party" =<< perform d [carol] (Mint 1.0 me me None)
   unless (redemptionsQueued d) do
-    refused "a redemption with an extra actor" =<< perform d both (Redeem 1.0 me me None)
-    refused "a withdrawal with an extra actor" =<< perform d both (Withdraw 1.0 me me None)
+    refused "a redemption by another party" =<< perform d [carol] (Redeem 1.0 me me None)
+    refused "a withdrawal by another party" =<< perform d [carol] (Withdraw 1.0 me me None)
   balancesOf d alice >>= (=== before)
 
 -- | An account with no owner is refused everywhere, and the deposit side's max methods are zero for it.

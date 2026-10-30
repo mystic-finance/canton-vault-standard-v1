@@ -19,7 +19,7 @@ properties =
   , ("maxLimitsAreExact", maxLimitsAreExact)
   , ("viewQuotesEveryPath", viewQuotesEveryPath)
   , ("slippageLimitsRefuseAndMoveNothing", slippageLimitsRefuseAndMoveNothing)
-  , ("actorsBeyondTheAccountAreRefused", actorsBeyondTheAccountAreRefused)
+  , ("actorsWithoutTheAccountAreRefused", actorsWithoutTheAccountAreRefused)
   , ("anAccountWithNoOwnerIsRefused", anAccountWithNoOwnerIsRefused)
   , ("aBasicAccountIsAccepted", aBasicAccountIsAccepted)
   , ("thePoolSitsInTheCustodianAccount", thePoolSitsInTheCustodianAccount)

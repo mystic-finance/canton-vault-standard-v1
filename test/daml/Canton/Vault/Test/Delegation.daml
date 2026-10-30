@@ -19,6 +19,7 @@ import Canton.Vault.Test.MockToken
 import Canton.Vault.Test.Periods
 import Canton.Vault.Test.QueuedDeposit qualified as Q
 import Canton.Vault.Test.QueuedRedeem qualified as R
+import Canton.Vault.Test.Reports (vaultReports)
 
 import Splice.Api.Token.MetadataV1
 import Splice.TokenStandard.Utils (basicAccount, toAnyContractId)
@@ -78,7 +79,7 @@ unitsOf party = do
 -- Tests
 ---------
 
--- | Bob deposits and redeems for Alice through the vault, paying himself as an ERC-4626 spender may, until each
+-- | Bob deposits and redeems for Alice through the vault, paying himself, until each
 -- allowance runs out across calls.
 aDelegateActsForTheOwnerWithinItsAllowances : Script ()
 aDelegateActsForTheOwnerWithinItsAllowances = script do
@@ -188,19 +189,19 @@ tryAlone f party auth = do
       attempt cmd = trySubmit (actAs party <> discloseMany ds) (() <$ cmd)
   sequence
     [ attempt $ exerciseCmd auth VaultDelegateAuth_Deposit with
-        vaultCid = f.vaultCid; assets = 1.0; sender = me; receiver = me; minSharesOut = None; extraArgs = args
+        vaultCid = f.vaultCid; assets = 1.0; sender = me; receiver = me; minSharesOut = None; actors = [party]; extraArgs = args
     , attempt $ exerciseCmd auth VaultDelegateAuth_Mint with
-        vaultCid = f.vaultCid; shares = 1.0; sender = me; receiver = me; maxAssetsIn = None; extraArgs = args
+        vaultCid = f.vaultCid; shares = 1.0; sender = me; receiver = me; maxAssetsIn = None; actors = [party]; extraArgs = args
     , attempt $ exerciseCmd auth VaultDelegateAuth_Withdraw with
-        vaultCid = f.vaultCid; assets = 1.0; from = me; receiver = me; maxSharesIn = None; extraArgs = args
+        vaultCid = f.vaultCid; assets = 1.0; from = me; receiver = me; maxSharesIn = None; actors = [party]; extraArgs = args
     , attempt $ exerciseCmd auth VaultDelegateAuth_Redeem with
-        vaultCid = f.vaultCid; shares = 1.0; from = me; receiver = me; minAssetsOut = None; extraArgs = args
+        vaultCid = f.vaultCid; shares = 1.0; from = me; receiver = me; minAssetsOut = None; actors = [party]; extraArgs = args
     , attempt $ exerciseCmd auth VaultDelegateAuth_RequestDeposit with
         vaultCid = coerceContractId f.vaultCid; label = "x"; assets = 1.0; sender = me; receiver = me
-        minSharesOut = None; extraArgs = args
+        minSharesOut = None; actors = [party]; extraArgs = args
     , attempt $ exerciseCmd auth VaultDelegateAuth_RequestRedeem with
         vaultCid = coerceContractId f.vaultCid; label = "x"; shares = 1.0; from = me; receiver = me
-        minAssetsOut = None; extraArgs = args ]
+        minAssetsOut = None; actors = [party]; extraArgs = args ]
 
 -- | Without the registrar, the delegate cannot use the authorization: a vault of its own, which the registrar did not
 -- sign, has only the delegate's authority.
@@ -220,6 +221,38 @@ theRegistrarAloneCannotUseTheAuthorization = script do
   auth <- authorize f.alice bob f.registrar "reference-1" (Some 100.0) (Some 100.0) (days 1)
   tries <- tryAlone f f.registrar auth
   forA_ tries (failsWith "requires authorizers")
+
+-- | A delegate the vault itself signs for, such as its registrar, still acts only when it is among the callers: anyone
+-- else naming the authorization is refused.
+onlyTheDelegateCallingUsesTheAuthorization : Script ()
+onlyTheDelegateCallingUsesTheAuthorization = script do
+  f <- setupVault
+  mallory <- allocateParty "mallory"
+  auth <- authorize f.alice f.registrar f.registrar "reference-1" (Some 100.0) None (days 1)
+  authD <- fromSome <$> queryDisclosure f.alice auth
+  funds <- fund f f.alice 10.0
+  fundsD <- fromSome <$> queryDisclosure f.alice (fromInterfaceContractId @MockHolding funds)
+  ds <- vaultDisclosure f
+  failsWith "the delegate is not among the actors" =<< trySubmit (actAs mallory <> discloseMany (authD :: fundsD :: ds)) do
+    exerciseCmd f.vaultCid Vault_Deposit with
+      sender = basicAccount f.alice; assets = 10.0; receiver = basicAccount f.alice; minSharesOut = None
+      actors = [mallory]; extraArgs = under auth (depositArgs f [funds])
+
+-- | A delegated action's event names the delegate among its actors, and the delegate sees it.
+aDelegatedEventNamesTheDelegate : Script ()
+aDelegatedEventNamesTheDelegate = script do
+  f <- setupVault
+  bob <- allocateParty "bob"
+  auth <- authorize f.alice bob f.registrar "reference-1" (Some 100.0) None (days 1)
+  funds <- fund f f.alice 10.0
+  fundsD <- fromSome <$> queryDisclosure f.alice (fromInterfaceContractId @MockHolding funds)
+  ds <- vaultDisclosure f
+  tree <- submitTree (actAs bob <> discloseMany (fundsD :: ds)) do
+    exerciseCmd f.vaultCid Vault_Deposit with
+      sender = basicAccount f.alice; assets = 10.0; receiver = basicAccount f.alice; minSharesOut = None
+      actors = [bob]; extraArgs = under auth (depositArgs f [funds])
+  [r] <- pure (vaultReports tree)
+  (r.actors, bob `elem` r.observers) === ([f.alice, bob], True)
 
 -- | A delegate queues a deposit as the owner's own request, spending the allowance as it requests.
 aDelegateQueuesADepositForTheOwner : Script ()

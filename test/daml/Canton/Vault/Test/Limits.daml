@@ -77,9 +77,18 @@ aRollWithinTheLimitsNeedsOnlyTheRegistrar : Script ()
 aRollWithinTheLimitsNeedsOnlyTheRegistrar = script do
   f <- setupLimited
   _ <- fund f f.custodian 0.00001
+  passTime (hours 1)
   Right rolled <- openAs [f.registrar] =<< closeForRoll f f.vaultTemplateCid
   Some vault <- queryContractId f.registrar rolled
   vault.totalAssets === 100.00001
+
+-- | A rise is allowed pro rata for the time the period ran, not the time it was declared for, so a period closed at
+-- once allows none.
+aRiseIsMeasuredOverTheTimeThePeriodRan : Script ()
+aRiseIsMeasuredOverTheTimeThePeriodRan = script do
+  f <- setupLimited
+  _ <- fund f f.custodian 0.00001
+  failsWith "the price rises within the vault's limit" =<< openAs [f.registrar] =<< closeForRoll f f.vaultTemplateCid
 
 -- | A 10% rise in an hour is far beyond 10% a year, so the registrar alone cannot roll it.
 aRiseBeyondTheLimitIsRefused : Script ()
