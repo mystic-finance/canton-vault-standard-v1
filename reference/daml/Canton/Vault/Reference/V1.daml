@@ -507,12 +507,14 @@ recordFlow vault assetsDelta sharesDelta = do
     sharesDelta
   pure ()
 
--- | Sums the pool from holdings the custodian owns, so none can be invented.
+-- | Sums the pool from holdings the custodian owns and its registry issued, so none can be invented.
 sumPool : ReferenceVault -> [ContractId V2.Holding] -> Update Decimal
 sumPool vault holdingCids = do
   require "pool holdings are distinct" (length (dedup holdingCids) == length holdingCids)
   amounts <- forA holdingCids $ \cid -> do
-    holding <- view <$> fetch cid
+    held <- fetch cid
+    require "pool holding is signed by its registry" (vault.underlyingInstrument.admin `elem` signatory held)
+    let holding = view held
     require' ("holding.instrumentId", holding.instrumentId)
       isEqualR ("underlyingInstrument", vault.underlyingInstrument)
     require' ("holding.account", holding.account)

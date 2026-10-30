@@ -589,6 +589,39 @@ rollRejectsPoolHoldingsOutsideTheCustodianAccount = script do
       evidence = PoolHoldings (map (toInterfaceContractId . fst) pool <> [outside])
       validUntil = addRelTime now (hours 2)
 
+-- | A holding its registry never issued, claiming the custodian's account, is not the pool.
+rollRejectsAHoldingItsRegistryDidNotSign : Script ()
+rollRejectsAHoldingItsRegistryDidNotSign = script do
+  f <- setupVault
+  _ <- deposit f f.vaultTemplateCid f.alice 100.0
+  pool <- query @MockHolding f.custodian
+  ds <- poolDisclosures f
+  mallory <- allocateParty "mallory"
+  (_, sample) :: _ <- pure pool
+  forged <- submit mallory $ createCmd ForgedHolding with
+    forger = mallory; holding = (sample.holding with amount = 1000000.0); observers = [f.registrar, f.custodian]
+  flows <- query @PeriodFlow f.registrar
+  now <- getTime
+  closed <- closePeriod f f.vaultTemplateCid
+  failsWith "pool holding is signed by its registry" =<< trySubmit (actAs f.registrar <> discloseMany ds) do
+    exerciseCmd closed ClosedPeriod_Open with
+      flowCids = map fst flows
+      evidence = PoolHoldings (map (toInterfaceContractId . fst) pool <> [toInterfaceContractId forged])
+      validUntil = addRelTime now (hours 2)
+
+-- | A holding anyone can create, claiming whatever account and amount it likes.
+template ForgedHolding
+  with
+    forger : Party
+    holding : V2.HoldingView
+    observers : [Party]
+  where
+    signatory forger
+    observer observers
+
+    interface instance V2.Holding for ForgedHolding where
+      view = holding
+
 -- | The owner's other account is not the one being redeemed; only the guard refuses it.
 burningFromAnotherAccountIsRejected : Script ()
 burningFromAnotherAccountIsRejected = script do
