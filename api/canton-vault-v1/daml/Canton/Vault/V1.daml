@@ -91,10 +91,12 @@ data VaultView = VaultView with
       -- `rateValidFrom`, counting only assets that belong to this vault.
     virtualShares : Decimal
       -- ^ The shares the vault counts on top of `totalShares` when it prices,
-      -- so that the first deposit cannot set the price; zero for none.
+      -- so a donation cannot profitably inflate the price against the next
+      -- depositor. MUST be `0.0000000001` times `10^k`, for a whole `k` of the
+      -- vault's choosing, `0` by default.
     virtualAssets : Decimal
-      -- ^ The assets the vault counts on top of `totalAssets` when it prices;
-      -- zero for none.
+      -- ^ The assets the vault counts on top of `totalAssets` when it prices.
+      -- MUST be `0.0000000001`, the smallest amount a `Decimal` holds.
     rate : Rate
       -- ^ The share price, fixed for the period below. A rate with an accrual
       -- still moves within the period, but its parameters do not.

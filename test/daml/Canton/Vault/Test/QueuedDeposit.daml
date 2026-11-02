@@ -1005,10 +1005,26 @@ emptyFulfilmentIsRefused = script do
 -- Dust
 --------
 
--- | The vault after a roll that finds a unit of yield in the pool, so a share costs two units.
+-- | The vault with `n` shares outstanding, held by another party, against `n` of the underlying in the pool.
+seeded : Env -> Decimal -> Script Env
+seeded env n = do
+  now <- current env
+  Some vault <- queryContractId env.registrar now.vaultCid
+  holder <- allocateParty "seed"
+  vaultCid <- submit (actAs [env.registrar, env.custodian]) $
+    archiveCmd now.vaultCid *> createCmd vault with totalShares = vault.totalShares + n; totalAssets = vault.totalAssets + n
+  _ <- usdOf env env.custodian n
+  _ <- submit (actAs [holder, env.registrar]) do
+    createCmd Token with
+      holding = V2.HoldingView with
+        account = basicAccount holder; instrumentId = sharesId env; amount = n; lock = None; meta = emptyMetadata
+  pure env with vaultCid
+
+-- | The vault after a roll that finds as much yield in the pool as it held, so a share costs two units.
 withYield : Env -> Script Env
 withYield env = do
-  _ <- usdOf env env.custodian 1.0
+  env <- seeded env 100.0
+  _ <- usdOf env env.custodian 100.0
   closeQueued env >>= openQueued env
 
 -- | A deposit worth no share at the current rate is refused when requested.
@@ -1206,10 +1222,11 @@ requestsFromOnePeriodShareOnePrice = script do
   bob <- allocateParty "bob"
   (_, a) <- queueRequest env env.alice "a" 100.0
   (_, b) <- queueRequest env bob "b" 50.0
-  moveUsdPool env 1.0
+  env <- seeded env 100.0
+  moveUsdPool env 100.0
   next <- nextPeriod env
   Right () <- fulfilNow next env.venue [a]
-  moveUsdPool env 10.0
+  moveUsdPool env 1000.0
   Right () <- fulfilNow next env.venue [b]
   tokens env (sharesId env) env.alice >>= (=== 50.0)
   tokens env (sharesId env) bob >>= (=== 25.0)
@@ -1225,7 +1242,7 @@ withAPendingDeposit = do
   pure (next, r1)
 
 -- | Bob holds 100 shares of a vault worth 100, Alice requests 100 at that rate, and the pool doubles before her period
--- closes. She takes the risen rate, 100 × 101 / 201 with the virtual offset, and Bob keeps the rise.
+-- closes. She takes the risen rate, 50 shares, and Bob keeps the rise.
 theRequesterBearsARiseBeforeTheirPeriodCloses : Script ()
 theRequesterBearsARiseBeforeTheirPeriodCloses = script do
   env <- setup
@@ -1239,14 +1256,14 @@ theRequesterBearsARiseBeforeTheirPeriodCloses = script do
   Right () <- fulfilNow next env.venue [r1]
   counted <- nextPeriod next
   Some vault <- queryContractId env.registrar counted.vaultCid
-  tokens env (sharesId env) env.alice >>= (=== 50.2487562189)
-  (vault.totalShares, vault.totalAssets) === (150.2487562189, 300.0)
+  tokens env (sharesId env) env.alice >>= (=== 50.0)
+  (vault.totalShares, vault.totalAssets) === (150.0, 300.0)
 
 -- | Filled a period late after the price rose, a deposit gets the current price, not the cheaper struck one.
 aLateFillAfterARiseGetsTheCurrentPrice : Script ()
 aLateFillAfterARiseGetsTheCurrentPrice = script do
   (env, r1) <- withAPendingDeposit
-  moveUsdPool env 101.0
+  moveUsdPool env 100.0
   late <- nextPeriod env
   Right () <- fulfilNow late env.venue [r1]
   tokens env (sharesId env) env.alice >>= (=== 125.0)
@@ -1289,7 +1306,8 @@ aRequestBelowItsMinimumIsNotFilled = script do
     requestFor env env.alice env.alice label 100.0 (Some minimum)
   high <- requestOf env env.alice "high"
   low <- requestOf env env.alice "low"
-  moveUsdPool env 1.0
+  env <- seeded env 100.0
+  moveUsdPool env 100.0
   next <- nextPeriod env
   failsWith "VAULT_SLIPPAGE_EXCEEDED: request high" =<< fulfilNow next env.venue [high, low]
   Right () <- fulfilNow next env.venue [low]

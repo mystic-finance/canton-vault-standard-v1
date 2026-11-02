@@ -344,6 +344,22 @@ actionsMoveTheAccountsNamed h = withHistory h plainConfig 61 $ \d -> if not (dep
           holdingOf alice v.underlyingInstrument payout >>= (=== before + out.assets)
 
 -- | A deposit or mint that would issue no shares fails.
+-- | Whether a number is a whole power of ten.
+powerOfTen : Decimal -> Bool
+powerOfTen x = x == 1.0 || (x >= 10.0 && powerOfTen (x / 10.0))
+
+-- | The view's virtual offset is the smallest amount of assets, and of shares times a power of ten.
+theVirtualOffsetIsTheSmallestUnit : Harness -> Script ()
+theVirtualOffsetIsTheSmallestUnit h = do
+  found <- h.deploy plainConfig
+  case found of
+    None -> skip (h.name <> " offers no plain vault")
+    Some d -> do
+      v <- viewOf d
+      v.virtualAssets === 0.0000000001
+      assertMsg ("virtualShares " <> show v.virtualShares <> " is not 0.0000000001 times a power of ten")
+        (powerOfTen (v.virtualShares / 0.0000000001))
+
 nothingIsIssuedForNothing : Harness -> Script ()
 nothingIsIssuedForNothing h = do
   found <- h.deploy plainConfig

@@ -24,6 +24,7 @@ properties =
   , ("aBasicAccountIsAccepted", aBasicAccountIsAccepted)
   , ("thePoolSitsInTheCustodianAccount", thePoolSitsInTheCustodianAccount)
   , ("actionsMoveTheAccountsNamed", actionsMoveTheAccountsNamed)
+  , ("theVirtualOffsetIsTheSmallestUnit", theVirtualOffsetIsTheSmallestUnit)
   , ("nothingIsIssuedForNothing", nothingIsIssuedForNothing)
   , ("actionsFailWhenThePeriodEnds", actionsFailWhenThePeriodEnds)
   , ("publicReadsServeTheView", publicReadsServeTheView)

@@ -38,9 +38,10 @@ accrue accrual assets asOf now =
       Some (AccrualSimple with ratePerSecond) -> assets * (1.0 + ratePerSecond * dt)
       Some (AccrualCompounding with ratePerSecond) -> assets * exp (ratePerSecond * dt)
 
--- | One share and one asset of offset, so the first deposit cannot set an arbitrary price.
+-- | The smallest amount of shares and of assets, counted on top of the totals so a donation cannot profitably inflate
+-- the price.
 virtualOffset : Decimal
-virtualOffset = 1.0
+virtualOffset = 0.0000000001
 
 -- | The price of one share, with the virtual offset.
 sharePrice : Decimal -> Decimal -> Decimal

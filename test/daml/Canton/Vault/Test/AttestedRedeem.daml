@@ -141,7 +141,7 @@ dustPartIsNotFilled = script do
 -- after a rise as after a fall.
 theRestTakesThePriceOfThePeriodThatFillsIt : Script ()
 theRestTakesThePriceOfThePeriodThatFillsIt = script do
-  forA_ [(1.1, 66.0), (0.9, 54.0)] $ \(price, paid) -> do
+  forA_ [(1.1, 65.9999999999), (0.9, 53.9999999999)] $ \(price, paid) -> do
     (env, oracle, rest) <- partlyFilled
     _ <- holdingOf env.custodian env.usd.admin (usdId env) 10.0
     Right env <- rollAt env oracle price [(1, 1.0)]
@@ -158,7 +158,7 @@ aFirstFillIsPricedFromTheFirstAllottingPeriod = script do
   Right env <- rollAt env oracle 1.0 []
   Right env <- rollAt env oracle 1.1 [(1, 1.0)]
   Right tree <- fillTree env [req]
-  reported tree === [Withdrew with assets = 110.0; shares = 100.0; fromRequest = Some (RequestRef 1 "r1")]
+  reported tree === [Withdrew with assets = 109.9999999999; shares = 100.0; fromRequest = Some (RequestRef 1 "r1")]
 
   (env, oracle) <- setupOracle
   _ <- holdingOf env.custodian env.usd.admin (usdId env) 10.0

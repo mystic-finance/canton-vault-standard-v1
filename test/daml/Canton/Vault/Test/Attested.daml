@@ -75,8 +75,8 @@ attestedRollPricesTheVault = script do
     asOf = vault.rateValidFrom; accrual = None
     inputs = [PriceInput with authority = oracle; subject = "reference-1"; effectiveAt = now; attestationId = "nav-1"]
   v.totalShares === 100.0
-  v.totalAssets === 150.5
-  (v.virtualShares, v.virtualAssets) === (1.0, 1.0)
+  v.totalAssets === 150.0
+  (v.virtualShares, v.virtualAssets) === (0.0000000001, 0.0000000001)
 
 -- | Reads the vault's on-ledger conversions, which only its stakeholders can call.
 template ConvertProbe
@@ -120,7 +120,7 @@ instantRedemptionsArePaidWhileThePoolLasts = script do
   now <- getTime
   Right rolled <- rollAttested f f.vaultTemplateCid =<< attest f oracle 1.5 now "nav-1"
   Right first <- redeemFrom f rolled 50.0
-  first.assets === 75.0
+  first.assets === 74.9999999999
   failsWith "'available' is less than 'transfer.amount'" =<< redeemFrom f rolled 50.0
 
 -- | Reads exit limits with the registrar's and custodian's authority, which the shares and the pool need.
@@ -163,7 +163,7 @@ maxExitsAreWhatThePoolCanPay = script do
   (withdrawMax, redeemMax) === (100.0, 66.6666666666)
   failsWith "'available' is less than 'transfer.amount'" =<< redeemFrom f rolled 100.0
   Right redeemed <- redeemFrom f rolled redeemMax
-  redeemed.assets === 99.9999999999
+  redeemed.assets === 99.9999999998
 
 attestationFromAnotherPartyIsRefused : Script ()
 attestationFromAnotherPartyIsRefused = script do
@@ -258,6 +258,7 @@ evidenceMustMatchThePricing = script do
 attestedPriceStaysWithinLimits : Script ()
 attestedPriceStaysWithinLimits = script do
   (f, oracle) <- setupOracleVault
+  _ <- deposit f f.vaultTemplateCid f.alice 100.0
   limited <- submit (actAs [f.registrar, f.custodian]) do
     exerciseCmd f.vaultTemplateCid ReferenceVault_SetPriceLimits with limits = lidoLimits
   now <- getTime

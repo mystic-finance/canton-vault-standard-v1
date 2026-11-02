@@ -28,9 +28,9 @@ poolKey = "minimal-vault/pool"
 ulp : Decimal
 ulp = 0.0000000001
 
--- | One share and one unit of the underlying, so the first deposit can't set the price.
+-- | The smallest amount of shares and of the underlying, counted on top of the totals.
 offset : Decimal
-offset = 1.0
+offset = 0.0000000001
 
 roundDown, roundUp : Decimal -> Decimal -> Decimal -> Decimal
 roundDown a b c = let p = N.mul @20 a b; q = N.div @10 p c in if N.mul @20 q c > p then q - ulp else q

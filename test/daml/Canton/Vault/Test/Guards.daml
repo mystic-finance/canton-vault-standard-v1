@@ -82,19 +82,21 @@ aFlowLeftOutOfARollCountsInTheNext : Script ()
 aFlowLeftOutOfARollCountsInTheNext = script do
   f <- setupVault
   _ <- deposit f f.vaultTemplateCid f.alice 100.0
+  counted <- rollPeriod f f.vaultTemplateCid
+  _ <- deposit f counted f.alice 100.0
   stale <- query @PeriodFlow f.registrar
   pool <- query @MockHolding f.custodian
   ds <- poolDisclosures f
   passTime (seconds 1)
   now <- getTime
-  closed4 <- closePeriod f f.vaultTemplateCid
+  closed4 <- closePeriod f counted
   rolled <- submit (actAs f.registrar <> discloseMany ds) do
     exerciseCmd closed4 ClosedPeriod_Open with
       flowCids = []
       evidence = PoolHoldings (map (toInterfaceContractId . fst) pool)
       validUntil = addRelTime now (hours 2)
   Some missed <- queryContractId f.registrar rolled
-  missed.totalShares === 0.0
+  missed.totalShares === 100.0
 
   closed5 <- closePeriod f rolled
   caught <- submit (actAs f.registrar <> discloseMany ds) do
@@ -103,7 +105,7 @@ aFlowLeftOutOfARollCountsInTheNext = script do
       evidence = PoolHoldings (map (toInterfaceContractId . fst) pool)
       validUntil = addRelTime now (hours 3)
   Some vault <- queryContractId f.registrar caught
-  vault.totalShares === 100.0
+  vault.totalShares === 200.0
 
 -- | A period must end in the future, or the vault opens already closed.
 rollRejectsAPeriodEndingInThePast : Script ()

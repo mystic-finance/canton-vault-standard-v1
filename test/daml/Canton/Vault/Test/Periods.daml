@@ -30,6 +30,20 @@ rollPeriod f vaultCid = do
       evidence = PoolHoldings (map (toInterfaceContractId . fst) pool)
       validUntil = addRelTime now (hours 2)
 
+-- | Roll the period as `rollPeriod` does, with the custodian agreeing to a price beyond the vault's limits.
+rollPeriodBeyondLimits : Fixture -> ContractId ReferenceVault -> Script (ContractId ReferenceVault)
+rollPeriodBeyondLimits f vaultCid = do
+  flows <- query @PeriodFlow f.registrar
+  pool <- query @MockHolding f.custodian
+  ds <- poolDisclosures f
+  now <- getTime
+  closed <- closePeriod f vaultCid
+  submit (actAs [f.registrar, f.custodian] <> discloseMany ds) do
+    exerciseCmd closed ClosedPeriod_OpenBeyondLimits with
+      flowCids = map fst flows
+      evidence = PoolHoldings (map (toInterfaceContractId . fst) pool)
+      validUntil = addRelTime now (hours 2)
+
 -- | The custodian's pool holdings, disclosed.
 poolDisclosures : Fixture -> Script [Disclosure]
 poolDisclosures f = do
