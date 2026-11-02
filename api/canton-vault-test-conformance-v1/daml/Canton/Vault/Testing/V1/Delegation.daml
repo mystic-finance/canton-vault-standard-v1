@@ -1,0 +1,48 @@
+-- | `VaultDelegateAuth` against the vault under test, which honours it as the `Vault` interface requires.
+module Canton.Vault.Testing.V1.Delegation where
+
+import DA.Assert ((===))
+import DA.TextMap qualified as TextMap
+import DA.Time (addRelTime, days)
+import Daml.Script
+
+import Splice.Api.Token.MetadataV1
+
+import Canton.Vault.V1
+import Canton.Vault.Delegation.V1
+import Canton.Vault.Testing.V1.Flow
+import Canton.Vault.Testing.V1.Harness
+import Canton.Vault.Testing.V1.Read
+
+-- | A delegate deposits for the owner through the vault within the allowance, which the deposit spends; past it, it is
+-- refused.
+delegatesActWithinTheirAllowance : Harness -> Script ()
+delegatesActWithinTheirAllowance h = do
+  found <- h.deploy plainConfig
+  case found of
+    None -> skip (h.name <> " offers no plain vault")
+    Some d -> if not (depositsByVault d) then skip "no deposit through the vault" else do
+      alice <- allocateParty "alice"
+      bob <- allocateParty "bob"
+      let me = basic alice
+      v <- viewOf d
+      now <- getTime
+      auth <- submit alice $ createCmd VaultDelegateAuth with
+        owner = alice; delegate = bob; vaultRegistrar = v.vaultRegistrar; vaultId = v.vaultId
+        depositAllowance = Some 100.0; redeemAllowance = None; expiresAt = addRelTime now (days 1); meta = emptyMetadata
+      d.fund alice 200.0
+      let depositFor auth assets = do
+            ctx <- d.entry me
+            vaultCid <- d.vault
+            let named = ctx.extraArgs.context.values
+                extraArgs = ctx.extraArgs with
+                  context = ctx.extraArgs.context with
+                    values = TextMap.insert delegationKey (AV_ContractId (coerceContractId auth)) named
+            trySubmit (actAs bob <> discloseMany ctx.disclosures) do
+              exerciseCmd vaultCid Vault_Deposit with
+                assets; sender = me; receiver = me; minSharesOut = None; actors = [bob]; extraArgs
+      result <- succeeded "a delegated deposit" =<< depositFor auth 60.0
+      result.assets === 60.0
+      [(auth, left)] <- query @VaultDelegateAuth alice
+      left.depositAllowance === Some 40.0
+      refused "a delegated deposit past the allowance" =<< depositFor auth 50.0

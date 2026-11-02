@@ -1,0 +1,147 @@
+-- | Acting on a vault as a wallet does: instant actions, and queued requests
+-- funded through the allocation requests the vault publishes.
+module Canton.Vault.Testing.V1.Flow where
+
+import DA.Foldable (forA_)
+import DA.List (sort)
+import DA.Optional (isSome)
+import Daml.Script
+
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.HoldingV2
+import Splice.Api.Token.AllocationRequestV2
+
+import Canton.Vault.V1
+import Canton.Vault.AsyncDeposit.V1
+import Canton.Vault.AsyncRedeem.V1
+import Canton.Vault.Testing.V1.Harness
+import Canton.Vault.Testing.V1.Read
+
+-- | An instant action, with the accounts it moves and the caller's limit.
+data Step
+  = Deposit with assets : Decimal; sender : Account; receiver : Account; limit : Optional Decimal
+  | Mint with shares : Decimal; sender : Account; receiver : Account; limit : Optional Decimal
+  | Withdraw with assets : Decimal; owner : Account; receiver : Account; limit : Optional Decimal
+  | Redeem with shares : Decimal; owner : Account; receiver : Account; limit : Optional Decimal
+  deriving (Eq, Show)
+
+contextFor : Deployment -> Step -> Script Prepared
+contextFor d = \case
+  Deposit {sender} -> d.entry sender
+  Mint {sender} -> d.entry sender
+  Withdraw {owner} -> d.exit owner
+  Redeem {owner} -> d.exit owner
+
+command : ContractId Vault -> [Party] -> ExtraArgs -> Step -> Commands VaultActionResult
+command v actors extraArgs = \case
+  Deposit {..} -> exerciseCmd v Vault_Deposit with assets; sender; receiver; minSharesOut = limit; actors; extraArgs
+  Mint {..} -> exerciseCmd v Vault_Mint with shares; sender; receiver; maxAssetsIn = limit; actors; extraArgs
+  Withdraw {..} -> exerciseCmd v Vault_Withdraw with assets; owner; receiver; maxSharesIn = limit; actors; extraArgs
+  Redeem {..} -> exerciseCmd v Vault_Redeem with shares; owner; receiver; minAssetsOut = limit; actors; extraArgs
+
+perform : Deployment -> [Party] -> Step -> Script (Either SubmitError VaultActionResult)
+perform d actors action = do
+  p <- contextFor d action
+  v <- d.vault
+  trySubmit (actAs actors <> discloseMany p.disclosures) (command v actors p.extraArgs action)
+
+performTree : Deployment -> [Party] -> Step -> Script (Either SubmitError (VaultActionResult, TransactionTree))
+performTree d actors action = do
+  p <- contextFor d action
+  v <- d.vault
+  trySubmitResultAndTree (actAs actors <> discloseMany p.disclosures) (command v actors p.extraArgs action)
+
+-- | Whether the suite can complete a deposit through the vault itself.
+depositsByVault : Deployment -> Bool
+depositsByVault d = not (depositsQueued d) && not (isSome d.issue)
+
+depositsQueued, redemptionsQueued : Deployment -> Bool
+depositsQueued d = optional False (.deposits) d.queue
+redemptionsQueued d = optional False (.redemptions) d.queue
+
+-- | A request and the allocation requests the vault published for it.
+data Requested = Requested with
+    requester : Party
+    label : Text
+    requestId : RequestId
+    allocationRequests : [(ContractId AllocationRequest, AllocationRequestView)]
+    trees : [TransactionTree]
+
+-- | The allocation requests the party sees that `act` created.
+publishedBy : Party -> Script a -> Script (a, [(ContractId AllocationRequest, AllocationRequestView)])
+publishedBy party act = do
+  before <- map fst <$> queryInterface @AllocationRequest party
+  x <- act
+  after <- queryInterface @AllocationRequest party
+  pure (x, [(cid, v) | (cid, Some v) <- after, cid `notElem` before])
+
+requestDeposit : Deployment -> Party -> Account -> Account -> Text -> Decimal -> Optional Decimal -> Script (Either SubmitError Requested)
+requestDeposit d party sender receiver label assets minSharesOut = do
+  p <- d.entry sender
+  v <- d.vault
+  (r, published) <- publishedBy party $ trySubmitResultAndTree (actAs party <> discloseMany p.disclosures) do
+    exerciseCmd (coerceContractId v : ContractId VaultAsyncDeposit) Vault_RequestDeposit with
+      label; assets; sender; receiver; minSharesOut; actors = [party]; extraArgs = p.extraArgs
+  pure $ (\(result, tree) -> Requested with requester = party; label; requestId = result.requestId; allocationRequests = published; trees = [tree]) <$> r
+
+requestRedeem : Deployment -> Party -> Account -> Account -> Text -> Decimal -> Optional Decimal -> Script (Either SubmitError Requested)
+requestRedeem d party owner receiver label shares minAssetsOut = do
+  p <- d.exit owner
+  v <- d.vault
+  (r, published) <- publishedBy party $ trySubmitResultAndTree (actAs party <> discloseMany p.disclosures) do
+    exerciseCmd (coerceContractId v : ContractId VaultAsyncRedeem) Vault_RequestRedeem with
+      label; shares; owner; receiver; minAssetsOut; actors = [party]; extraArgs = p.extraArgs
+  pure $ (\(result, tree) -> Requested with requester = party; label; requestId = result.requestId; allocationRequests = published; trees = [tree]) <$> r
+
+-- | Every allocation the request asks of its own parties, made as their wallets would, then accepted by the vault.
+fundRequest : Queue -> Requested -> Script [TransactionTree]
+fundRequest q r = do
+  allocations <- fmap concat $ forA r.allocationRequests $ \(_, v) ->
+    forA v.allocations $ \spec -> case spec.authorizer.owner of
+      Some owner -> q.allocate owner spec v.settlement
+      None -> abort "an allocation request names an account with no owner"
+  q.accept r.requester r.label allocations
+
+-- | Brings the party into the vault with `assets` of the underlying, through the queue if deposits are queued.
+enter : Deployment -> Party -> Text -> Decimal -> Script ()
+enter d party label assets = do
+  d.fund party assets
+  case d.queue of
+    Some q | q.deposits -> do
+      r <- succeeded "a deposit request" =<< requestDeposit d party (basic party) (basic party) label assets None
+      _ <- fundRequest q r
+      _ <- q.fill
+      pure ()
+    _ | Some issue <- d.issue -> issue party assets
+    _ -> do
+      _ <- succeeded "a deposit" =<< perform d [party] (Deposit with assets; sender = basic party; receiver = basic party; limit = None)
+      pure ()
+
+-- | The vault's async view for a queued direction.
+asyncViewOf : Deployment -> Bool -> Script AsyncView
+asyncViewOf d deposits = do
+  v <- d.vault
+  found <- if deposits
+    then queryInterfaceContractId d.reader (coerceContractId v : ContractId VaultAsyncDeposit)
+    else queryInterfaceContractId d.reader (coerceContractId v : ContractId VaultAsyncRedeem)
+  case found of
+    Some a -> pure a
+    None -> abort "the reader cannot see the vault's async view"
+
+-- | Queued underlying or shares under the id, by the vault's pending methods.
+pendingOf : Deployment -> Queue -> Bool -> RequestId -> Account -> Script Decimal
+pendingOf d q deposits rid account = do
+  p <- q.pending account
+  readVault d (if deposits then PendingDeposit rid account else PendingRedeem rid account) p.extraArgs
+
+sameParties : [Party] -> [Party] -> Bool
+sameParties a b = sort a == sort b
+
+-- | Every allocation request the party sees for the vault is gone.
+allGone : Party -> [ContractId AllocationRequest] -> Script Bool
+allGone party cids = do
+  found <- forA cids $ \cid -> queryInterfaceContractId party cid
+  pure (not (any isSome found))
+
+forEach_ : [a] -> (a -> Script ()) -> Script ()
+forEach_ = forA_

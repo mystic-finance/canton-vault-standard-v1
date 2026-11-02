@@ -1,0 +1,295 @@
+-- | The reference vaults under the conformance suite: one harness each for the instant, queued-deposit and
+-- queued-redemption vaults.
+module Canton.Vault.Test.ConformanceReference where
+
+import DA.Action (void)
+import DA.Foldable (forA_)
+import DA.List (head, (!!))
+import DA.Optional (fromSome)
+import DA.TextMap qualified as TextMap
+import Daml.Script
+
+import Canton.Vault.V1 (Vault)
+import Canton.Vault.Reference.Math (assetsToShares)
+import Canton.Vault.Reference.QueuedDeposit qualified as Q
+import Canton.Vault.Reference.QueuedRedeem qualified as R
+import Canton.Vault.Reference.Share
+import Canton.Vault.Reference.V1
+import Canton.Vault.Test.CrossAdminSettlement (Registry(..), tokenArgs)
+import Canton.Vault.Test.Deposit hiding (fund)
+import Canton.Vault.Test.Deposit qualified as D (fund)
+import Canton.Vault.Test.MockToken
+import Canton.Vault.Test.Periods (disclosuresFor, poolDisclosures, rollPeriod)
+import Canton.Vault.Test.QueuedDeposit qualified as QD
+import Canton.Vault.Test.QueuedRedeem qualified as QR
+import Canton.Vault.Testing.V1.Harness
+import Canton.Vault.Testing.V1.Suite qualified as Suite
+
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.HoldingV2 qualified as V2
+import Splice.Api.Token.AllocationV2 qualified as V2
+import Splice.TokenStandard.Utils (toAnyContractId)
+import Splice.Testing.Tokens.TestTokenV2.Holding (Token(..))
+
+-- Instant vault
+-----------------
+
+referenceInstant : Harness
+referenceInstant = Harness with
+  name = "the reference instant vault"
+  deploy = \config ->
+    if config.depositFeeBps /= config.mintFeeBps || config.withdrawFeeBps /= config.redeemFeeBps then pure None
+    else Some . instantDeployment <$> setupVaultFees config.depositFeeBps config.redeemFeeBps config.accrual config.depositCap
+
+currentReference : Fixture -> Script (ContractId ReferenceVault)
+currentReference f = do
+  vaults <- query @ReferenceVault f.registrar
+  pure (head [cid | (cid, v) <- vaults, v.vaultRegistrar == f.registrar, v.vaultId == "reference-1"])
+
+-- | The holdings of the instrument in the account, with their disclosures.
+mockHoldings : V2.InstrumentId -> V2.Account -> Script [(ContractId MockHolding, Disclosure)]
+mockHoldings instrument account = case account.owner of
+  None -> pure []
+  Some owner -> do
+    held <- query @MockHolding owner
+    forA [cid | (cid, h) <- held, h.holding.account == account, h.holding.instrumentId == instrument] $ \cid ->
+      (cid,) . fromSome <$> queryDisclosure owner cid
+
+shareHoldings : V2.InstrumentId -> V2.Account -> Script [(ContractId ShareHolding, Disclosure)]
+shareHoldings instrument account = case account.owner of
+  None -> pure []
+  Some owner -> do
+    held <- query @ShareHolding owner
+    forA [cid | (cid, t) <- held, t.holding.account == account, t.holding.instrumentId == instrument, t.holding.lock == None] $ \cid ->
+      (cid,) . fromSome <$> queryDisclosure owner cid
+
+instantDeployment : Fixture -> Deployment
+instantDeployment f = Deployment with
+  reader = f.registrar
+  vault = toInterfaceContractId <$> currentReference f
+  fund = \party amount -> void (D.fund f party amount)
+  entry = \account -> do
+    ds <- disclosuresFor f =<< currentReference f
+    funds <- mockHoldings f.underlying account
+    pure Prepared with
+      extraArgs = depositArgs f (map (toInterfaceContractId . fst) funds)
+      disclosures = ds <> map snd funds
+  exit = \account -> do
+    ds <- disclosuresFor f =<< currentReference f
+    pool <- query @MockHolding f.custodian
+    poolDs <- poolDisclosures f
+    held <- shareHoldings f.shares account
+    pure Prepared with
+      extraArgs = redeemArgs f (map (toInterfaceContractId . fst) pool) (map fst held)
+      disclosures = ds <> poolDs <> map snd held
+  nextPeriod = do
+    _ <- rollPeriod f =<< currentReference f
+    pure []
+  changeValue = Some $ \factor -> do
+    pool <- query @MockHolding f.custodian
+    let total = sum [h.holding.amount | (_, h) <- pool]
+    if factor == 1.0 then pure () else if factor > 1.0 then void (D.fund f f.custodian (total * (factor - 1.0))) else do
+      forA_ pool $ \(cid, _) -> submit (actAs [f.underlyingAdmin, f.custodian]) (archiveCmd cid)
+      void (D.fund f f.custodian (total * factor))
+  queue = None
+  issue = None
+
+-- Queued vaults
+-----------------
+
+-- | The unlocked test tokens of the instrument in the party's basic account.
+tokensOf : Party -> V2.InstrumentId -> Script [(ContractId Token, Decimal)]
+tokensOf party instrument = do
+  held <- query @Token party
+  pure [ (cid, t.holding.amount) | (cid, t) <- held, t.holding.instrumentId == instrument
+       , t.holding.account.owner == Some party, t.holding.lock == None ]
+
+disclosed : Party -> [ContractId Token] -> Script [Disclosure]
+disclosed party cids = forA cids $ \cid -> fromSome <$> queryDisclosure party cid
+
+-- | Scales the custodian's pool of test tokens.
+scaleTokens : Registry -> Party -> V2.InstrumentId -> Decimal -> Script ()
+scaleTokens usd custodian instrument factor = do
+  pool <- tokensOf custodian instrument
+  let total = sum (map snd pool)
+  if factor == 1.0 then pure () else if factor > 1.0 then void (QR.holdingOf custodian usd.admin instrument (total * (factor - 1.0))) else do
+    forA_ pool $ \(cid, _) -> submit (actAs [usd.admin, custodian]) (archiveCmd cid)
+    void (QR.holdingOf custodian usd.admin instrument (total * factor))
+
+-- | Makes an allocation as its authorizer's wallet would, through the registry its admin names.
+allocateOn : Registry -> Registry -> Party -> V2.AllocationSpecification -> V2.SettlementInfo -> Script (ContractId V2.Allocation)
+allocateOn usd shares party spec settlement = do
+  let registry = if spec.admin == usd.admin then usd else shares
+  inputs <- case spec.transferLegSides of
+    [] -> pure []
+    leg :: _ -> map (toInterfaceContractId . fst) <$> tokensOf party (V2.InstrumentId with admin = spec.admin; id = leg.instrumentId)
+  QD.allocateWith registry party spec settlement inputs
+
+-- | An instant exit's context on a test-token vault: the account's shares and the custodian's pool.
+tokenExit : Registry -> Registry -> Party -> V2.InstrumentId -> V2.InstrumentId -> Disclosure -> V2.Account -> Script Prepared
+tokenExit usd shares custodian underlying shareInstrument vd account = do
+  pool <- tokensOf custodian underlying
+  held <- case account.owner of
+    Some owner -> tokensOf owner shareInstrument
+    None -> pure []
+  poolDs <- disclosed custodian (map fst pool)
+  heldDs <- case account.owner of
+    Some owner -> disclosed owner (map fst held)
+    None -> pure []
+  let ids cids = AV_List [AV_ContractId (toAnyContractId c) | c <- cids]
+      args = tokenArgs usd
+  pure Prepared with
+    extraArgs = args with
+      context = ChoiceContext with
+        values = TextMap.union
+          (TextMap.fromList [(underlyingHoldingsKey, ids (map fst pool)), (shareHoldingsKey, ids (map fst held))])
+          args.context.values
+    disclosures = [vd, usd.disclosure, shares.disclosure] <> poolDs <> heldDs
+
+-- | A deposit's context on a test-token vault: the account's underlying.
+tokenEntry : Registry -> Registry -> V2.InstrumentId -> Disclosure -> V2.Account -> Script Prepared
+tokenEntry usd shares underlying vd account = do
+  funds <- case account.owner of
+    Some owner -> tokensOf owner underlying
+    None -> pure []
+  fundsDs <- case account.owner of
+    Some owner -> disclosed owner (map fst funds)
+    None -> pure []
+  let args = tokenArgs usd
+  pure Prepared with
+    extraArgs = args with
+      context = ChoiceContext with
+        values = TextMap.insert underlyingHoldingsKey (AV_List [AV_ContractId (toAnyContractId c) | (c, _) <- funds]) args.context.values
+    disclosures = [vd, usd.disclosure, shares.disclosure] <> fundsDs
+
+referenceQueuedDeposit : Harness
+referenceQueuedDeposit = Harness with
+  name = "the reference queued-deposit vault"
+  deploy = \config -> if config /= plainConfig then pure None else Some . queuedDepositDeployment <$> QD.setup
+
+queuedDepositDeployment : QD.Env -> Deployment
+queuedDepositDeployment env = Deployment with
+  reader = env.registrar
+  vault = (\e -> toInterfaceContractId @Vault e.vaultCid) <$> QD.current env
+  fund = \party amount -> void (QD.usdOf env party amount)
+  entry = \_ -> do
+    vd <- QD.vaultDisclosure env
+    pure Prepared with extraArgs = noContext; disclosures = [vd, env.usd.disclosure, env.shares.disclosure]
+  exit = \account -> do
+    vd <- QD.vaultDisclosure env
+    tokenExit env.usd env.shares env.custodian (QD.usdId env) (QD.sharesId env) vd account
+  nextPeriod = do
+    _ <- QD.nextPeriod env
+    pure []
+  changeValue = Some (scaleTokens env.usd env.custodian (QD.usdId env))
+  queue = Some Queue with
+    deposits = True
+    redemptions = False
+    allocate = allocateOn env.usd env.shares
+    accept = \requester label allocations -> do
+      (cid, _) <- QD.published env requester label
+      now <- QD.current env
+      vd <- QD.vaultDisclosure now
+      tree <- submitTree (actAs env.venue <> discloseMany [vd, env.usd.disclosure, env.shares.disclosure]) do
+        exerciseCmd now.vaultCid Q.ReferenceQueuedDepositVault_Bind with
+          requestCid = cid; underlyingAllocation = allocations !! 0; shareAllocation = allocations !! 1
+      pure [tree]
+    fill = do
+      live <- query @Q.QueuedDepositRequest env.registrar
+      let requests = [ QD.Req with requestCid = cid; underlyingAllocation = r.underlyingAllocation; shareAllocation = r.shareAllocation
+                     | (cid, r) <- live, r.vaultId == env.vaultId ]
+      if null requests then pure [] else do
+        ready <- QD.readyToFill env requests
+        filled <- forA requests $ \r -> QD.fulfilNowTree ready env.venue [r]
+        pure [t | Right t <- filled]
+    reject = Some $ \requester label -> do
+      request <- QD.requestOf env requester label
+      result <- QD.rejectTreeAs env env.venue [request] "conformance"
+      either (\e -> abort ("rejection failed: " <> show e)) (pure . pure) result
+    pending = \account -> do
+      live <- query @Q.QueuedDepositRequest env.registrar
+      pure Prepared with
+        extraArgs = QD.requestArgs [cid | (cid, r) <- live, r.vaultId == env.vaultId, r.sender == account]
+        disclosures = []
+  issue = None
+
+referenceQueuedRedeem : Harness
+referenceQueuedRedeem = Harness with
+  name = "the reference queued-redemption vault"
+  deploy = \config -> if config /= plainConfig then pure None else Some . queuedRedeemDeployment <$> QR.setup
+
+queuedRedeemDeployment : QR.Env -> Deployment
+queuedRedeemDeployment env = Deployment with
+  reader = env.registrar
+  vault = (\e -> toInterfaceContractId @Vault e.vaultCid) <$> QR.current env
+  fund = \party amount -> void (QR.holdingOf party env.usd.admin (QR.usdId env) amount)
+  entry = \account -> do
+    vd <- QR.vaultDisclosure env
+    tokenEntry env.usd env.shares (QR.usdId env) vd account
+  exit = \account -> do
+    vd <- QR.vaultDisclosure env
+    tokenExit env.usd env.shares env.custodian (QR.usdId env) (QR.sharesId env) vd account
+  nextPeriod = do
+    _ <- QR.nextPeriod env
+    pure []
+  changeValue = Some (scaleTokens env.usd env.custodian (QR.usdId env))
+  queue = Some Queue with
+    deposits = False
+    redemptions = True
+    allocate = allocateOn env.usd env.shares
+    accept = \requester label allocations -> do
+      (cid, _) <- QR.published env requester label
+      now <- QR.current env
+      vd <- QR.vaultDisclosure now
+      tree <- submitTree (actAs env.venue <> discloseMany [vd, env.usd.disclosure, env.shares.disclosure]) do
+        exerciseCmd now.vaultCid R.ReferenceQueuedRedeemVault_Bind with
+          requestCid = cid; shareAllocation = allocations !! 0; underlyingAllocation = allocations !! 1
+      pure [tree]
+    fill = do
+      live <- query @R.QueuedRedeemRequest env.registrar
+      let requests = [ QR.Req with requestCid = cid; shareAllocation = r.shareAllocation; underlyingAllocation = r.underlyingAllocation
+                     | (cid, r) <- live, r.vaultId == env.vaultId ]
+      if null requests then pure [] else do
+        ready <- QR.readyToFill env requests
+        filled <- forA requests $ \r -> QR.fulfilNowTree ready env.venue [r]
+        pure [t | Right t <- filled]
+    reject = Some $ \requester label -> do
+      request <- QR.requestOf env requester label
+      result <- QR.rejectTreeAs env env.venue [request] "conformance"
+      either (\e -> abort ("rejection failed: " <> show e)) (pure . pure) result
+    pending = \account -> do
+      live <- query @R.QueuedRedeemRequest env.registrar
+      pure Prepared with
+        extraArgs = QR.requestArgs [cid | (cid, r) <- live, r.vaultId == env.vaultId, r.sender == account]
+        disclosures = []
+  -- The test token needs the custodian's consent to receive, so the operator issues shares and books the flow.
+  issue = Some $ \party assets -> do
+    now <- QR.current env
+    Some vault <- queryContractId env.registrar now.vaultCid
+    let shares = assetsToShares vault.totalShares vault.totalAssets assets
+    _ <- submit env.registrar do
+      createCmd PeriodFlow with
+        vaultId = env.vaultId; vaultRegistrar = env.registrar; periodStart = vault.rateValidFrom
+        assetsDelta = assets; sharesDelta = shares
+    _ <- QR.holdingOf env.custodian env.usd.admin (QR.usdId env) assets
+    void (QR.holdingOf party env.registrar (QR.sharesId env) shares)
+
+noContext : ExtraArgs
+noContext = ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata
+
+-- The suite against each
+--------------------------
+
+instantVaultConforms : Script ()
+instantVaultConforms = Suite.conformance referenceInstant
+
+-- In two scripts: in one, the script service cancels the run for its size.
+queuedDepositVaultConforms, queuedDepositQueueConforms : Script ()
+queuedDepositVaultConforms = Suite.conformanceOf vaultProperties referenceQueuedDeposit
+queuedDepositQueueConforms = Suite.conformanceOf queueProperties referenceQueuedDeposit
+
+vaultProperties, queueProperties : [(Text, Harness -> Script ())]
+(vaultProperties, queueProperties) = break ((== "queuedDirectionsHaveNoInstantPath") . fst) Suite.properties
+
+queuedRedeemVaultConforms : Script ()
+queuedRedeemVaultConforms = Suite.conformance referenceQueuedRedeem

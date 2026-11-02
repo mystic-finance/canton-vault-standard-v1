@@ -1,0 +1,144 @@
+{-# LANGUAGE AllowAmbiguousTypes #-}
+
+-- | Reading a vault as a wallet does: its read methods on-ledger, holdings
+-- through the token standard, and events from transaction trees.
+module Canton.Vault.Testing.V1.Read where
+
+import DA.Foldable (forA_)
+import DA.Optional (optionalToList)
+import DA.Text qualified as T
+import Daml.Script
+
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.HoldingV2
+
+import Canton.Vault.V1
+import Canton.Vault.AsyncDeposit.V1
+import Canton.Vault.AsyncRedeem.V1
+import Canton.Vault.EventLog.V1
+import Canton.Vault.Testing.V1.Harness
+
+-- | One read method and its arguments.
+data Method
+  = ConvertToShares Decimal
+  | ConvertToAssets Decimal
+  | PreviewDeposit Decimal
+  | PreviewMint Decimal
+  | PreviewWithdraw Decimal
+  | PreviewRedeem Decimal
+  | MaxDeposit Account
+  | MaxMint Account
+  | MaxWithdraw Account
+  | MaxRedeem Account
+  | PendingDeposit with requestId : RequestId; account : Account
+  | PendingRedeem with requestId : RequestId; account : Account
+  deriving (Eq, Show, Serializable)
+
+-- | Reads a vault's methods with the authority of one of its stakeholders.
+template Reader
+  with
+    reader : Party
+  where
+    signatory reader
+
+    choice Reader_Read : Decimal
+      with
+        vaultCid : ContractId Vault
+        method : Method
+        extraArgs : ExtraArgs
+      controller reader
+      do
+        vault <- fetch vaultCid
+        case method of
+          ConvertToShares a -> convertToShares vault a
+          ConvertToAssets s -> convertToAssets vault s
+          PreviewDeposit a -> previewDeposit vault a
+          PreviewMint s -> previewMint vault s
+          PreviewWithdraw a -> previewWithdraw vault a
+          PreviewRedeem s -> previewRedeem vault s
+          MaxDeposit account -> maxDeposit vault account extraArgs
+          MaxMint account -> maxMint vault account extraArgs
+          MaxWithdraw account -> maxWithdraw vault account extraArgs
+          MaxRedeem account -> maxRedeem vault account extraArgs
+          PendingDeposit rid account -> do
+            queued <- fetch (coerceContractId vaultCid : ContractId VaultAsyncDeposit)
+            pendingDepositRequest queued rid account extraArgs
+          PendingRedeem rid account -> do
+            queued <- fetch (coerceContractId vaultCid : ContractId VaultAsyncRedeem)
+            pendingRedeemRequest queued rid account extraArgs
+
+noArgs : ExtraArgs
+noArgs = ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata
+
+tryRead : Deployment -> Method -> ExtraArgs -> Script (Either SubmitError Decimal)
+tryRead d method extraArgs = do
+  vaultCid <- d.vault
+  trySubmit (actAs d.reader) do
+    createAndExerciseCmd (Reader with reader = d.reader) Reader_Read with vaultCid; method; extraArgs
+
+readVault : Deployment -> Method -> ExtraArgs -> Script Decimal
+readVault d method extraArgs = tryRead d method extraArgs >>= \case
+  Right x -> pure x
+  Left e -> abort (show method <> " failed: " <> show e)
+
+-- | The vault's view, as its endpoint would serve it.
+viewOf : Deployment -> Script VaultView
+viewOf d = do
+  vaultCid <- d.vault
+  queryInterfaceContractId d.reader vaultCid >>= \case
+    Some v -> pure v
+    None -> abort "the reader cannot see the vault"
+
+basic : Party -> Account
+basic p = Account with owner = Some p; provider = None; id = ""
+
+-- | What the account holds of the instrument, locked or not.
+holdingOf : Party -> InstrumentId -> Account -> Script Decimal
+holdingOf viewer instrument account = do
+  held <- queryInterface @Holding viewer
+  pure (sum [h.amount | (_, Some h) <- held, h.instrumentId == instrument, h.account == account])
+
+-- | Every report of the vault's events in the trees.
+reportsIn : [TransactionTree] -> [VaultEventLog_Report]
+reportsIn = concatMap (\t -> concatMap reportsUnder t.rootEvents)
+
+reportsUnder : TreeEvent -> [VaultEventLog_Report]
+reportsUnder (CreatedEvent _) = []
+reportsUnder (ExercisedEvent e) =
+  optionalToList (fromAnyChoice @VaultEventLog @VaultEventLog_Report e.argument) <> concatMap reportsUnder e.childEvents
+
+-- | The events among the reports that the vault's registrar made for it.
+eventsOf : VaultView -> [VaultEventLog_Report] -> [VaultEvent]
+eventsOf v reports = [r.event | r <- reports, r.vaultRegistrar == v.vaultRegistrar, r.vaultId == v.vaultId]
+
+-- | The parties of an account: its owner and its provider.
+accountParties : Account -> [Party]
+accountParties a = optionalToList a.owner <> optionalToList a.provider
+
+-- | Each report is shown to the parties of both its accounts, and to its actors.
+shownToTheirParties : Text -> [VaultEventLog_Report] -> Script ()
+shownToTheirParties what reports = forA_ reports $ \r ->
+  forA_ (accountParties r.owner <> accountParties r.receiver <> r.actors) $ \p ->
+    assertMsg (what <> ": the event is shown to " <> show p) (p `elem` r.observers)
+
+-- | Fails unless the submission was refused.
+refused : Text -> Either SubmitError a -> Script ()
+refused what = \case
+  Left _ -> pure ()
+  Right _ -> abort (what <> ": accepted, though it should be refused")
+
+-- | Fails unless the submission was refused for a reason containing the text.
+refusedFor : Text -> Text -> Either SubmitError a -> Script ()
+refusedFor what reason = \case
+  Left e | reason `T.isInfixOf` show e -> pure ()
+  Left e -> abort (what <> ": refused for another reason than '" <> reason <> "': " <> show e)
+  Right _ -> abort (what <> ": accepted, though it should be refused")
+
+succeeded : Text -> Either SubmitError a -> Script a
+succeeded what = \case
+  Right x -> pure x
+  Left e -> abort (what <> " failed: " <> show e)
+
+-- | A property that doesn't apply to this vault.
+skip : Text -> Script ()
+skip why = debug ("skipped: " <> why)

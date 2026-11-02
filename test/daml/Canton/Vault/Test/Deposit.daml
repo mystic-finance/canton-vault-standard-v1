@@ -2,14 +2,17 @@
 module Canton.Vault.Test.Deposit where
 
 import DA.Assert ((===))
-import DA.Time (addRelTime, hours)
+import DA.Time (addRelTime, hours, seconds)
+import DA.Text qualified as T
 import DA.TextMap qualified as TextMap
 import Daml.Script
 
 import Canton.Vault.V1
+import Canton.Vault.EventLog.V1
 import Canton.Vault.Reference.V1
 import Canton.Vault.Reference.Share
 import Canton.Vault.Test.MockToken
+import Canton.Vault.Test.Reports
 
 import Splice.Api.Token.MetadataV1
 import Splice.Api.Token.HoldingV2 qualified as V2
@@ -68,7 +71,7 @@ setupVaultLimited limits depositFeeBps redeemFeeBps vaultAccrual cap = do
     createCmd ReferenceVault with
       vaultId = "reference-1"
       vaultRegistrar = registrar
-      custodian
+      custodian = basicAccount custodian
       underlyingInstrument = underlying
       shareInstrument = shares
       totalShares = 0.0
@@ -101,8 +104,11 @@ repin f factory factoryD = do
   pure f with vaultTemplateCid; vaultCid = toInterfaceContractId vaultTemplateCid; registryCid = factory
 
 -- | End the vault's period, so the next can be opened from its final flows.
+-- | Closes the period a second after it was last moved on, as some time always passes on a ledger.
 closePeriod : Fixture -> ContractId ReferenceVault -> Script (ContractId ClosedPeriod)
-closePeriod f vaultCid = submit f.registrar (exerciseCmd vaultCid ReferenceVault_ClosePeriod)
+closePeriod f vaultCid = do
+  passTime (seconds 1)
+  submit f.registrar (exerciseCmd vaultCid ReferenceVault_ClosePeriod)
 
 vaultDisclosure : Fixture -> Script [Disclosure]
 vaultDisclosure f = do
@@ -155,8 +161,9 @@ firstDepositMintsAtPar = script do
   disclosures <- vaultDisclosure f
   result <- submit (actAs f.alice <> discloseMany disclosures) do
     exerciseCmd f.vaultCid Vault_Deposit with
+      sender = basicAccount f.alice
       assets = 100.0
-      receiver = f.alice
+      receiver = basicAccount f.alice
       minSharesOut = Some 100.0
       actors = [f.alice]
       extraArgs = depositArgs f [holdingCid]
@@ -176,8 +183,9 @@ slippageLimitIsEnforced = script do
   disclosures <- vaultDisclosure f
   submitMustFail (actAs f.alice <> discloseMany disclosures) do
     exerciseCmd f.vaultCid Vault_Deposit with
+      sender = basicAccount f.alice
       assets = 100.0
-      receiver = f.alice
+      receiver = basicAccount f.alice
       minSharesOut = Some 101.0
       actors = [f.alice]
       extraArgs = depositArgs f [holdingCid]
@@ -191,8 +199,9 @@ redeemReturnsUnderlying = script do
   disclosures <- vaultDisclosure f
   depositResult <- submit (actAs f.alice <> discloseMany disclosures) do
     exerciseCmd f.vaultCid Vault_Deposit with
+      sender = basicAccount f.alice
       assets = 100.0
-      receiver = f.alice
+      receiver = basicAccount f.alice
       minSharesOut = None
       actors = [f.alice]
       extraArgs = depositArgs f [holdingCid]
@@ -210,8 +219,8 @@ redeemReturnsUnderlying = script do
   redeemResult <- submit (actAs f.alice <> discloseMany (disclosures <> poolDisclosures)) do
     exerciseCmd f.vaultCid Vault_Redeem with
       shares = 100.0
-      owner = f.alice
-      receiver = f.alice
+      owner = basicAccount f.alice
+      receiver = basicAccount f.alice
       minAssetsOut = Some 100.0
       actors = [f.alice]
       extraArgs = redeemArgs f custodianCids shareCids
@@ -230,8 +239,9 @@ redeemRequiresTheOwner = script do
 
   depositResult <- submit (actAs f.alice <> discloseMany disclosures) do
     exerciseCmd f.vaultCid Vault_Deposit with
+      sender = basicAccount f.alice
       assets = 100.0
-      receiver = f.alice
+      receiver = basicAccount f.alice
       minSharesOut = None
       actors = [f.alice]
       extraArgs = depositArgs f [holdingCid]
@@ -251,8 +261,8 @@ redeemRequiresTheOwner = script do
   submitMustFail (actAs mallory <> discloseMany (disclosures <> poolDisclosures <> shareDisclosures)) do
     exerciseCmd f.vaultCid Vault_Redeem with
       shares = 100.0
-      owner = f.alice
-      receiver = mallory
+      owner = basicAccount f.alice
+      receiver = basicAccount mallory
       minAssetsOut = None
       actors = [mallory]
       extraArgs = redeemArgs f
@@ -271,16 +281,18 @@ periodRollCarriesTotals = script do
 
   aliceResult <- submit (actAs f.alice <> discloseMany disclosures) do
     exerciseCmd f.vaultCid Vault_Deposit with
+      sender = basicAccount f.alice
       assets = 100.0
-      receiver = f.alice
+      receiver = basicAccount f.alice
       minSharesOut = None
       actors = [f.alice]
       extraArgs = depositArgs f [aliceFunds]
 
   bobResult <- submit (actAs bob <> discloseMany disclosures) do
     exerciseCmd f.vaultCid Vault_Deposit with
+      sender = basicAccount bob
       assets = 100.0
-      receiver = bob
+      receiver = basicAccount bob
       minSharesOut = None
       actors = [bob]
       extraArgs = depositArgs f [bobFunds]
@@ -324,8 +336,9 @@ rollRejectsWrongInstrument = script do
 
   _ <- submit (actAs f.alice <> discloseMany disclosures) do
     exerciseCmd f.vaultCid Vault_Deposit with
+      sender = basicAccount f.alice
       assets = 100.0
-      receiver = f.alice
+      receiver = basicAccount f.alice
       minSharesOut = None
       actors = [f.alice]
       extraArgs = depositArgs f [holdingCid]
@@ -350,7 +363,7 @@ rollRejectsWrongInstrument = script do
       evidence = PoolHoldings (map (toInterfaceContractId . fst) custodianHoldings)
       validUntil = addRelTime now (hours 2)
 
--- | An account's provider can fund a deposit alongside its owner.
+-- | An account's provider can fund a deposit alongside its owner, which is reported as the owner's.
 providerCanDepositForOwner : Script ()
 providerCanDepositForOwner = script do
   f <- setupVault
@@ -367,17 +380,19 @@ providerCanDepositForOwner = script do
         context = (depositArgs f [holdingCid]).context
         meta = accountToMeta "sender" account emptyMetadata
 
-  result <- submit (actAs [f.alice, provider] <> discloseMany disclosures) do
+  tree <- submitTree (actAs [f.alice, provider] <> discloseMany disclosures) do
     exerciseCmd f.vaultCid Vault_Deposit with
+      sender = account
       assets = 100.0
-      receiver = f.alice
+      receiver = basicAccount f.alice
       minSharesOut = None
       actors = [f.alice, provider]
       extraArgs = args
 
-  result.shares === 100.0
+  [(r.event, r.owner, r.actors) | r <- vaultReports tree]
+    === [((Deposited with assets = 100.0; shares = 100.0; fromRequest = None), account, [f.alice, provider])]
 
--- | The actors must be exactly the funding account's parties; only the vault's check refuses this.
+-- | The actors must include the funding account's parties; only the vault's check refuses this.
 actorsMustMatchTheFundingAccount : Script ()
 actorsMustMatchTheFundingAccount = script do
   f <- setupVault
@@ -394,13 +409,15 @@ actorsMustMatchTheFundingAccount = script do
         context = (depositArgs f [holdingCid]).context
         meta = accountToMeta "sender" account emptyMetadata
 
-  submitMustFail (actAs [f.alice, provider] <> discloseMany disclosures) do
+  Left refused <- trySubmit (actAs [f.alice, provider] <> discloseMany disclosures) do
     exerciseCmd f.vaultCid Vault_Deposit with
+      sender = account
       assets = 100.0
-      receiver = f.alice
+      receiver = basicAccount f.alice
       minSharesOut = None
       actors = [f.alice]
       extraArgs = args
+  assertMsg ("refused by the vault's actors check: " <> show refused) ("'actors'" `T.isInfixOf` show refused)
 
 -- | The max methods answer for the party's own holdings, not the whole pool.
 maxRedeemCountsOnlyTheParty : Script ()
@@ -414,16 +431,18 @@ maxRedeemCountsOnlyTheParty = script do
 
   aliceResult <- submit (actAs f.alice <> discloseMany disclosures) do
     exerciseCmd f.vaultCid Vault_Deposit with
+      sender = basicAccount f.alice
       assets = 100.0
-      receiver = f.alice
+      receiver = basicAccount f.alice
       minSharesOut = None
       actors = [f.alice]
       extraArgs = depositArgs f [aliceFunds]
 
   _ <- submit (actAs bob <> discloseMany disclosures) do
     exerciseCmd f.vaultCid Vault_Deposit with
+      sender = basicAccount bob
       assets = 900.0
-      receiver = bob
+      receiver = basicAccount bob
       minSharesOut = None
       actors = [bob]
       extraArgs = depositArgs f [bobFunds]
@@ -448,8 +467,9 @@ maxRedeemWithoutEvidenceIsZero = script do
 
   _ <- submit (actAs f.alice <> discloseMany disclosures) do
     exerciseCmd f.vaultCid Vault_Deposit with
+      sender = basicAccount f.alice
       assets = 100.0
-      receiver = f.alice
+      receiver = basicAccount f.alice
       minSharesOut = None
       actors = [f.alice]
       extraArgs = depositArgs f [holdingCid]

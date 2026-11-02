@@ -1,0 +1,235 @@
+-- | Properties of `VaultAsyncDeposit` and `VaultAsyncRedeem`, and of the events a vault with a queue must report.
+module Canton.Vault.Testing.V1.Queued where
+
+import DA.Action (when)
+import DA.Assert ((===))
+import DA.Foldable (forA_)
+import DA.List (dedup, head)
+import DA.TextMap qualified as TextMap
+import DA.Time (addRelTime, microseconds)
+import Daml.Script
+
+import Splice.Api.Token.AllocationRequestV2
+
+import Canton.Vault.V1
+import Canton.Vault.EventLog.V1
+import Canton.Vault.Testing.V1.Flow
+import Canton.Vault.Testing.V1.Harness
+import Canton.Vault.Testing.V1.Quote (ulp)
+import Canton.Vault.Testing.V1.Read
+
+-- | Runs the body for each queued direction of a new plain vault: `True` for deposits, `False` for redemptions.
+eachQueuedDirection : Harness -> (Deployment -> Queue -> Bool -> Script ()) -> Script ()
+eachQueuedDirection h body = do
+  found <- h.deploy plainConfig
+  case found of
+    None -> skip (h.name <> " offers no plain vault")
+    Some d -> case d.queue of
+      None -> skip (h.name <> " queues neither direction")
+      Some q -> do
+        when q.deposits (body d q True)
+        when q.redemptions do
+          fresh <- h.deploy plainConfig
+          forA_ fresh $ \d' -> forA_ d'.queue $ \q' -> body d' q' False
+
+-- | A request in the direction, from Alice's basic account to the receiver's.
+requestIn : Deployment -> Bool -> Party -> Party -> Text -> Decimal -> Optional Decimal -> Script (Either SubmitError Requested)
+requestIn d deposits requester receiver label amount minimum =
+  if deposits
+    then requestDeposit d requester (basic requester) (basic receiver) label amount minimum
+    else requestRedeem d requester (basic requester) (basic receiver) label amount minimum
+
+-- | Gives the party what a request in the direction escrows: underlying for a deposit, shares for a redemption.
+provide : Deployment -> Bool -> Party -> Decimal -> Script ()
+provide d deposits party amount = if deposits then d.fund party amount else enter d party "provision" (amount * 2.0)
+
+-- | What the receiver holds of what a fill pays: shares for a deposit, underlying for a redemption.
+receivedBy : Deployment -> Bool -> Party -> Script Decimal
+receivedBy d deposits party = do
+  v <- viewOf d
+  holdingOf party (if deposits then v.shareInstrument else v.underlyingInstrument) (basic party)
+
+-- | A queued direction has no instant path: its previews fail, its max methods are zero, and its actions fail.
+queuedDirectionsHaveNoInstantPath : Harness -> Script ()
+queuedDirectionsHaveNoInstantPath h = eachQueuedDirection h $ \d _ deposits -> do
+  alice <- allocateParty "alice"
+  let me = basic alice
+  provide d deposits alice 10.0
+  if deposits then do
+    refused "previewDeposit" =<< tryRead d (PreviewDeposit 1.0) noArgs
+    refused "previewMint" =<< tryRead d (PreviewMint 1.0) noArgs
+    ctx <- d.entry me
+    readVault d (MaxDeposit me) ctx.extraArgs >>= (=== 0.0)
+    readVault d (MaxMint me) ctx.extraArgs >>= (=== 0.0)
+    refused "an instant deposit" =<< perform d [alice] (Deposit 1.0 me me None)
+    refused "an instant mint" =<< perform d [alice] (Mint 1.0 me me None)
+  else do
+    refused "previewWithdraw" =<< tryRead d (PreviewWithdraw 1.0) noArgs
+    refused "previewRedeem" =<< tryRead d (PreviewRedeem 1.0) noArgs
+    ctx <- d.exit me
+    readVault d (MaxWithdraw me) ctx.extraArgs >>= (=== 0.0)
+    readVault d (MaxRedeem me) ctx.extraArgs >>= (=== 0.0)
+    refused "an instant withdrawal" =<< perform d [alice] (Withdraw 1.0 me me None)
+    refused "an instant redemption" =<< perform d [alice] (Redeem 1.0 me me None)
+
+-- | A request publishes allocation requests under the vault's executors, committed until the end of its period
+-- plus the window, and the vault says when requests are priced.
+requestsPublishTheirTerms : Harness -> Script ()
+requestsPublishTheirTerms h = eachQueuedDirection h $ \d _ deposits -> do
+  alice <- allocateParty "alice"
+  provide d deposits alice 50.0
+  v <- viewOf d
+  async <- asyncViewOf d deposits
+  assertMsg "the async view says when requests are priced" (TextMap.member requestPricingKey async.meta.values)
+  r <- succeeded "a request" =<< requestIn d deposits alice alice "terms" 50.0 None
+  assertMsg "the request publishes an allocation request" (r.allocationRequests /= [])
+  let deadline = addRelTime v.rateValidUntil async.settlementDeadlineWindow
+  forA_ r.allocationRequests $ \(_, ar) -> do
+    assertMsg "the settlement's executors are the vault's" (sameParties ar.settlement.executors async.executors)
+    forA_ ar.allocations $ \spec -> case spec.settlementDeadline of
+      Some t -> assertMsg ("committed until " <> show deadline <> ", not " <> show t) (t == deadline)
+      None -> abort "an allocation is requested with no deadline"
+
+-- | The requester and the receiver each decline through the allocation request, and the executors withdraw it;
+-- each ends the request, reported as cancelled or rejected with nothing having been queued.
+requestsAreEndedByTheirParties : Harness -> Script ()
+requestsAreEndedByTheirParties h = eachQueuedDirection h $ \d _ deposits -> do
+  alice <- allocateParty "alice"
+  bob <- allocateParty "bob"
+  provide d deposits alice 30.0
+  async <- asyncViewOf d deposits
+  v <- viewOf d
+  let end r actors choice = do
+        trees <- forA r.allocationRequests $ \(cid, _) -> submitTree (actAs actors) $ choice cid
+        gone <- allGone (head actors) (map fst r.allocationRequests)
+        assertMsg "ending the allocation request ends the request" gone
+        pure [e | e@(RequestClosed {}) <- eventsOf v (reportsIn trees)]
+      declined cid actors = () <$ exerciseCmd cid AllocationRequest_Reject with actors; extraArgs = noArgs
+      withdrawn cid actors = () <$ exerciseCmd cid AllocationRequest_Withdraw with actors; extraArgs = noArgs
+  r1 <- succeeded "a request" =<< requestIn d deposits alice alice "declined" 10.0 None
+  byRequester <- end r1 [alice] (\cid -> declined cid [alice])
+  r2 <- succeeded "a request" =<< requestIn d deposits alice bob "refused" 10.0 None
+  byReceiver <- end r2 [bob] (\cid -> declined cid [bob])
+  r3 <- succeeded "a request" =<< requestIn d deposits alice alice "withdrawn" 10.0 None
+  byExecutors <- end r3 async.executors (\cid -> withdrawn cid async.executors)
+  let closed r reason = [RequestClosed with request = RequestRef r.requestId r.label; amount = 0.0; reason]
+  (byRequester, byReceiver, byExecutors) === (closed r1 CR_Cancelled, closed r2 CR_Cancelled, closed r3 CR_Rejected)
+
+-- | A funded request counts as pending until the executors fill it, and the receiver is paid.
+requestsAreFilled : Harness -> Script ()
+requestsAreFilled h = eachQueuedDirection h $ \d q deposits -> do
+  alice <- allocateParty "alice"
+  provide d deposits alice 40.0
+  r <- succeeded "a request" =<< requestIn d deposits alice alice "filled" 40.0 None
+  _ <- fundRequest q r
+  pendingOf d q deposits r.requestId (basic alice) >>= (=== 40.0)
+  before <- receivedBy d deposits alice
+  _ <- q.fill
+  after <- receivedBy d deposits alice
+  assertMsg "the receiver is paid" (after > before)
+  pendingOf d q deposits r.requestId (basic alice) >>= (=== 0.0)
+
+-- | A request whose minimum no fill can meet stays queued, and nothing is paid.
+minimumsAreHonoured : Harness -> Script ()
+minimumsAreHonoured h = eachQueuedDirection h $ \d q deposits -> do
+  alice <- allocateParty "alice"
+  provide d deposits alice 40.0
+  r <- succeeded "a request" =<< requestIn d deposits alice alice "out of reach" 40.0 (Some 1.0e20)
+  _ <- fundRequest q r
+  before <- receivedBy d deposits alice
+  _ <- q.fill
+  receivedBy d deposits alice >>= (=== before)
+  pendingOf d q deposits r.requestId (basic alice) >>= (=== 40.0)
+
+-- | A direction's requests take the id `0` all or none, and two sharing another id are filled together, at one rate.
+requestIdsKeepTheirPromise : Harness -> Script ()
+requestIdsKeepTheirPromise h = eachQueuedDirection h $ \d q deposits -> do
+  alice <- allocateParty "alice"
+  bob <- allocateParty "bob"
+  provide d deposits alice 40.0
+  provide d deposits bob 10.0
+  a <- succeeded "a request" =<< requestIn d deposits alice alice "joint-a" 40.0 None
+  b <- succeeded "a request" =<< requestIn d deposits bob bob "joint-b" 10.0 None
+  _ <- fundRequest q a
+  _ <- fundRequest q b
+  beforeA <- receivedBy d deposits alice
+  beforeB <- receivedBy d deposits bob
+  _ <- q.fill
+  paidA <- (\x -> x - beforeA) <$> receivedBy d deposits alice
+  paidB <- (\x -> x - beforeB) <$> receivedBy d deposits bob
+  provide d deposits alice 10.0
+  c <- succeeded "a request" =<< requestIn d deposits alice alice "later" 10.0 None
+  let ids = [a.requestId, b.requestId, c.requestId]
+  assertMsg ("ids " <> show ids <> " give 0 to some requests and not others") (all (== 0) ids || all (/= 0) ids)
+  if a.requestId /= b.requestId || a.requestId == 0 then skip "the two requests share no id" else do
+    assertMsg "requests sharing an id are filled together" (paidA > 0.0 && paidB > 0.0)
+    assertMsg ("requests sharing an id are filled at one rate, not " <> show (paidA, paidB)) (abs (paidA - 4.0 * paidB) <= 10.0 * ulp)
+
+-- What a request still has queued at `now`, from the vault's events alone.
+rebuilt : Time -> RequestRef -> [VaultEvent] -> Decimal
+rebuilt now ref events
+  | null fills && any (now >=) deadlines = 0.0
+  | otherwise = sum requested - sum fills - sum closes
+  where
+    requested = [a | DepositRequested r a _ <- events, r == ref] <> [s | RedeemRequested r s _ <- events, r == ref]
+    deadlines = [t | DepositRequested r _ t <- events, r == ref] <> [t | RedeemRequested r _ t <- events, r == ref]
+    fills = [a | Deposited a _ (Some r) <- events, r == ref] <> [s | Withdrew _ s (Some r) <- events, r == ref]
+    closes = [a | RequestClosed r a _ <- events, r == ref]
+
+-- | Everything queued under the id, from the events alone.
+rebuiltUnder : Time -> RequestId -> [VaultEvent] -> Decimal
+rebuiltUnder now rid events = sum [rebuilt now r events | r <- dedup (concatMap refsOf events), r.requestId == rid]
+
+refsOf : VaultEvent -> [RequestRef]
+refsOf = \case
+  DepositRequested r _ _ -> [r]
+  RedeemRequested r _ _ -> [r]
+  RequestClosed r _ _ -> [r]
+  Deposited _ _ (Some r) -> [r]
+  Withdrew _ _ (Some r) -> [r]
+  _ -> []
+
+-- | R7: a wallet rebuilds what Alice has queued from the vault's events alone, and gets what the pending methods
+-- return through funding, rejection, a declined request, a fill, and either side of a deadline.
+pendingRebuildsFromEvents : Harness -> Script ()
+pendingRebuildsFromEvents h = eachQueuedDirection h $ \d q deposits -> do
+  alice <- allocateParty "alice"
+  let me = basic alice
+  provide d deposits alice 200.0
+  v <- viewOf d
+  let agree events rid expected = do
+        now <- getTime
+        onLedger <- pendingOf d q deposits rid me
+        (rebuiltUnder now rid (eventsOf v (reportsIn events)), onLedger) === (expected, expected)
+  a <- succeeded "a request" =<< requestIn d deposits alice alice "a" 40.0 None
+  funded <- fundRequest q a
+  let log1 = a.trees <> funded
+  agree log1 a.requestId 40.0
+  log2 <- case q.reject of
+    None -> pure log1
+    Some reject -> do
+      b <- succeeded "a request" =<< requestIn d deposits alice alice "b" 20.0 None
+      fundedB <- fundRequest q b
+      agree (log1 <> b.trees <> fundedB) b.requestId (if b.requestId == a.requestId then 60.0 else 20.0)
+      rejected <- reject alice "b"
+      pure (log1 <> b.trees <> fundedB <> rejected)
+  c <- succeeded "a request" =<< requestIn d deposits alice alice "c" 10.0 None
+  declined <- forA c.allocationRequests $ \(cid, _) -> submitTree alice do
+    exerciseCmd cid AllocationRequest_Reject with actors = [alice]; extraArgs = noArgs
+  let log3 = log2 <> c.trees <> declined
+  agree log3 a.requestId 40.0
+  filled <- q.fill
+  let log4 = log3 <> filled
+  agree log4 a.requestId 0.0
+  e <- succeeded "a request" =<< requestIn d deposits alice alice "e" 30.0 None
+  fundedE <- fundRequest q e
+  let log5 = log4 <> e.trees <> fundedE
+      ref = RequestRef e.requestId "e"
+  case [t | DepositRequested r _ t <- eventsOf v (reportsIn log5), r == ref] <> [t | RedeemRequested r _ t <- eventsOf v (reportsIn log5), r == ref] of
+    [] -> abort "the vault reported no accepted request with its deadline"
+    deadline :: _ -> do
+      shownToTheirParties "a queued request's event" [r | r <- reportsIn log5, r.vaultRegistrar == v.vaultRegistrar, r.vaultId == v.vaultId]
+      setTime (addRelTime deadline (microseconds (-1)))
+      agree log5 e.requestId 30.0
+      setTime deadline
+      agree log5 e.requestId 0.0

@@ -16,6 +16,11 @@ rolled st = do
   cid <- rollPeriod st.f st.vaultCid
   pure st with vaultCid = cid
 
+rolledBeyond : State -> Script State
+rolledBeyond st = do
+  cid <- rollPeriodBeyondLimits st.f st.vaultCid
+  pure st with vaultCid = cid
+
 totals : State -> Script (Decimal, Decimal)
 totals st = do
   Some v <- queryContractId st.f.registrar st.vaultCid
@@ -83,27 +88,29 @@ emptyVaultWithdrawAndRedeemAreRefused = script do
 -- Inflation attack
 --------------------
 
--- | A donation before any deposit stays with the virtual share; later depositors lose nothing.
+-- | A donation before any deposit goes to the virtual share: the donor cannot take it back, a deposit too small to
+-- mint a share is refused, and a larger one loses less than the donor gave up.
 inflationAttack : Script ()
 inflationAttack = script do
   f <- setupVault
   donor <- allocateParty "donor"
   victim <- allocateParty "victim"
   _ <- fund f f.custodian 999999.0
-  st <- rolled (fixed f)
+  st <- rolledBeyond (fixed f)
   totals st >>= (=== (0.0, 999999.0))
 
-  q <- quote st victim 1.0 1.0
-  (q.toShares, q.toAssets) === (0.000001, 1000000.0)
-  d <- quote st donor 1.0 1.0
+  q <- quote st victim 1.0 0.0000000001
+  (q.toShares, q.toAssets) === (0.0, 999999.0000000001)
+  d <- quote st donor 1.0 0.0000000001
   (d.withdrawMax, d.redeemMax) === (0.0, 0.0)
 
-  dep <- succeeded "deposit" =<< depositAs st victim 100.0
-  dep.shares === 0.0001
-  mnt <- succeeded "mint" =<< mintAs st victim 0.0001 200.0
-  mnt.assets === 100.0
-  red <- succeeded "redeem" =<< redeemAs st victim 0.0002
-  red.assets === 200.0
+  refused "a deposit worth no share" =<< depositAs st victim 100.0
+  dep <- succeeded "deposit" =<< depositAs st victim 1500000.0
+  dep.shares === 0.0000000001
+  st' <- rolled st
+  red <- succeeded "redeem" =<< redeemAs st' victim 0.0000000001
+  red.assets === 1249999.5
+  assertMsg "the victim lost no more than the donor gave up" (1500000.0 - red.assets <= 999999.0)
 
 -- Several users
 -----------------
@@ -128,27 +135,27 @@ multipleUsersInterleaved = script do
   totals st3 >>= (=== (6000.0, 9000.0))
 
   (d4, st4) <- step st3 (succeeded "4 alice deposits" =<< depositAs st3 alice 2000.0)
-  d4.shares === 1333.4073991778
+  d4.shares === 1333.3333333333
   (m5, st5) <- step st4 (succeeded "5 bruce mints" =<< mintAs st4 bruce 2000.0 4000.0)
-  m5.assets === 2999.8333611066
+  m5.assets === 3000.0
 
   st6 <- yieldOf st5 3000.0
   (r7, st7) <- step st6 (succeeded "7 alice redeems" =<< redeemAs st6 alice 1333.0)
-  r7.assets === 2427.8039195451
+  r7.assets === 2427.9642857142
   (w8, st8) <- step st7 (succeeded "8 bruce withdraws" =<< withdrawAs st7 bruce 2929.0)
-  w8.shares === 1608.1846513913
+  w8.shares === 1608.0784313726
 
   q9 <- quote st8 alice 1.0 1.0
-  q9.withdrawMax === 3643.3585329415
+  q9.withdrawMax === 3643.4642857142
   (w9, st9) <- step st8 (succeeded "9 alice withdraws all" =<< withdrawAs st8 alice q9.withdrawMax)
-  w9.shares === 2000.4073991778
+  w9.shares === 2000.3333333333
 
   left <- held st9 bruce
-  left === 4391.8153486087
+  left === 4391.9215686274
   (r10, st10) <- step st9 (succeeded "10 bruce redeems all" =<< redeemAs st9 bruce left)
-  r10.assets === 7998.8496003532
+  r10.assets === 7999.5714285715
 
   held st10 alice >>= (=== 0.0)
   held st10 bruce >>= (=== 0.0)
   -- The rounding remainder stays in the vault.
-  totals st10 >>= (=== (0.0, 0.8213082668))
+  totals st10 >>= (=== (0.0, 0.0000000001))

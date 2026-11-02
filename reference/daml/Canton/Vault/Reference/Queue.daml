@@ -1,12 +1,15 @@
 -- | What the queued vaults share: pinned factories, allocation checks, struck prices and reports.
 module Canton.Vault.Reference.Queue where
 
-import DA.Foldable (forA_)
 import DA.List (dedup, sort, unique)
 import DA.Map qualified as Map
 import DA.Optional (isSome)
 import DA.TextMap qualified as TextMap
 import DA.Time (isLedgerTimeGE)
+
+import Canton.Vault.V1 (requestPricingKey)
+import Canton.Vault.EventLog.V1
+import Canton.Vault.Reference.Log
 
 import Splice.Api.Token.MetadataV1
 import Splice.Api.Token.HoldingV2 qualified as V2
@@ -14,6 +17,23 @@ import Splice.Api.Token.AllocationV2 qualified as V2
 import Splice.Api.Token.AllocationInstructionV2 qualified as V2
 import Splice.Api.Token.AllocationRequestV2 qualified as AR
 import Splice.TokenStandard.Utils
+
+-- | The settlement id every allocation for a request to the vault carries, beside a contract id naming the request.
+requestSettlementId : Text -> Text
+requestSettlementId vaultId = vaultId <> "/requests"
+
+-- | The transfer leg id for one leg of one request: its requester, their label, and which leg it is.
+requestLegId : Party -> Text -> Text -> Text
+requestLegId requester label leg =
+  partyToText requester <> "/" <> label <> "/" <> leg
+
+-- | The registrar's account a redemption escrows its shares to, holding them until they are burned or returned.
+redemptionAccount : Party -> V2.Account
+redemptionAccount registrar = V2.Account with owner = Some registrar; provider = None; id = "redemptions"
+
+-- | When the queued vaults strike a request's rate: once its period has closed.
+requestPolicies : Metadata
+requestPolicies = Metadata with values = TextMap.fromList [(requestPricingKey, "period-close")]
 
 -- | A registry's allocation and settlement factories.
 data Factories = Factories with
@@ -28,9 +48,11 @@ template RequestAnchor
     vaultRegistrar : Party
     executors : [Party]
     requester : Party
+    receiver : Party
+      -- ^ Sees the anchor, so declining the request can end it.
   where
     signatory vaultRegistrar
-    observer requester, executors
+    observer requester, receiver, executors
 
 -- | The allocations a queued request needs, published for wallets as the token standard's allocation request.
 template RequestAllocations
@@ -65,7 +87,7 @@ template RequestAllocations
       do
         over <- isLedgerTimeGE fundBy
         require "the request's period has ended" over
-        endUnfunded this "not funded in its period"
+        endUnfunded this [vaultRegistrar] CR_Expired
 
     interface instance AR.AllocationRequest for RequestAllocations where
       view = AR.AllocationRequestView with
@@ -81,24 +103,24 @@ template RequestAllocations
       allocationRequest_rejectImpl self arg = do
         require "the requester or the receiver declines" (arg.actors `elem` [[requester], [receiver]])
         archive (fromInterfaceContractId @RequestAllocations self)
-        endUnfunded this "declined"
+        endUnfunded this arg.actors CR_Cancelled
         pure AR.AllocationRequest_RejectResult with meta = emptyMetadata
       allocationRequest_withdrawImpl self arg = do
         require "the executors withdraw" (sort arg.actors == sort executors)
         archive (fromInterfaceContractId @RequestAllocations self)
-        endUnfunded this "withdrawn by the executors"
+        endUnfunded this arg.actors CR_Rejected
         pure AR.AllocationRequest_WithdrawResult with meta = emptyMetadata
       allocationRequest_acceptExtraObservers _arg = []
       allocationRequest_rejectExtraObservers _arg = []
       allocationRequest_withdrawExtraObservers _arg = []
 
--- | Ends a request no allocation was bound to, reporting why.
-endUnfunded : RequestAllocations -> Text -> Update ()
-endUnfunded r reason = do
+-- | Ends a request no allocation was bound to, reporting why; nothing was queued, so nothing leaves the queue.
+endUnfunded : RequestAllocations -> [Party] -> CloseReason -> Update ()
+endUnfunded r actors reason = do
   archive r.anchor
-  reportQueued r.vaultRegistrar [QueuedEvent with
-    vaultId = r.vaultId; requester = r.requester; receiver = r.receiver; label = r.label
-    requestId = r.epoch; requested = r.amount; outcome = Rejected with reason]
+  report r.vaultRegistrar r.vaultId [Report with
+    owner = r.escrow.authorizer; receiver = r.authorization.authorizer; actors; meta = emptyMetadata
+    event = RequestClosed with request = RequestRef r.epoch r.label; amount = 0.0; reason]
 
 -- | Refuses an allocation that is not exactly the one requested, under the request's own settlement.
 requireRequested : Text -> Party -> V2.SettlementInfo -> V2.AllocationSpecification -> ContractId V2.Allocation -> Update ()
@@ -164,6 +186,17 @@ allocateSidesWithChange factories extraArgs settlement requestedAt admin authori
       pure (allocationCid, concatMap snd (TextMap.toList result.authorizerChangeCids))
     _ -> fail "the vault's own allocation did not complete"
 
+-- | The reference's metadata key for the executors' own words on why they rejected a request.
+rejectionKey : Text
+rejectionKey = "cantonVaultV1/rejection"
+
+-- | Why a request was dropped: by its requester, by an executor, or by the registrar once it expired.
+droppedBy : Party -> [Party] -> Party -> CloseReason
+droppedBy requester executors actor
+  | actor == requester = CR_Cancelled
+  | actor `elem` executors = CR_Rejected
+  | otherwise = CR_Expired
+
 -- | The contract ids listed under the key in a choice context.
 getContractIds : Text -> ChoiceContext -> Update [ContractId t]
 getContractIds key context = case TextMap.lookup key context.values of
@@ -188,58 +221,6 @@ template PeriodPrice
   where
     signatory vaultRegistrar
     observer executors
-
--- | One queued request's outcome, as reported to its requester and receiver.
-data QueuedEvent = QueuedEvent with
-    vaultId : Text
-    requester : Party
-    receiver : Party
-    label : Text
-    requestId : Int
-      -- ^ The period the request was made in.
-    requested : Decimal
-      -- ^ The underlying deposited, or the shares redeemed.
-    outcome : Outcome
-  deriving (Eq, Show, Serializable)
-
-data Outcome
-  = Fulfilled with
-      received : Decimal
-        -- ^ The shares issued, or the underlying paid.
-  | PartlyFilled with
-      received : Decimal
-        -- ^ The underlying paid for the part filled.
-      filled : Decimal
-        -- ^ The shares filled; the rest stay queued.
-  | Rejected with
-      reason : Text
-        -- ^ Why the request could not settle.
-  | Reclaimed
-      -- ^ The owner took back the shares not yet filled.
-  deriving (Eq, Show, Serializable)
-
--- | Reports queued requests' outcomes in the transaction they happen in, as the token standard's `EventLog` does.
--- Created and archived within that transaction, so nothing stays on the ledger.
-template QueueLog
-  with
-    vaultRegistrar : Party
-  where
-    signatory vaultRegistrar
-
-    nonconsuming choice QueueLog_Report : ()
-      -- ^ Show the event to its observers.
-      with
-        event : QueuedEvent
-        observers : [Party]
-      observer observers
-      controller vaultRegistrar
-      do pure ()
-
-reportQueued : Party -> [QueuedEvent] -> Update ()
-reportQueued registrar events = do
-  log <- create QueueLog with vaultRegistrar = registrar
-  forA_ events $ \event -> exercise log QueueLog_Report with event; observers = dedup [event.requester, event.receiver]
-  archive log
 
 -- | The opening totals of the first period after a request's that could fill it: one that allotted its period a share,
 -- or the one right after for a vault that fills every request whole. Those stored for an earlier one, or the current.

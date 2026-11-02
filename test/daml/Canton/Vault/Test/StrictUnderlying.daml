@@ -47,8 +47,9 @@ depositWithPreapproval f ds = do
   funds <- fund f f.alice 100.0
   submit (actAs f.alice <> discloseMany (ds <> [preD])) do
     exerciseCmd f.vaultCid Vault_Deposit with
+      sender = basicAccount f.alice
       assets = 100.0
-      receiver = f.alice
+      receiver = basicAccount f.alice
       minSharesOut = None
       actors = [f.alice]
       extraArgs = withPreapproval preCid (depositArgs f [funds])
@@ -66,8 +67,9 @@ depositWithoutAPreapprovalIsRefused = script do
   funds <- fund f f.alice 100.0
   submitMustFail (actAs f.alice <> discloseMany ds) do
     exerciseCmd f.vaultCid Vault_Deposit with
+      sender = basicAccount f.alice
       assets = 100.0
-      receiver = f.alice
+      receiver = basicAccount f.alice
       minSharesOut = None
       actors = [f.alice]
       extraArgs = depositArgs f [funds]
@@ -84,8 +86,8 @@ redeemCompletesWhenTheRegistryWantsTheReceiver = script do
   result <- submit (actAs f.alice <> discloseMany (take 1 rolledDs <> drop 1 ds <> poolDs)) do
     exerciseCmd (toInterfaceContractId rolled : ContractId Vault) Vault_Redeem with
       shares = first.shares
-      owner = f.alice
-      receiver = f.alice
+      owner = basicAccount f.alice
+      receiver = basicAccount f.alice
       minAssetsOut = None
       actors = [f.alice]
       extraArgs = redeemArgs f (map (toInterfaceContractId . fst) pool) shares
@@ -105,8 +107,8 @@ redeemToAnAbsentReceiverIsRefused = script do
   submitMustFail (actAs f.alice <> discloseMany (take 1 rolledDs <> drop 1 ds <> poolDs)) do
     exerciseCmd (toInterfaceContractId rolled : ContractId Vault) Vault_Redeem with
       shares = first.shares
-      owner = f.alice
-      receiver = bob
+      owner = basicAccount f.alice
+      receiver = basicAccount bob
       minAssetsOut = None
       actors = [f.alice]
       extraArgs = redeemArgs f (map (toInterfaceContractId . fst) pool) shares

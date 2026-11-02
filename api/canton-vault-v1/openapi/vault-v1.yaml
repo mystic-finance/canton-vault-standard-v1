@@ -1,0 +1,283 @@
+openapi: 3.0.0
+info:
+  title: vault off-ledger API
+  description: |
+    Implemented by vault registrars so that wallets, which are not stakeholders
+    of a vault contract, can read its view and disclose it in their own
+    submissions.
+
+    Served under the URL prefixes the vault registrar publishes for its share
+    registry, in the metadata of its CNS entry under
+    `splice.lfdecentralizedtrust.org/registryUrls`, as the token standard's
+    registry APIs are. A registrar serving it SHOULD list the vault packages it
+    implements, such as `canton-vault-v1`, in the `supportedApis` of its
+    token metadata `getRegistryInfo` response.
+  version: 0.1.0
+paths:
+
+  /registry/vaults/v1/vaults:
+    get:
+      operationId: "listVaults"
+      description: |
+        List the vaults this registrar operates.
+      parameters:
+        - name: pageSize
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int32
+            default: 25
+          description: "Number of vaults per page."
+        - name: pageToken
+          in: query
+          required: false
+          schema:
+            type: string
+          description: "The `nextPageToken` received from the response for the previous page."
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListVaultsResponse"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /registry/vaults/v1/vaults/{vaultId}:
+    get:
+      operationId: "getVault"
+      description: |
+        Get a vault's views and the contract to disclose when exercising its
+        choices. The vault contract changes at the latest when a new price is
+        published, so clients fetch it again rather than cache it past
+        `rateValidUntil`.
+      parameters:
+        - name: vaultId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Vault"
+        "404":
+          $ref: "#/components/responses/404"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /registry/vaults/v1/vaults/{vaultId}/choice-contexts/{choice}:
+    post:
+      operationId: "getVaultChoiceContext"
+      description: |
+        Get the choice context, and the contracts to disclose, that the vault
+        needs from its own side to exercise a choice, such as the holdings a
+        redemption pays out from. The caller adds its own, such as the holdings
+        it pays in from.
+      parameters:
+        - name: vaultId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: choice
+          in: path
+          required: true
+          schema:
+            type: string
+            enum:
+              - "deposit"
+              - "mint"
+              - "withdraw"
+              - "redeem"
+              - "request-deposit"
+              - "request-redeem"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GetChoiceContextRequest"
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChoiceContext"
+        "400":
+          $ref: "#/components/responses/400"
+        "404":
+          $ref: "#/components/responses/404"
+        "500":
+          $ref: "#/components/responses/500"
+
+components:
+  responses:
+    "400":
+      description: "bad request"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    "404":
+      description: "not found"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    "500":
+      description: "internal server error"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+
+  schemas:
+    ListVaultsResponse:
+      type: object
+      properties:
+        vaults:
+          type: array
+          items:
+            $ref: "#/components/schemas/Vault"
+        nextPageToken:
+          type: string
+          description: "The token for the next page, absent on the last one."
+      required:
+        - vaults
+
+    Vault:
+      type: object
+      properties:
+        vaultId:
+          type: string
+          description: "The vault's id, unique per registrar and stable across archives."
+        view:
+          type: object
+          description: |
+            The vault's `VaultView`, as the Daml JSON API encodes it. Its
+            `custodian` is the token standard's `Account`, an object with
+            `owner`, `provider` and `id`, and always has an `owner`.
+        asyncDepositView:
+          type: object
+          description: |
+            The vault's `AsyncView` for queued deposits, as the Daml JSON API
+            encodes it; absent if deposits are instant.
+        asyncRedeemView:
+          type: object
+          description: |
+            The vault's `AsyncView` for queued redemptions, as the Daml JSON API
+            encodes it; absent if redemptions are instant.
+        disclosedContract:
+          $ref: "#/components/schemas/DisclosedContract"
+        paused:
+          description: |
+            Indicates whether the vault is currently paused: some or all of its
+            actions are refused. Its max methods say which.
+          type: boolean
+          default: false
+        pauseInfo:
+          $ref: "#/components/schemas/PauseInfo"
+      required:
+        - vaultId
+        - view
+        - disclosedContract
+
+    PauseInfo:
+      description: |
+        Additional information about the vault's pause state.
+      type: object
+      properties:
+        reason:
+          description: |
+            Why the vault is paused.
+          type: string
+        until:
+          description: |
+            Timestamp (exclusive) until which the vault is paused, if known.
+          type: string
+          format: date-time
+
+    GetChoiceContextRequest:
+      description: |
+        A request for the vault's part of the context for exercising a choice.
+      type: object
+      properties:
+        choiceArguments:
+          type: object
+          description: |
+            The arguments intended for the choice, as the Daml JSON API encodes
+            them, with `extraArgs.context` and `extraArgs.meta` empty.
+        meta:
+          description: |
+            Metadata that will be passed to the choice, and should be incorporated
+            into the choice context. Provided for extensibility.
+          type: object
+          additionalProperties:
+            type: string
+        excludeDebugFields:
+          description: "If set to true, the response will not include fields prefixed with 'debug'."
+          default: false
+          type: boolean
+      required:
+        - choiceArguments
+
+    ChoiceContext:
+      description: |
+        The vault's part of the context for exercising a choice, to be merged
+        into the choice's `extraArgs.context`.
+      type: object
+      properties:
+        choiceContextData:
+          description: "The values to add to the choice context."
+          type: object
+        disclosedContracts:
+          description: "The contracts to disclose when exercising the choice."
+          type: array
+          items:
+            $ref: "#/components/schemas/DisclosedContract"
+      required:
+        - choiceContextData
+        - disclosedContracts
+
+    DisclosedContract:
+      type: object
+      properties:
+        templateId:
+          type: string
+        contractId:
+          type: string
+        createdEventBlob:
+          type: string
+        synchronizerId:
+          description: "The synchronizer the contract is assigned to."
+          type: string
+        debugPackageName:
+          description: "The Daml package of the contract; trust it only as far as the provider."
+          type: string
+        debugPayload:
+          description: "The contract arguments; trust them only as far as the provider."
+          type: object
+        debugCreatedAt:
+          description: "When the contract was created; trust it only as far as the provider."
+          type: string
+          format: date-time
+      required:
+        - templateId
+        - contractId
+        - createdEventBlob
+        - synchronizerId
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+      required:
+        - error

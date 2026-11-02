@@ -14,6 +14,7 @@ import Canton.Vault.Test.MockToken
 import Canton.Vault.Test.Periods
 
 import Splice.Api.Token.HoldingV2 qualified as V2
+import Splice.TokenStandard.Utils (basicAccount)
 
 -- | Alice signs a deposit of 100 for the vault, to be run by the venue within `ttl`.
 sign : Fixture -> Party -> RelTime -> Script (ContractId VaultCommand)
@@ -25,7 +26,7 @@ sign f venue ttl = do
       executor = venue
       vaultId = "reference-1"
       vaultRegistrar = f.registrar
-      action = DepositCommand with assets = 100.0; receiver = f.alice; minSharesOut = None
+      action = DepositCommand with sender = basicAccount f.alice; assets = 100.0; receiver = basicAccount f.alice; minSharesOut = None
       expiresAt = addRelTime now ttl
 
 run : Fixture -> Party -> ContractId VaultCommand -> ContractId ReferenceVault -> Script (Either SubmitError VaultActionResult)
@@ -85,7 +86,7 @@ commandForAnotherVaultIsRefused = script do
     createCmd ReferenceVault with
       vaultId = "reference-2"
       vaultRegistrar = f.registrar
-      custodian = f.custodian
+      custodian = basicAccount f.custodian
       underlyingInstrument = f.underlying
       shareInstrument = f.shares with id = "reference-2"
       totalShares = 0.0
@@ -115,7 +116,7 @@ commandForAnotherRegistrarIsRefused = script do
     createCmd ReferenceVault with
       vaultId = "reference-1"
       vaultRegistrar = rogue
-      custodian = rogue
+      custodian = basicAccount rogue
       underlyingInstrument = f.underlying
       shareInstrument = V2.InstrumentId with admin = rogue; id = "reference-1"
       totalShares = 0.0

@@ -1,0 +1,147 @@
+-- | A wallet rebuilds what each request has queued from the vault's events alone, and gets what the vault's pending
+-- methods return at every step.
+module Canton.Vault.Test.EventRebuild where
+
+import DA.Assert ((===))
+import DA.List (dedup, head)
+import DA.Time (addRelTime, days, microseconds)
+import Daml.Script
+
+import Canton.Vault.V1 (RequestId)
+import Canton.Vault.EventLog.V1
+import Canton.Vault.Reference.Queue qualified as Q
+import Canton.Vault.Reference.QueuedDeposit qualified as Q
+import Canton.Vault.Reference.QueuedRedeem qualified as R
+import Canton.Vault.Test.AttestedRedeem qualified as Attested
+import Canton.Vault.Test.QueuedDeposit qualified as QD
+import Canton.Vault.Test.QueuedRedeem qualified as QR
+
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.AllocationRequestV2 qualified as AR
+
+-- | What the request still has queued at `now`, from the events alone.
+rebuilt : Time -> RequestRef -> [VaultEvent] -> Decimal
+rebuilt now ref events
+  | null fills && any (now >=) deadlines = 0.0
+  | otherwise = sum requested - sum fills - sum closes
+  where
+    requested = [a | DepositRequested r a _ <- events, r == ref] <> [s | RedeemRequested r s _ <- events, r == ref]
+    deadlines = [d | DepositRequested r _ d <- events, r == ref] <> [d | RedeemRequested r _ d <- events, r == ref]
+    fills = [a | Deposited a _ (Some r) <- events, r == ref] <> [s | Withdrew _ s (Some r) <- events, r == ref]
+    closes = [a | RequestClosed r a _ <- events, r == ref]
+
+-- | Everything queued under the id, from the events alone.
+rebuiltUnder : Time -> RequestId -> [VaultEvent] -> Decimal
+rebuiltUnder now rid events = sum [rebuilt now r events | r <- dedup (concatMap refs events), r.requestId == rid]
+  where
+    refs e = case e of
+      DepositRequested r _ _ -> [r]
+      RedeemRequested r _ _ -> [r]
+      RequestClosed r _ _ -> [r]
+      Deposited _ _ (Some r) -> [r]
+      Withdrew _ _ (Some r) -> [r]
+      _ -> []
+
+-- | A deposit request funded and bound, with what binding it reported.
+fundedDeposit : QD.Env -> Text -> Decimal -> Script (RequestId, QD.Req, [VaultEvent])
+fundedDeposit env label assets = do
+  Right rid <- QD.requestTerms env env.alice label assets env.alice None
+  (cid, r) <- QD.published env env.alice label
+  escrowed <- QD.escrowAsRequested env r
+  receiving <- QD.authorizationAsRequested env r
+  now <- QD.current env
+  vd <- QD.vaultDisclosure now
+  tree <- submitTree (actAs env.venue <> discloseMany [vd, env.usd.disclosure, env.shares.disclosure]) do
+    exerciseCmd now.vaultCid Q.ReferenceQueuedDepositVault_Bind with
+      requestCid = cid; underlyingAllocation = escrowed; shareAllocation = receiving
+  req <- QD.requestOf env env.alice label
+  pure (rid, req, QD.reported tree)
+
+-- | A redemption request funded and bound, with what binding it reported.
+fundedRedeem : QR.Env -> Text -> Decimal -> Script (RequestId, QR.Req, [VaultEvent])
+fundedRedeem env label shares = do
+  Right rid <- QR.requestTerms env env.alice label shares env.alice None
+  (cid, r) <- QR.published env env.alice label
+  escrowed <- QR.escrowAsRequested env r
+  receiving <- QR.receiptAsRequested env r
+  now <- QR.current env
+  vd <- QR.vaultDisclosure now
+  tree <- submitTree (actAs env.venue <> discloseMany [vd, env.usd.disclosure, env.shares.disclosure]) do
+    exerciseCmd now.vaultCid R.ReferenceQueuedRedeemVault_Bind with
+      requestCid = cid; shareAllocation = escrowed; underlyingAllocation = receiving
+  req <- QR.requestOf env env.alice label
+  pure (rid, req, QR.reported tree)
+
+-- | The events and the vault agree on what Alice has queued under the id.
+depositsAgree : QD.Env -> [VaultEvent] -> RequestId -> [QD.Req] -> Decimal -> Script ()
+depositsAgree env events rid live expected = do
+  now <- getTime
+  onLedger <- QD.pending env rid env.alice (map (.requestCid) live)
+  (rebuiltUnder now rid events, onLedger) === (expected, expected)
+
+redemptionsAgree : QR.Env -> [VaultEvent] -> RequestId -> [QR.Req] -> Decimal -> Script ()
+redemptionsAgree env events rid live expected = do
+  now <- getTime
+  onLedger <- QR.pending env rid env.alice (map (.requestCid) live)
+  (rebuiltUnder now rid events, onLedger) === (expected, expected)
+
+-- | Requests funded, rejected, never funded, filled, and past their deadline.
+depositPendingRebuildsFromEvents : Script ()
+depositPendingRebuildsFromEvents = script do
+  env <- QD.setup
+  (rid, r1, bound1) <- fundedDeposit env "r1" 100.0
+  depositsAgree env bound1 rid [r1] 100.0
+  (_, r2, bound2) <- fundedDeposit env "r2" 50.0
+  let events = bound1 <> bound2
+  depositsAgree env events rid [r1, r2] 150.0
+
+  Right rejected <- QD.rejectTreeAs env env.venue [r2] "receiver blocked"
+  let events' = events <> QD.reported rejected
+  depositsAgree env events' rid [r1] 100.0
+
+  Right _ <- QD.requestTerms env env.alice "r3" 10.0 env.alice None
+  (unfunded, r3) <- QD.published env env.alice "r3"
+  setTime r3.fundBy
+  expired <- submitTree env.registrar (exerciseCmd unfunded Q.RequestAllocations_Expire)
+  let events'' = events' <> QD.reported expired
+  depositsAgree env events'' rid [r1] 100.0
+
+  ready <- QD.readyToFill env [r1]
+  Right filled <- QD.fulfilNowTree ready env.venue [r1]
+  let events''' = events'' <> QD.reported filled
+  depositsAgree ready events''' rid [] 0.0
+
+  (later, r4, bound4) <- fundedDeposit ready "r4" 30.0
+  later === rid + 1
+  let everything = events''' <> bound4
+      deadline = head [d | DepositRequested _ _ d <- bound4]
+  setTime (addRelTime deadline (microseconds (-1)))
+  depositsAgree ready everything later [r4] 30.0
+  setTime deadline
+  depositsAgree ready everything later [r4] 0.0
+
+-- | A request never funded, and one filled in part whose rest outlives the escrow's deadline until it is reclaimed.
+redeemPendingRebuildsFromEvents : Script ()
+redeemPendingRebuildsFromEvents = script do
+  (env, oracle) <- Attested.setupOracle
+  (rid, r1, bound) <- fundedRedeem env "r1" 100.0
+  redemptionsAgree env bound rid [r1] 100.0
+
+  Right _ <- QR.requestTerms env env.alice "r2" 10.0 env.alice None
+  (unfunded, _) <- QR.published env env.alice "r2"
+  declined <- submitTree env.alice do
+    exerciseCmd (toInterfaceContractId @AR.AllocationRequest unfunded) AR.AllocationRequest_Reject with
+      actors = [env.alice]; extraArgs = ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata
+  let events = bound <> QR.reported declined
+  redemptionsAgree env events rid [r1] 100.0
+
+  Right env <- Attested.rollAt env oracle 1.0 [(1, 0.4)]
+  Right filled <- Attested.fillTree env [r1]
+  rest <- Attested.requestNow env "r1"
+  let events' = events <> QR.reported filled
+  redemptionsAgree env events' rid [rest] 60.0
+  passTime (QR.window + days 1)
+  redemptionsAgree env events' rid [rest] 60.0
+
+  Right reclaimed <- Attested.reclaimAs env env.alice rest
+  redemptionsAgree env (events' <> QR.reported reclaimed) rid [] 0.0

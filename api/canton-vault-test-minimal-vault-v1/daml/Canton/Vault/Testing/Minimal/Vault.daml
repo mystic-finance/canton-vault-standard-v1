@@ -1,0 +1,238 @@
+-- | A minimal vault, independent of the reference: instant both ways, no fees, totals kept live on the contract,
+-- which every action rewrites. Shares and the underlying are Splice test tokens.
+module Canton.Vault.Testing.Minimal.Vault where
+
+import DA.Action (when)
+import DA.Foldable (forA_)
+import DA.List (dedup)
+import DA.Numeric qualified as N
+import DA.Optional (isNone, isSome, optionalToList)
+import DA.TextMap qualified as TextMap
+import DA.Time (isLedgerTimeLT)
+
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.HoldingV2
+import Splice.Api.Token.TransferInstructionV2
+import Splice.Testing.Tokens.TestTokenV2.Holding (Token(..))
+
+import Canton.Vault.V1
+import Canton.Vault.Delegation.V1
+import Canton.Vault.EventLog.V1
+
+-- | The context keys this vault reads: the sender's holdings, the owner's shares, and the pool paid out from.
+fundsKey, sharesKey, poolKey : Text
+fundsKey = "minimal-vault/funds"
+sharesKey = "minimal-vault/shares"
+poolKey = "minimal-vault/pool"
+
+ulp : Decimal
+ulp = 0.0000000001
+
+-- | The smallest amount of shares and of the underlying, counted on top of the totals.
+offset : Decimal
+offset = 0.0000000001
+
+roundDown, roundUp : Decimal -> Decimal -> Decimal -> Decimal
+roundDown a b c = let p = N.mul @20 a b; q = N.div @10 p c in if N.mul @20 q c > p then q - ulp else q
+roundUp a b c = let p = N.mul @20 a b; q = N.div @10 p c in if N.mul @20 q c < p then q + ulp else q
+
+parties : Account -> [Party]
+parties a = dedup (optionalToList a.owner <> optionalToList a.provider)
+
+cidsAt : Text -> ExtraArgs -> [ContractId t]
+cidsAt key args = case TextMap.lookup key args.context.values of
+  Some (AV_List vs) -> [coerceContractId c | AV_ContractId c <- vs]
+  _ -> []
+
+template MinimalVault
+  with
+    registrar : Party
+    custodian : Account
+    vaultId : Text
+    underlying : InstrumentId
+    shares : InstrumentId
+    transferFactory : ContractId TransferFactory
+    totalShares : Decimal
+    totalAssets : Decimal
+    validFrom : Time
+    validUntil : Time
+  where
+    signatory registrar, optionalToList custodian.owner
+    ensure isSome custodian.owner && shares == InstrumentId with admin = registrar; id = vaultId
+      && totalShares >= 0.0 && totalAssets >= 0.0 && validUntil > validFrom
+
+    interface instance Vault for MinimalVault where
+      view = VaultView with
+        vaultId; vaultRegistrar = registrar; custodian
+        underlyingInstrument = underlying; shareInstrument = shares
+        totalShares; totalAssets; virtualShares = offset; virtualAssets = offset
+        rate = Rate with asOf = validFrom; accrual = None; inputs = []
+        depositFeeBps = 0; mintFeeBps = 0; withdrawFeeBps = 0; redeemFeeBps = 0
+        rateValidFrom = validFrom; rateValidUntil = validUntil
+        meta = emptyMetadata
+
+      convertToShares a = pure (toShares this a)
+      convertToAssets s = pure (toAssets this s)
+      maxDeposit account _ = pure (if isNone account.owner then 0.0 else 1.0e27)
+      maxMint account _ = pure (if isNone account.owner then 0.0 else 1.0e27)
+      maxWithdraw account args = toAssets this <$> held this account args
+      maxRedeem account args = held this account args
+      previewDeposit a = pure (toShares this a)
+      previewMint s = pure (roundUp s (totalAssets + offset) (totalShares + offset))
+      previewWithdraw a = pure (roundUp a (totalShares + offset) (totalAssets + offset))
+      previewRedeem s = pure (toAssets this s)
+
+      vault_depositExtraObservers _ = []
+      vault_mintExtraObservers _ = []
+      vault_withdrawExtraObservers _ = []
+      vault_redeemExtraObservers _ = []
+
+      vault_depositImpl self arg = orDelegated arg.actors arg.sender arg.extraArgs
+        (\auth -> snd <$> exercise auth VaultDelegateAuth_Deposit with
+          vaultCid = self; assets = arg.assets; sender = arg.sender; receiver = arg.receiver; minSharesOut = arg.minSharesOut; actors = arg.actors; extraArgs = arg.extraArgs) do
+        let issued = toShares this arg.assets
+        forA_ arg.minSharesOut $ \m -> when (issued < m) (fail vaultSlippageExceeded)
+        enter this self arg.sender arg.receiver arg.actors arg.extraArgs arg.assets issued
+
+      vault_mintImpl self arg = orDelegated arg.actors arg.sender arg.extraArgs
+        (\auth -> snd <$> exercise auth VaultDelegateAuth_Mint with
+          vaultCid = self; shares = arg.shares; sender = arg.sender; receiver = arg.receiver; maxAssetsIn = arg.maxAssetsIn; actors = arg.actors; extraArgs = arg.extraArgs) do
+        let cost = roundUp arg.shares (totalAssets + offset) (totalShares + offset)
+        forA_ arg.maxAssetsIn $ \m -> when (cost > m) (fail vaultSlippageExceeded)
+        enter this self arg.sender arg.receiver arg.actors arg.extraArgs cost arg.shares
+
+      vault_withdrawImpl self arg = orDelegated arg.actors arg.owner arg.extraArgs
+        (\auth -> snd <$> exercise auth VaultDelegateAuth_Withdraw with
+          vaultCid = self; assets = arg.assets; from = arg.owner; receiver = arg.receiver; maxSharesIn = arg.maxSharesIn; actors = arg.actors; extraArgs = arg.extraArgs) do
+        let burned = roundUp arg.assets (totalShares + offset) (totalAssets + offset)
+        forA_ arg.maxSharesIn $ \m -> when (burned > m) (fail vaultSlippageExceeded)
+        leave this self arg.owner arg.receiver arg.actors arg.extraArgs arg.assets burned
+
+      vault_redeemImpl self arg = orDelegated arg.actors arg.owner arg.extraArgs
+        (\auth -> snd <$> exercise auth VaultDelegateAuth_Redeem with
+          vaultCid = self; shares = arg.shares; from = arg.owner; receiver = arg.receiver; minAssetsOut = arg.minAssetsOut; actors = arg.actors; extraArgs = arg.extraArgs) do
+        let paid = toAssets this arg.shares
+        forA_ arg.minAssetsOut $ \m -> when (paid < m) (fail vaultSlippageExceeded)
+        leave this self arg.owner arg.receiver arg.actors arg.extraArgs paid arg.shares
+
+      vault_publicFetchImpl _ _ = pure (view (toInterface @Vault this))
+      vault_publicConvertToAssetsImpl _ arg = pure (toAssets this arg.shares)
+
+    choice MinimalVault_Roll : ContractId MinimalVault
+      -- ^ Opens a new rate period.
+      with
+        until : Time
+      controller registrar
+      do
+        now <- getTime
+        create this with validFrom = now; validUntil = until
+
+    choice MinimalVault_Revalue : ContractId MinimalVault
+      -- ^ Books a change in the pool's value from outside vault actions.
+      with
+        assets : Decimal
+      controller registrar, optionalToList custodian.owner
+      do create this with totalAssets = assets
+
+toShares, toAssets : MinimalVault -> Decimal -> Decimal
+toShares v a = roundDown a (v.totalShares + offset) (v.totalAssets + offset)
+toAssets v s = roundDown s (v.totalAssets + offset) (v.totalShares + offset)
+
+-- | The account's shares among the holdings named.
+held : MinimalVault -> Account -> ExtraArgs -> Update Decimal
+held v account args = do
+  tokens <- forA (cidsAt sharesKey args : [ContractId Token]) fetch
+  pure (sum [t.holding.amount | t <- tokens, t.holding.account == account, t.holding.instrumentId == v.shares])
+
+requireOpen : MinimalVault -> Update ()
+requireOpen v = do
+  open <- isLedgerTimeLT v.validUntil
+  assertMsg "the rate period has ended" open
+
+-- | Acts through the authorization a delegate names, when the actors do not include the account's parties.
+orDelegated : [Party] -> Account -> ExtraArgs -> (ContractId VaultDelegateAuth -> Update a) -> Update a -> Update a
+orDelegated actors from args delegated own = case TextMap.lookup delegationKey args.context.values of
+  Some (AV_ContractId cid) | isSome from.owner && not (all (`elem` actors) (parties from)) -> delegated (coerceContractId cid)
+  _ -> own
+
+requireAccounts : Account -> Account -> [Party] -> Update ()
+requireAccounts from to actors = do
+  assertMsg "an account with no owner" (isSome from.owner && isSome to.owner)
+  assertMsg "the actors include the account's parties" (all (`elem` actors) (parties from))
+
+-- | The sender instructs the transfer; if the registry leaves it pending, the receiver's parties accept it.
+transferUnderlying : MinimalVault -> ExtraArgs -> Account -> Account -> Decimal -> [ContractId Holding] -> Update ()
+transferUnderlying v args from to amount inputs = do
+  result <- exercise v.transferFactory TransferFactory_Transfer with
+    transfer = Transfer with
+      sender = from; receiver = to; amount; instrumentId = v.underlying
+      requestedAt = v.validFrom; executeBefore = v.validUntil; inputHoldingCids = inputs; meta = emptyMetadata
+    actors = parties from; extraArgs = args
+  output <- case result.output of
+    TransferInstructionResult_Pending {transferInstructionCid} ->
+      (.output) <$> exercise transferInstructionCid TransferInstruction_Accept with actors = parties to; extraArgs = args
+    other -> pure other
+  case output of
+    TransferInstructionResult_Completed {} -> pure ()
+    _ -> fail "the underlying transfer did not complete"
+
+enter : MinimalVault -> ContractId Vault -> Account -> Account -> [Party] -> ExtraArgs -> Decimal -> Decimal -> Update VaultActionResult
+enter v self sender receiver actors args assets issued = do
+  requireOpen v
+  requireAccounts sender receiver actors
+  assertMsg "the receiver's parties act" (all (`elem` actors) (parties receiver))
+  assertMsg "the deposit issues shares" (issued > 0.0)
+  transferUnderlying v args sender v.custodian assets (cidsAt fundsKey args)
+  token <- create Token with
+    holding = HoldingView with account = receiver; instrumentId = v.shares; amount = issued; lock = None; meta = emptyMetadata
+  archive (fromInterfaceContractId @MinimalVault self)
+  next <- create v with totalShares = v.totalShares + issued; totalAssets = v.totalAssets + assets
+  record v sender receiver actors (Deposited with assets; shares = issued; fromRequest = None)
+  pure VaultActionResult with
+    vaultCid = Some (toInterfaceContractId next); assets; shares = issued
+    holdingCids = [toInterfaceContractId token]; meta = emptyMetadata
+
+leave : MinimalVault -> ContractId Vault -> Account -> Account -> [Party] -> ExtraArgs -> Decimal -> Decimal -> Update VaultActionResult
+leave v self owner receiver actors args assets burned = do
+  requireOpen v
+  requireAccounts owner receiver actors
+  assertMsg "the exit pays something" (assets > 0.0 && burned > 0.0)
+  burnFrom v owner burned (cidsAt sharesKey args)
+  assertMsg "the receiver's parties act" (all (`elem` actors) (parties receiver))
+  transferUnderlying v args v.custodian receiver assets (cidsAt poolKey args)
+  archive (fromInterfaceContractId @MinimalVault self)
+  next <- create v with totalShares = v.totalShares - burned; totalAssets = v.totalAssets - assets
+  record v owner receiver actors (Withdrew with assets; shares = burned; fromRequest = None)
+  pure VaultActionResult with
+    vaultCid = Some (toInterfaceContractId next); assets; shares = burned; holdingCids = []; meta = emptyMetadata
+
+burnFrom : MinimalVault -> Account -> Decimal -> [ContractId Token] -> Update ()
+burnFrom _ _ remaining [] = assertMsg "the shares named cover the burn" (remaining <= 0.0)
+burnFrom v owner remaining (cid :: rest) = if remaining <= 0.0 then pure () else do
+  t <- fetch cid
+  assertMsg "a share holding of the owner" (t.holding.account == owner && t.holding.instrumentId == v.shares)
+  archive cid
+  let taken = min remaining t.holding.amount
+  when (t.holding.amount > taken) do
+    _ <- create t with holding = t.holding with amount = t.holding.amount - taken
+    pure ()
+  burnFrom v owner (remaining - taken) rest
+
+-- | Reports through a log created and archived in the same transaction.
+template MinimalLog
+  with
+    registrar : Party
+  where
+    signatory registrar
+    interface instance VaultEventLog for MinimalLog where
+      view = VaultEventLogView with vaultRegistrar = registrar; meta = emptyMetadata
+      vaultEventLog_reportImpl _ _ = pure VaultEventLog_ReportResult
+
+record : MinimalVault -> Account -> Account -> [Party] -> VaultEvent -> Update ()
+record v owner receiver actors event = do
+  logCid <- create MinimalLog with registrar = v.registrar
+  _ <- exercise (toInterfaceContractId @VaultEventLog logCid) VaultEventLog_Report with
+    vaultRegistrar = v.registrar; vaultId = v.vaultId; owner; receiver; actors; event
+    observers = dedup (parties owner <> parties receiver <> actors)
+    extraArgs = ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata
+  archive logCid

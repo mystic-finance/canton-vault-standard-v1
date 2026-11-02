@@ -1,0 +1,417 @@
+-- | Properties of `Vault`'s read methods and instant actions.
+module Canton.Vault.Testing.V1.Instant where
+
+import DA.Action (unless, when)
+import DA.Assert ((===))
+import DA.Foldable (forA_)
+import DA.Optional (isSome)
+import DA.Time (convertMicrosecondsToRelTime, convertRelTimeToMicroseconds, subTime)
+import Daml.Script
+
+import Splice.Api.Token.HoldingV2
+
+import Canton.Vault.V1
+import Canton.Vault.Testing.V1.Flow
+import Canton.Vault.Testing.V1.Harness
+import Canton.Vault.Testing.V1.Quote
+import Canton.Vault.Testing.V1.Read
+
+next : Int -> Int
+next s = (s * 1103515245 + 12345) % 2147483648
+
+-- | Between 1 and 100,000, to three places.
+amountFrom : Int -> Decimal
+amountFrom s = 1.0 + intToDecimal (s % 99999000) / 1000.0
+
+seeds : Int -> [Int]
+seeds n = [7919 * i | i <- [1 .. n]]
+
+-- | Yield or a loss.
+factorFrom : Int -> Decimal
+factorFrom s = case s % 3 of
+  0 -> 1.0
+  1 -> 1.37
+  _ -> 0.62
+
+feeConfigs : [VaultConfig]
+feeConfigs =
+  [ plainConfig
+  , plainConfig with depositFeeBps = 30; mintFeeBps = 30; withdrawFeeBps = 250; redeemFeeBps = 250
+  , plainConfig with depositFeeBps = 250; mintFeeBps = 250; withdrawFeeBps = 999; redeemFeeBps = 999
+  , plainConfig with depositFeeBps = 30; mintFeeBps = 45; withdrawFeeBps = 250; redeemFeeBps = 120 ]
+
+noOwner : Account
+noOwner = Account with owner = None; provider = None; id = ""
+
+-- | A vault with the config after a history: another depositor, a change of value if the implementation can make
+-- one, then a new period.
+withHistory : Harness -> VaultConfig -> Int -> (Deployment -> Script ()) -> Script ()
+withHistory h config seed body = do
+  found <- h.deploy config
+  case found of
+    None -> skip (h.name <> " offers no vault with " <> show config)
+    Some d -> do
+      bob <- allocateParty "bob"
+      enter d bob ("history-" <> show seed) (amountFrom seed)
+      forA_ d.changeValue $ \change -> change (factorFrom seed)
+      _ <- d.nextPeriod
+      body d
+
+-- | Alice's underlying and shares in her basic account.
+balancesOf : Deployment -> Party -> Script (Decimal, Decimal)
+balancesOf d party = do
+  v <- viewOf d
+  (,) <$> holdingOf party v.underlyingInstrument (basic party) <*> holdingOf party v.shareInstrument (basic party)
+
+sharesOf : Deployment -> Party -> Account -> Script Decimal
+sharesOf d party account = do
+  v <- viewOf d
+  holdingOf party v.shareInstrument account
+
+-- | Each preview is what its action then does.
+previewsMatchActions : Harness -> Script ()
+previewsMatchActions h = forA_ [(s, c) | s <- seeds 3, c <- feeConfigs] $ \(seed, config) ->
+  withHistory h config seed $ \d -> do
+    alice <- allocateParty "alice"
+    let me = basic alice
+        x = amountFrom (next seed)
+    if not (depositsByVault d) then enter d alice "alice" x else do
+      d.fund alice (x * 3.0)
+      q <- readVault d (PreviewDeposit x) noArgs
+      r <- succeeded "a deposit" =<< perform d [alice] (Deposit x me me None)
+      r.shares === q
+      qm <- readVault d (PreviewMint (x / 3.0)) noArgs
+      r <- succeeded "a mint" =<< perform d [alice] (Mint (x / 3.0) me me None)
+      r.assets === qm
+    unless (redemptionsQueued d) do
+      held <- sharesOf d alice me
+      qr <- readVault d (PreviewRedeem (held / 4.0)) noArgs
+      r <- succeeded "a redemption" =<< perform d [alice] (Redeem (held / 4.0) me me None)
+      r.assets === qr
+      worth <- readVault d (ConvertToAssets (held / 2.0)) noArgs
+      qw <- readVault d (PreviewWithdraw (worth / 2.0)) noArgs
+      r <- succeeded "a withdrawal" =<< perform d [alice] (Withdraw (worth / 2.0) me me None)
+      r.shares === qw
+
+-- | Previews never beat the conversions, which ignore fees.
+conversionsBoundPreviews : Harness -> Script ()
+conversionsBoundPreviews h = forA_ [(s, c) | s <- seeds 3, c <- feeConfigs] $ \(seed, config) ->
+  withHistory h config seed $ \d -> do
+    let x = amountFrom (next seed)
+    toShares <- readVault d (ConvertToShares x) noArgs
+    toAssets <- readVault d (ConvertToAssets x) noArgs
+    unless (depositsQueued d) do
+      deposit <- readVault d (PreviewDeposit x) noArgs
+      mint <- readVault d (PreviewMint x) noArgs
+      assertMsg "a deposit issues no more than its assets convert to" (deposit <= toShares)
+      assertMsg "a mint costs no less than its shares convert to" (mint >= toAssets)
+    unless (redemptionsQueued d) do
+      redeem <- readVault d (PreviewRedeem x) noArgs
+      withdraw <- readVault d (PreviewWithdraw x) noArgs
+      assertMsg "a redemption pays no more than its shares convert to" (redeem <= toAssets)
+      assertMsg "a withdrawal burns no fewer shares than its assets convert to" (withdraw >= toShares)
+
+-- | Going in and straight back out never ends with more than went in.
+roundTripsDoNotProfit : Harness -> Script ()
+roundTripsDoNotProfit h = forA_ [(s, c) | s <- seeds 3, c <- feeConfigs] $ \(seed, config) ->
+  withHistory h config seed $ \d -> if not (depositsByVault d) || redemptionsQueued d then skip "no instant round trip" else do
+    alice <- allocateParty "alice"
+    let me = basic alice
+        x = amountFrom (next seed)
+    d.fund alice (x * 4.0)
+    _ <- succeeded "a cushion of shares" =<< perform d [alice] (Deposit x me me None)
+    minted <- succeeded "a mint" =<< perform d [alice] (Mint (x / 4.0) me me None)
+    withdrawn <- succeeded "a withdrawal" =<< perform d [alice] (Withdraw minted.assets me me None)
+    assertMsg "minting then withdrawing what it cost burns no fewer shares than were minted" (withdrawn.shares >= x / 4.0)
+    deposited <- succeeded "a deposit" =<< perform d [alice] (Deposit (x / 2.0) me me None)
+    redeemed <- succeeded "a redemption" =<< perform d [alice] (Redeem deposited.shares me me None)
+    assertMsg "depositing then redeeming returns no more than went in" (redeemed.assets <= x / 2.0)
+
+-- | Each max method is exact: its amount goes through, one unit more is refused.
+maxLimitsAreExact : Harness -> Script ()
+maxLimitsAreExact h = forA_ configs $ \config -> withHistory h config 31 $ \d -> do
+    alice <- allocateParty "alice"
+    let me = basic alice
+    if not (depositsByVault d) then enter d alice "alice" 500.0 else do
+      ctx <- d.entry me
+      m <- readVault d (MaxDeposit me) ctx.extraArgs
+      if m >= 1.0e20 then enter d alice "alice" 500.0 else do
+        d.fund alice (m + 1.0)
+        refused "a deposit above maxDeposit" =<< perform d [alice] (Deposit (m + ulp) me me None)
+        _ <- succeeded "a deposit of maxDeposit" =<< perform d [alice] (Deposit m me me None)
+        ctx <- d.entry me
+        mm <- readVault d (MaxMint me) ctx.extraArgs
+        cost <- readVault d (PreviewMint mm) noArgs
+        d.fund alice (cost + 1.0)
+        refused "a mint above maxMint" =<< perform d [alice] (Mint (mm + ulp) me me None)
+        _ <- succeeded "a mint of maxMint" =<< perform d [alice] (Mint mm me me None)
+        pure ()
+    unless (redemptionsQueued d) do
+      ctx <- d.exit me
+      mr <- readVault d (MaxRedeem me) ctx.extraArgs
+      mw <- readVault d (MaxWithdraw me) ctx.extraArgs
+      assertMsg "there are shares to redeem" (mr > 0.0)
+      refused "a redemption above maxRedeem" =<< perform d [alice] (Redeem (mr + ulp) me me None)
+      refused "a withdrawal above maxWithdraw" =<< perform d [alice] (Withdraw (mw + ulp) me me None)
+      _ <- succeeded "a withdrawal of maxWithdraw" =<< perform d [alice] (Withdraw mw me me None)
+      ctx <- d.exit me
+      rest <- readVault d (MaxRedeem me) ctx.extraArgs
+      when (rest > 0.0) do
+        _ <- succeeded "a redemption of maxRedeem" =<< perform d [alice] (Redeem rest me me None)
+        pure ()
+  where
+    configs =
+      [ plainConfig with depositCap = Some 500.0
+      , plainConfig with depositFeeBps = 30; mintFeeBps = 30; withdrawFeeBps = 250; redeemFeeBps = 250; depositCap = Some 500.0
+      , plainConfig ]
+
+-- | Accruing rates, simple and compounding, one with fees.
+accrualConfigs : [VaultConfig]
+accrualConfigs =
+  [ plainConfig with accrual = Some (AccrualSimple with ratePerSecond = 0.000001)
+  , plainConfig with depositFeeBps = 30; mintFeeBps = 30; withdrawFeeBps = 250; redeemFeeBps = 250
+                     accrual = Some (AccrualCompounding with ratePerSecond = 0.0000003) ]
+
+-- | A wallet quotes every path from the view alone, by the formulas `Vault` states, midway through the period.
+viewQuotesEveryPath : Harness -> Script ()
+viewQuotesEveryPath h = forA_ [(s, c) | s <- seeds 2, c <- feeConfigs <> accrualConfigs] $ \(seed, config) ->
+  withHistory h config seed $ \d -> do
+    v <- viewOf d
+    v.rate.accrual === config.accrual
+    start <- getTime
+    passTime (convertMicrosecondsToRelTime (convertRelTimeToMicroseconds (subTime v.rateValidUntil start) / 2))
+    t <- getTime
+    forA_ [1.0, 33.3333333333, 777.777, amountFrom (next seed)] $ \x -> do
+        let q = quote v t x x
+        readVault d (ConvertToShares x) noArgs >>= (=== q.toShares)
+        readVault d (ConvertToAssets x) noArgs >>= (=== q.toAssets)
+        unless (depositsQueued d) do
+          readVault d (PreviewDeposit x) noArgs >>= (=== q.deposit)
+          case q.mint of
+            Some m -> readVault d (PreviewMint x) noArgs >>= (=== m)
+            None -> refused "previewMint at a full fee" =<< tryRead d (PreviewMint x) noArgs
+        unless (redemptionsQueued d) do
+          readVault d (PreviewRedeem x) noArgs >>= (=== q.redeem)
+          case q.withdraw of
+            Some w -> readVault d (PreviewWithdraw x) noArgs >>= (=== w)
+            None -> refused "previewWithdraw at a full fee" =<< tryRead d (PreviewWithdraw x) noArgs
+
+-- | An action just past its caller's limit fails with `vaultSlippageExceeded` and moves nothing.
+slippageLimitsRefuseAndMoveNothing : Harness -> Script ()
+slippageLimitsRefuseAndMoveNothing h = withHistory h plainConfig 47 $ \d -> do
+  alice <- allocateParty "alice"
+  let me = basic alice
+  enter d alice "alice" 100.0
+  d.fund alice 100.0
+  before <- balancesOf d alice
+  unless (depositsQueued d) do
+    q <- readVault d (PreviewDeposit 10.0) noArgs
+    refusedFor "a deposit below minSharesOut" vaultSlippageExceeded =<< perform d [alice] (Deposit 10.0 me me (Some (q + ulp)))
+    qm <- readVault d (PreviewMint 10.0) noArgs
+    refusedFor "a mint above maxAssetsIn" vaultSlippageExceeded =<< perform d [alice] (Mint 10.0 me me (Some (qm - ulp)))
+  unless (redemptionsQueued d) do
+    qr <- readVault d (PreviewRedeem 10.0) noArgs
+    refusedFor "a redemption below minAssetsOut" vaultSlippageExceeded =<< perform d [alice] (Redeem 10.0 me me (Some (qr + ulp)))
+    qw <- readVault d (PreviewWithdraw 1.0) noArgs
+    refusedFor "a withdrawal above maxSharesIn" vaultSlippageExceeded =<< perform d [alice] (Withdraw 1.0 me me (Some (qw - ulp)))
+  balancesOf d alice >>= (=== before)
+
+-- | The actors must include the sender's or owner's parties: another party acting alone is refused.
+actorsWithoutTheAccountAreRefused : Harness -> Script ()
+actorsWithoutTheAccountAreRefused h = withHistory h plainConfig 53 $ \d -> do
+  alice <- allocateParty "alice"
+  carol <- allocateParty "carol"
+  let me = basic alice
+  enter d alice "alice" 100.0
+  d.fund alice 100.0
+  before <- balancesOf d alice
+  unless (depositsQueued d) do
+    refused "a deposit by another party" =<< perform d [carol] (Deposit 10.0 me me None)
+    refused "a mint by another party" =<< perform d [carol] (Mint 1.0 me me None)
+  unless (redemptionsQueued d) do
+    refused "a redemption by another party" =<< perform d [carol] (Redeem 1.0 me me None)
+    refused "a withdrawal by another party" =<< perform d [carol] (Withdraw 1.0 me me None)
+  balancesOf d alice >>= (=== before)
+
+-- | An account with no owner is refused everywhere, and the deposit side's max methods are zero for it.
+anAccountWithNoOwnerIsRefused : Harness -> Script ()
+anAccountWithNoOwnerIsRefused h = withHistory h plainConfig 59 $ \d -> do
+  alice <- allocateParty "alice"
+  let me = basic alice
+  readVault d (MaxDeposit noOwner) noArgs >>= (=== 0.0)
+  readVault d (MaxMint noOwner) noArgs >>= (=== 0.0)
+  enter d alice "alice" 100.0
+  d.fund alice 100.0
+  unless (depositsQueued d) do
+    refused "a deposit from an account with no owner" =<< perform d [alice] (Deposit 10.0 noOwner me None)
+    refused "a deposit to an account with no owner" =<< perform d [alice] (Deposit 10.0 me noOwner None)
+    refused "a mint to an account with no owner" =<< perform d [alice] (Mint 1.0 me noOwner None)
+  unless (redemptionsQueued d) do
+    refused "a redemption from an account with no owner" =<< perform d [alice] (Redeem 1.0 noOwner me None)
+    refused "a redemption to an account with no owner" =<< perform d [alice] (Redeem 1.0 me noOwner None)
+    refused "a withdrawal to an account with no owner" =<< perform d [alice] (Withdraw 1.0 me noOwner None)
+
+-- | A party's basic account deposits and redeems, instantly or through a request, as each direction is offered.
+aBasicAccountIsAccepted : Harness -> Script ()
+aBasicAccountIsAccepted h = do
+  found <- h.deploy plainConfig
+  case found of
+    None -> skip (h.name <> " offers no plain vault")
+    Some d -> basicRoundTrip d
+
+basicRoundTrip : Deployment -> Script ()
+basicRoundTrip d = do
+  alice <- allocateParty "alice"
+  let me = basic alice
+  v <- viewOf d
+  d.fund alice 100.0
+  case d.queue of
+    Some q | q.deposits -> do
+      r <- succeeded "a deposit request from the basic account" =<< requestDeposit d alice me me "basic in" 100.0 None
+      _ <- fundRequest q r
+      () <$ q.fill
+    _ | Some issue <- d.issue -> do
+      skip "no deposit through the vault"
+      issue alice 100.0
+    _ -> do
+      ctx <- d.entry me
+      room <- readVault d (MaxDeposit me) ctx.extraArgs
+      assertMsg ("the basic account may deposit 100.0, not " <> show room) (room >= 100.0)
+      () <$ (succeeded "a deposit from the basic account" =<< perform d [alice] (Deposit 100.0 me me None))
+  shares <- holdingOf alice v.shareInstrument me
+  assertMsg "the basic account holds the shares issued" (shares > 0.0)
+  before <- holdingOf alice v.underlyingInstrument me
+  case d.queue of
+    Some q | q.redemptions -> do
+      r <- succeeded "a redeem request from the basic account" =<< requestRedeem d alice me me "basic out" shares None
+      _ <- fundRequest q r
+      () <$ q.fill
+    _ -> do
+      ctx <- d.exit me
+      room <- readVault d (MaxRedeem me) ctx.extraArgs
+      assertMsg ("the basic account may redeem " <> show shares <> ", not " <> show room) (room >= shares)
+      () <$ (succeeded "a redemption from the basic account" =<< perform d [alice] (Redeem shares me me None))
+  after <- holdingOf alice v.underlyingInstrument me
+  assertMsg "the basic account is paid" (after > before)
+
+-- | The custodian account on the view has an owner; a deposit lands in it, and an instant redemption pays from it.
+thePoolSitsInTheCustodianAccount : Harness -> Script ()
+thePoolSitsInTheCustodianAccount h = do
+  found <- h.deploy plainConfig
+  case found of
+    None -> skip (h.name <> " offers no plain vault")
+    Some d | isSome d.issue -> skip "no deposit through the vault"
+    Some d -> do
+      v <- viewOf d
+      custodian <- case v.custodian.owner of
+        Some p -> pure p
+        None -> abort "the custodian account has no owner"
+      let pooled = holdingOf custodian v.underlyingInstrument v.custodian
+      before <- pooled
+      alice <- allocateParty "alice"
+      enter d alice "pooled" 100.0
+      after <- pooled
+      assertMsg ("the custodian account received " <> show (after - before) <> ", not 100.0") (after - before == 100.0)
+      unless (redemptionsQueued d) do
+        let me = basic alice
+        shares <- holdingOf alice v.shareInstrument me
+        r <- succeeded "a redemption" =<< perform d [alice] (Redeem shares me me None)
+        left <- pooled
+        assertMsg ("the custodian account paid " <> show (after - left) <> ", not " <> show r.assets) (after - left == r.assets)
+
+-- | Shares go to the account named, and a payout to the account named, when the vault takes such accounts.
+actionsMoveTheAccountsNamed : Harness -> Script ()
+actionsMoveTheAccountsNamed h = withHistory h plainConfig 61 $ \d -> if not (depositsByVault d) then skip "no deposit through the vault" else do
+  alice <- allocateParty "alice"
+  let me = basic alice
+      savings = me with id = "savings"
+      payout = me with id = "payout"
+  ctx <- d.entry me
+  room <- readVault d (MaxDeposit savings) ctx.extraArgs
+  if room == 0.0 then skip "the vault takes no account other than a basic one" else do
+    d.fund alice 100.0
+    r <- succeeded "a deposit to a named account" =<< perform d [alice] (Deposit 100.0 me savings None)
+    sharesOf d alice savings >>= (=== r.shares)
+    sharesOf d alice me >>= (=== 0.0)
+    unless (redemptionsQueued d) do
+      v <- viewOf d
+      before <- holdingOf alice v.underlyingInstrument payout
+      paid <- perform d [alice] (Redeem (r.shares / 2.0) savings payout None)
+      case paid of
+        Left _ -> skip "the vault pays out to no account other than a basic one"
+        Right out -> do
+          sharesOf d alice savings >>= (=== r.shares - r.shares / 2.0)
+          holdingOf alice v.underlyingInstrument payout >>= (=== before + out.assets)
+
+-- | A deposit or mint that would issue no shares fails.
+-- | Whether a number is a whole power of ten.
+powerOfTen : Decimal -> Bool
+powerOfTen x = x == 1.0 || (x >= 10.0 && powerOfTen (x / 10.0))
+
+-- | The view's virtual offset is the smallest amount of assets, and of shares times a power of ten.
+theVirtualOffsetIsTheSmallestUnit : Harness -> Script ()
+theVirtualOffsetIsTheSmallestUnit h = do
+  found <- h.deploy plainConfig
+  case found of
+    None -> skip (h.name <> " offers no plain vault")
+    Some d -> do
+      v <- viewOf d
+      v.virtualAssets === 0.0000000001
+      assertMsg ("virtualShares " <> show v.virtualShares <> " is not 0.0000000001 times a power of ten")
+        (powerOfTen (v.virtualShares / 0.0000000001))
+
+nothingIsIssuedForNothing : Harness -> Script ()
+nothingIsIssuedForNothing h = do
+  found <- h.deploy plainConfig
+  case found of
+    None -> skip (h.name <> " offers no plain vault")
+    Some d -> if depositsQueued d then skip "deposits are queued" else do
+      alice <- allocateParty "alice"
+      let me = basic alice
+      d.fund alice 10.0
+      refused "a deposit of nothing" =<< perform d [alice] (Deposit 0.0 me me None)
+      refused "a mint of no shares" =<< perform d [alice] (Mint 0.0 me me None)
+      case d.changeValue of
+        None -> skip "the implementation can't raise the price above one"
+        Some change -> do
+          bob <- allocateParty "bob"
+          enter d bob "bob" 100.0
+          change 3.0
+          _ <- d.nextPeriod
+          shares <- readVault d (PreviewDeposit ulp) noArgs
+          shares === 0.0
+          refused "a deposit worth no shares" =<< perform d [alice] (Deposit ulp me me None)
+
+-- | Actions fail once the rate period ends.
+actionsFailWhenThePeriodEnds : Harness -> Script ()
+actionsFailWhenThePeriodEnds h = withHistory h plainConfig 67 $ \d -> do
+  alice <- allocateParty "alice"
+  let me = basic alice
+  enter d alice "alice" 100.0
+  d.fund alice 100.0
+  v <- viewOf d
+  setTime v.rateValidUntil
+  unless (depositsQueued d) do
+    refused "a deposit at the end of the period" =<< perform d [alice] (Deposit 10.0 me me None)
+    refused "a mint at the end of the period" =<< perform d [alice] (Mint 1.0 me me None)
+  unless (redemptionsQueued d) do
+    refused "a redemption at the end of the period" =<< perform d [alice] (Redeem 1.0 me me None)
+    refused "a withdrawal at the end of the period" =<< perform d [alice] (Withdraw 1.0 me me None)
+
+-- | A party the vault is disclosed to reads its view and conversions through the public choices.
+publicReadsServeTheView : Harness -> Script ()
+publicReadsServeTheView h = withHistory h plainConfig 71 $ \d -> do
+  dave <- allocateParty "dave"
+  ctx <- d.entry (basic dave)
+  vaultCid <- d.vault
+  v <- viewOf d
+  fetched <- trySubmit (actAs dave <> discloseMany ctx.disclosures) do
+    exerciseCmd vaultCid Vault_PublicFetch with actors = [dave]
+  case fetched of
+    Left _ -> skip "the vault does not serve this party"
+    Right got -> do
+      got === v
+      worth <- readVault d (ConvertToAssets 10.0) noArgs
+      public <- submit (actAs dave <> discloseMany ctx.disclosures) do
+        exerciseCmd vaultCid Vault_PublicConvertToAssets with shares = 10.0; actors = [dave]
+      public === worth

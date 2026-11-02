@@ -2,10 +2,12 @@
 module Canton.Vault.Test.Attested where
 
 import DA.Assert ((===))
-import DA.Time (addRelTime, hours, microseconds)
+import DA.Foldable (forA_)
+import DA.Time (addRelTime, days, hours, microseconds)
 import Daml.Script
 
 import Canton.Vault.V1
+import Canton.Vault.Reference.Math (mulDivDown)
 import Canton.Vault.Reference.V1
 import Canton.Vault.Reference.Share
 import Canton.Vault.Test.Deposit
@@ -14,6 +16,7 @@ import Canton.Vault.Test.MockToken
 import Canton.Vault.Test.Periods
 
 import Splice.Api.Token.MetadataV1 (ExtraArgs)
+import Splice.TokenStandard.Utils (basicAccount)
 
 -- | The fixture's vault, re-created to be priced by a new oracle party.
 setupOracleVault : Script (Fixture, Party)
@@ -22,7 +25,7 @@ setupOracleVault = do
   oracle <- allocateParty "oracle"
   Some vault <- queryContractId f.registrar f.vaultTemplateCid
   vaultTemplateCid <- submit (actAs [f.registrar, f.custodian]) $
-    archiveCmd f.vaultTemplateCid *> createCmd vault with pricing = OraclePricing with oracle; latest = None
+    archiveCmd f.vaultTemplateCid *> createCmd vault with pricing = OraclePricing with oracle; latest = None; maxAge = days 1
   let f' = f with vaultTemplateCid; vaultCid = toInterfaceContractId vaultTemplateCid
   pure (f', oracle)
 
@@ -53,7 +56,7 @@ redeemFrom f vaultCid shares = do
   poolDs <- poolDisclosures f
   trySubmit (actAs f.alice <> discloseMany (ds <> poolDs)) do
     exerciseCmd (toInterfaceContractId vaultCid : ContractId Vault) Vault_Redeem with
-      shares; receiver = f.alice; owner = f.alice; minAssetsOut = None; actors = [f.alice]
+      shares; receiver = basicAccount f.alice; owner = basicAccount f.alice; minAssetsOut = None; actors = [f.alice]
       extraArgs = redeemArgs f (map (toInterfaceContractId . fst) pool) (map fst held)
 
 -- | The roll prices the vault at the oracle's word, and the view says whose word it is.
@@ -61,17 +64,53 @@ attestedRollPricesTheVault : Script ()
 attestedRollPricesTheVault = script do
   (f, oracle) <- setupOracleVault
   Some before <- queryContractId f.registrar f.vaultTemplateCid
-  (view (toInterface @Vault before)).rate === Computed ComputedRate with asOf = before.rateValidFrom; accrual = None
+  (view (toInterface @Vault before)).rate === Rate with asOf = before.rateValidFrom; accrual = None; inputs = []
   _ <- deposit f f.vaultTemplateCid f.alice 100.0
   now <- getTime
   a <- attest f oracle 1.5 now "nav-1"
   Right rolled <- rollAttested f f.vaultTemplateCid a
   Some vault <- queryContractId f.registrar rolled
   let v = view (toInterface @Vault vault)
-  v.rate === Attested AttestedRate with
-    pricePerShare = 1.5; authority = oracle; effectiveAt = now; attestationId = "nav-1"; accrual = None
-  v.totalShares === 101.0
-  v.totalAssets === 151.5
+  v.rate === Rate with
+    asOf = vault.rateValidFrom; accrual = None
+    inputs = [PriceInput with authority = oracle; subject = "reference-1"; effectiveAt = now; attestationId = "nav-1"]
+  v.totalShares === 100.0
+  v.totalAssets === 150.0
+  (v.virtualShares, v.virtualAssets) === (0.0000000001, 0.0000000001)
+
+-- | Reads the vault's on-ledger conversions, which only its stakeholders can call.
+template ConvertProbe
+  with
+    registrar : Party
+  where
+    signatory registrar
+
+    choice ConvertProbe_Convert : (Decimal, Decimal)
+      with
+        vaultCid : ContractId Vault
+        shares : Decimal
+        assets : Decimal
+      controller registrar
+      do
+        vault <- fetch vaultCid
+        (,) <$> convertToAssets vault shares <*> convertToShares vault assets
+
+-- | A wallet pricing an attested vault from its view's totals gets what the vault computes on-ledger, whatever
+-- the attested price rounds to.
+viewPricesAsTheVaultDoes : Script ()
+viewPricesAsTheVaultDoes = script do
+  forA_ [1.2345678901, 0.9999999999, 3.0000000007] $ \price -> do
+    (f, oracle) <- setupOracleVault
+    _ <- deposit f f.vaultTemplateCid f.alice 101.0
+    now <- getTime
+    Right rolled <- rollAttested f f.vaultTemplateCid =<< attest f oracle price now "nav-1"
+    Some vault <- queryContractId f.registrar rolled
+    let v = view (toInterface @Vault vault)
+    forA_ [1.0, 33.3333333333, 101.0] $ \x -> do
+      (onAssets, onShares) <- submit f.registrar do
+        createAndExerciseCmd (ConvertProbe with registrar = f.registrar) ConvertProbe_Convert with
+          vaultCid = toInterfaceContractId rolled; shares = x; assets = x
+      (onAssets, onShares) === (mulDivDown x (v.totalAssets + v.virtualAssets) (v.totalShares + v.virtualShares), mulDivDown x (v.totalShares + v.virtualShares) (v.totalAssets + v.virtualAssets))
 
 -- | Assets outside the pool are priced but not paid out: redemptions are paid while the pool lasts.
 instantRedemptionsArePaidWhileThePoolLasts : Script ()
@@ -81,7 +120,7 @@ instantRedemptionsArePaidWhileThePoolLasts = script do
   now <- getTime
   Right rolled <- rollAttested f f.vaultTemplateCid =<< attest f oracle 1.5 now "nav-1"
   Right first <- redeemFrom f rolled 50.0
-  first.assets === 75.0
+  first.assets === 74.9999999999
   failsWith "'available' is less than 'transfer.amount'" =<< redeemFrom f rolled 50.0
 
 -- | Reads exit limits with the registrar's and custodian's authority, which the shares and the pool need.
@@ -100,7 +139,7 @@ template ExitProbe
       controller registrar
       do
         vault <- fetch vaultCid
-        (,) <$> maxWithdraw vault party extraArgs <*> maxRedeem vault party extraArgs
+        (,) <$> maxWithdraw vault (basicAccount party) extraArgs <*> maxRedeem vault (basicAccount party) extraArgs
 
 -- | Alice's most withdrawable assets and redeemable shares, naming her shares and the pool.
 maxExits : Fixture -> ContractId ReferenceVault -> Script (Decimal, Decimal)
@@ -124,7 +163,7 @@ maxExitsAreWhatThePoolCanPay = script do
   (withdrawMax, redeemMax) === (100.0, 66.6666666666)
   failsWith "'available' is less than 'transfer.amount'" =<< redeemFrom f rolled 100.0
   Right redeemed <- redeemFrom f rolled redeemMax
-  redeemed.assets === 99.9999999999
+  redeemed.assets === 99.9999999998
 
 attestationFromAnotherPartyIsRefused : Script ()
 attestationFromAnotherPartyIsRefused = script do
@@ -159,6 +198,15 @@ attestationForAnotherRegistrarIsRefused = script do
     exerciseCmd closed ClosedPeriod_Open with
       flowCids = map fst flows; evidence = Attestation other; validUntil = addRelTime now (hours 2)
 
+-- | A roll refuses an attestation older than the vault's limit allows.
+staleAttestationIsRefused : Script ()
+staleAttestationIsRefused = script do
+  (f, oracle) <- setupOracleVault
+  now <- getTime
+  a <- attest f oracle 1.0 now "nav-1"
+  passTime (days 2)
+  failsWith "the attested price is recent enough" =<< rollAttested f f.vaultTemplateCid a
+
 -- | A roll uses its attestation up, so the next roll cannot price from it again.
 attestationIsUsedOnce : Script ()
 attestationIsUsedOnce = script do
@@ -187,7 +235,7 @@ attestationFromTheFutureIsRefused = script do
   (f, oracle) <- setupOracleVault
   now <- getTime
   failsWith "the attested price is not from the future" =<<
-    rollAttested f f.vaultTemplateCid =<< attest f oracle 1.0 (addRelTime now (microseconds 1)) "nav-1"
+    rollAttested f f.vaultTemplateCid =<< attest f oracle 1.0 (addRelTime now (hours 1)) "nav-1"
   Some closed <- (fmap fst . headOf) <$> query @ClosedPeriod f.registrar
   Right reopened <- trySubmit f.registrar (exerciseCmd closed ClosedPeriod_Reopen)
   Right _ <- rollAttested f reopened =<< attest f oracle 1.0 now "nav-2"
@@ -210,6 +258,7 @@ evidenceMustMatchThePricing = script do
 attestedPriceStaysWithinLimits : Script ()
 attestedPriceStaysWithinLimits = script do
   (f, oracle) <- setupOracleVault
+  _ <- deposit f f.vaultTemplateCid f.alice 100.0
   limited <- submit (actAs [f.registrar, f.custodian]) do
     exerciseCmd f.vaultTemplateCid ReferenceVault_SetPriceLimits with limits = lidoLimits
   now <- getTime
@@ -237,7 +286,7 @@ registrarCannotBeItsOwnOracle = script do
   Some vault <- queryContractId f.registrar f.vaultTemplateCid
   failsWith "Template precondition violated" =<< trySubmit (actAs [f.registrar, f.custodian]) do
     createCmd vault with vaultId = "reference-2"; shareInstrument = vault.shareInstrument with id = "reference-2"
-                         pricing = OraclePricing with oracle = f.registrar; latest = None
+                         pricing = OraclePricing with oracle = f.registrar; latest = None; maxAge = days 1
 
 headOf : [a] -> Optional a
 headOf (x :: _) = Some x

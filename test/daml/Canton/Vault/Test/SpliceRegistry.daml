@@ -47,7 +47,7 @@ setup = do
     createCmd ReferenceVault with
       vaultId = "test-token-vault"
       vaultRegistrar = registrar
-      custodian
+      custodian = basicAccount custodian
       underlyingInstrument = V2.InstrumentId with admin = usd.admin; id = "USD"
       shareInstrument = shareId
       totalShares = 100.0
@@ -78,7 +78,7 @@ redeemTo env receiver = do
             (tokenArgs env.usd).context.values
   trySubmit (actAs env.alice <> discloseMany [vaultD, poolD, env.usd.disclosure]) do
     exerciseCmd (toInterfaceContractId env.vaultCid : ContractId Vault) Vault_Redeem with
-      shares = 40.0; owner = env.alice; receiver; minAssetsOut = None; actors = [env.alice]; extraArgs = args
+      shares = 40.0; owner = basicAccount env.alice; receiver = basicAccount receiver; minAssetsOut = None; actors = [env.alice]; extraArgs = args
 
 usdHeldBy : Env -> Party -> Script Decimal
 usdHeldBy env party = do

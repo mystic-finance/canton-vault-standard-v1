@@ -9,10 +9,13 @@ import Canton.Vault.V1
 import Canton.Vault.Reference.V1
 import Canton.Vault.Test.Deposit
 import Canton.Vault.Test.MockToken
+import Canton.Vault.Test.Periods (rollPeriod)
+import Splice.TokenStandard.Utils (basicAccount)
 
--- | A donation after the attacker's first share still leaves the victim's deposit whole.
-donationBeforeTheFirstDepositDoesNotRobTheNext : Script ()
-donationBeforeTheFirstDepositDoesNotRobTheNext = script do
+-- | A donation after the attacker's first share can cost the next depositor, but never pays: the attacker loses at
+-- least as much as the victim.
+donationBeforeTheFirstDepositNeverPays : Script ()
+donationBeforeTheFirstDepositNeverPays = script do
   f <- setupVault
   victim <- allocateParty "victim"
   disclosures <- vaultDisclosure f
@@ -21,8 +24,9 @@ donationBeforeTheFirstDepositDoesNotRobTheNext = script do
   attackerFunds <- fund f f.alice 0.0000000001
   attackerResult <- submit (actAs f.alice <> discloseMany disclosures) do
     exerciseCmd f.vaultCid Vault_Deposit with
+      sender = basicAccount f.alice
       assets = 0.0000000001
-      receiver = f.alice
+      receiver = basicAccount f.alice
       minSharesOut = None
       actors = [f.alice]
       extraArgs = depositArgs f [attackerFunds]
@@ -39,8 +43,9 @@ donationBeforeTheFirstDepositDoesNotRobTheNext = script do
       None -> abort "pool holding disclosure not available"
   now <- getTime
   closed12 <- closePeriod f f.vaultTemplateCid
-  rolledCid <- submit (actAs f.registrar <> discloseMany poolDisclosures) do
-    exerciseCmd closed12 ClosedPeriod_Open with
+  -- A price this far above the last needs the custodian's agreement too.
+  rolledCid <- submit (actAs [f.registrar, f.custodian] <> discloseMany poolDisclosures) do
+    exerciseCmd closed12 ClosedPeriod_OpenBeyondLimits with
       flowCids = map fst flows
       evidence = PoolHoldings (map (toInterfaceContractId . fst) pool)
       validUntil = addRelTime now (hours 2)
@@ -55,16 +60,16 @@ donationBeforeTheFirstDepositDoesNotRobTheNext = script do
     (Some v, Some r) -> pure [v, r]
     _ -> abort "disclosures not available"
 
-  victimFunds <- fund f victim 100.0
+  victimFunds <- fund f victim 1500.0
   victimResult <- submit (actAs victim <> discloseMany rolledDisclosures) do
     exerciseCmd (toInterfaceContractId rolledCid : ContractId Vault) Vault_Deposit with
-      assets = 100.0
-      receiver = victim
+      sender = basicAccount victim
+      assets = 1500.0
+      receiver = basicAccount victim
       minSharesOut = None
       actors = [victim]
       extraArgs = depositArgs f [victimFunds]
 
-  -- What the victim can get back must be close to what they paid in.
   worth <- submit f.registrar do
     createAndExerciseCmd (MaxRedeemProbe with caller = f.registrar) (Probe_Run with
       vaultCid = toInterfaceContractId rolledCid
@@ -72,19 +77,19 @@ donationBeforeTheFirstDepositDoesNotRobTheNext = script do
       extraArgs = redeemArgs f [] (map fromInterfaceContractId victimResult.holdingCids))
   worth === victimResult.shares
 
+  -- Valued once the next roll counts the victim's deposit.
+  counted <- rollPeriod f rolledCid
   backing <- submit f.registrar do
     createAndExerciseCmd (MaxRedeemProbe with caller = f.registrar) (Probe_ConvertToAssets with
-      vaultCid = toInterfaceContractId rolledCid
+      vaultCid = toInterfaceContractId counted
       shares = victimResult.shares)
-  assertMsg
-    ("victim paid 100.0, shares are worth " <> show backing)
-    (backing >= 99.9)
-
-  -- The attacker cannot recover the donation.
   attackerBacking <- submit f.registrar do
     createAndExerciseCmd (MaxRedeemProbe with caller = f.registrar) (Probe_ConvertToAssets with
-      vaultCid = toInterfaceContractId rolledCid
+      vaultCid = toInterfaceContractId counted
       shares = attackerResult.shares)
+  (victimResult.shares, backing, attackerBacking) === (0.0000000002, 1250.0000000001, 625.0)
+  let victimLoss = 1500.0 - backing
+      attackerLoss = 1000.0000000001 - attackerBacking
   assertMsg
-    ("attacker donated 1000.0, their shares are worth " <> show attackerBacking)
-    (attackerBacking < 1.0)
+    ("the attacker lost " <> show attackerLoss <> ", less than the victim's " <> show victimLoss)
+    (attackerLoss >= victimLoss)

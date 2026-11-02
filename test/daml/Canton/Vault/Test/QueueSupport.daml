@@ -6,10 +6,12 @@ import DA.Text qualified as T
 import DA.TextMap qualified as TextMap
 import Daml.Script
 
+import Canton.Vault.V1 qualified as V
 import Canton.Vault.Reference.V1 (PriceLimits(..))
 
 import Splice.Api.Token.MetadataV1
 import Splice.Api.Token.AllocationV2 qualified as V2
+import Splice.TokenStandard.Utils (basicAccount)
 
 -- | Passes only if the submission was refused, and for the given reason.
 failsWith : Text -> Either SubmitError a -> Script ()
@@ -17,6 +19,35 @@ failsWith reason result = case result of
   Left e | reason `T.isInfixOf` show e -> pure ()
   Left e -> abort ("refused for another reason than '" <> reason <> "': " <> show e)
   Right _ -> abort ("accepted, though it should be refused: " <> reason)
+
+-- | Reads one of a vault's max or preview methods, named by `method`.
+template PathProbe
+  with
+    caller : Party
+  where
+    signatory caller
+    choice Probe_Path : Decimal
+      with
+        vaultCid : ContractId V.Vault
+        method : Text
+        amount : Decimal
+        party : Party
+        extraArgs : ExtraArgs
+      controller caller
+      do
+        vault <- fetch vaultCid
+        let methods =
+              [ ("maxDeposit", V.maxDeposit vault (basicAccount party) extraArgs)
+              , ("maxMint", V.maxMint vault (basicAccount party) extraArgs)
+              , ("maxWithdraw", V.maxWithdraw vault (basicAccount party) extraArgs)
+              , ("maxRedeem", V.maxRedeem vault (basicAccount party) extraArgs)
+              , ("previewDeposit", V.previewDeposit vault amount)
+              , ("previewMint", V.previewMint vault amount)
+              , ("previewWithdraw", V.previewWithdraw vault amount)
+              , ("previewRedeem", V.previewRedeem vault amount) ]
+        case lookup method methods of
+          Some read -> read
+          None -> abort ("no such method: " <> method)
 
 -- | An allocation its owner wrote and signed alone, claiming whatever its view says.
 template FakeAllocation

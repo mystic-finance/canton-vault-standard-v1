@@ -243,7 +243,7 @@ template MaxRedeemProbe
       controller caller
       do
         vault <- fetch vaultCid
-        maxMint vault party extraArgs
+        maxMint vault (basicAccount party) extraArgs
 
     choice Probe_MaxWithdraw : Decimal
       with
@@ -253,7 +253,7 @@ template MaxRedeemProbe
       controller caller
       do
         vault <- fetch vaultCid
-        maxWithdraw vault party extraArgs
+        maxWithdraw vault (basicAccount party) extraArgs
 
     choice Probe_ConvertToAssets : Decimal
       with
@@ -272,7 +272,7 @@ template MaxRedeemProbe
       controller caller
       do
         vault <- fetch vaultCid
-        maxRedeem vault party extraArgs
+        maxRedeem vault (basicAccount party) extraArgs
 
 -- | Every read method's answer at one moment, for conformance tests.
 data Quote = Quote with
@@ -310,8 +310,8 @@ template QuoteProbe
         mintPreview <- previewMint vault shares
         withdrawPreview <- previewWithdraw vault assets
         redeemPreview <- previewRedeem vault shares
-        depositMax <- maxDeposit vault party extraArgs
-        mintMax <- maxMint vault party extraArgs
-        withdrawMax <- maxWithdraw vault party extraArgs
-        redeemMax <- maxRedeem vault party extraArgs
+        depositMax <- maxDeposit vault (basicAccount party) extraArgs
+        mintMax <- maxMint vault (basicAccount party) extraArgs
+        withdrawMax <- maxWithdraw vault (basicAccount party) extraArgs
+        redeemMax <- maxRedeem vault (basicAccount party) extraArgs
         pure Quote with ..

@@ -6,6 +6,8 @@ module Canton.Vault.Test.Reports where
 import DA.Optional (optionalToList)
 import Daml.Script
 
+import Canton.Vault.EventLog.V1
+
 -- | The arguments of every exercise of the choice in the tree.
 exercisesOf : forall t c r. (Template t, Choice t c r) => TransactionTree -> [c]
 exercisesOf tree = concatMap (exercisesIn @t @c @r) tree.rootEvents
@@ -14,3 +16,7 @@ exercisesIn : forall t c r. (Template t, Choice t c r) => TreeEvent -> [c]
 exercisesIn (CreatedEvent _) = []
 exercisesIn (ExercisedEvent e) =
   optionalToList (fromAnyChoice @t @c e.argument) <> concatMap (exercisesIn @t @c @r) e.childEvents
+
+-- | Every event a vault reported in the tree.
+vaultReports : TransactionTree -> [VaultEventLog_Report]
+vaultReports = exercisesOf @VaultEventLog @VaultEventLog_Report

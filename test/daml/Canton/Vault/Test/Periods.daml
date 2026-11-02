@@ -10,6 +10,7 @@ import Canton.Vault.Reference.V1
 import Canton.Vault.Reference.Share
 import Canton.Vault.Test.Deposit
 import Canton.Vault.Test.MockToken
+import Splice.TokenStandard.Utils (basicAccount)
 
 -- | Roll the period, measuring the pool from the custodian's holdings.
 rollPeriod : Fixture -> ContractId ReferenceVault -> Script (ContractId ReferenceVault)
@@ -25,6 +26,20 @@ rollPeriod f vaultCid = do
   closed1 <- closePeriod f vaultCid
   submit (actAs f.registrar <> discloseMany poolDisclosures) do
     exerciseCmd closed1 ClosedPeriod_Open with
+      flowCids = map fst flows
+      evidence = PoolHoldings (map (toInterfaceContractId . fst) pool)
+      validUntil = addRelTime now (hours 2)
+
+-- | Roll the period as `rollPeriod` does, with the custodian agreeing to a price beyond the vault's limits.
+rollPeriodBeyondLimits : Fixture -> ContractId ReferenceVault -> Script (ContractId ReferenceVault)
+rollPeriodBeyondLimits f vaultCid = do
+  flows <- query @PeriodFlow f.registrar
+  pool <- query @MockHolding f.custodian
+  ds <- poolDisclosures f
+  now <- getTime
+  closed <- closePeriod f vaultCid
+  submit (actAs [f.registrar, f.custodian] <> discloseMany ds) do
+    exerciseCmd closed ClosedPeriod_OpenBeyondLimits with
       flowCids = map fst flows
       evidence = PoolHoldings (map (toInterfaceContractId . fst) pool)
       validUntil = addRelTime now (hours 2)
@@ -53,8 +68,9 @@ deposit f vaultCid party amount = do
   ds <- disclosuresFor f vaultCid
   submit (actAs party <> discloseMany ds) do
     exerciseCmd (toInterfaceContractId vaultCid : ContractId Vault) Vault_Deposit with
+      sender = basicAccount party
       assets = amount
-      receiver = party
+      receiver = basicAccount party
       minSharesOut = None
       actors = [party]
       extraArgs = depositArgs f [funds]
@@ -185,8 +201,8 @@ manyDepositorsInOnePeriod = script do
   redeemed <- submit (actAs bob <> discloseMany (ds <> poolDisclosures)) do
     exerciseCmd (toInterfaceContractId rolled : ContractId Vault) Vault_Redeem with
       shares = 250.0
-      owner = bob
-      receiver = bob
+      owner = basicAccount bob
+      receiver = basicAccount bob
       minAssetsOut = Some 250.0
       actors = [bob]
       extraArgs = redeemArgs f
@@ -213,8 +229,9 @@ pendingLegMintsNothing = script do
 
   submitMustFail (actAs f.alice <> discloseMany ds) do
     exerciseCmd f.vaultCid Vault_Deposit with
+      sender = basicAccount f.alice
       assets = 100.0
-      receiver = f.alice
+      receiver = basicAccount f.alice
       minSharesOut = None
       actors = [f.alice]
       extraArgs = args
@@ -253,8 +270,8 @@ redeemFeeStaysInThePool = script do
   redeemed <- submit (actAs f.alice <> discloseMany (ds <> poolDisclosures)) do
     exerciseCmd (toInterfaceContractId rolled : ContractId Vault) Vault_Redeem with
       shares = alice.shares
-      owner = f.alice
-      receiver = f.alice
+      owner = basicAccount f.alice
+      receiver = basicAccount f.alice
       minAssetsOut = None
       actors = [f.alice]
       extraArgs = redeemArgs f
@@ -296,8 +313,9 @@ depositCannotIssueToAnAbsentParty = script do
   funds <- fund f f.alice 100.0
   submitMustFail (actAs f.alice <> discloseMany ds) do
     exerciseCmd (toInterfaceContractId f.vaultTemplateCid : ContractId Vault) Vault_Deposit with
+      sender = basicAccount f.alice
       assets = 100.0
-      receiver = stranger
+      receiver = basicAccount stranger
       minSharesOut = None
       actors = [f.alice]
       extraArgs = depositArgs f [funds]
@@ -310,7 +328,7 @@ feesOutsideRangeAreRejected = script do
   let mk bps = createCmd ReferenceVault with
         vaultId = "bad"
         vaultRegistrar = f.registrar
-        custodian = f.custodian
+        custodian = basicAccount f.custodian
         underlyingInstrument = f.underlying
         shareInstrument = f.shares with id = "bad"
         totalShares = 0.0
@@ -338,7 +356,7 @@ shareInstrumentIsTheVaults = script do
   let mk shares = createCmd ReferenceVault with
         vaultId = "second"
         vaultRegistrar = f.registrar
-        custodian = f.custodian
+        custodian = basicAccount f.custodian
         underlyingInstrument = f.underlying
         shareInstrument = shares
         totalShares = 0.0
