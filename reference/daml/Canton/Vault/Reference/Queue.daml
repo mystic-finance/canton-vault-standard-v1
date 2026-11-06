@@ -35,7 +35,6 @@ redemptionAccount registrar = V2.Account with owner = Some registrar; provider =
 requestPolicies : Metadata
 requestPolicies = Metadata with values = TextMap.fromList [(requestPricingKey, "period-close")]
 
--- | A registry's allocation and settlement factories.
 data Factories = Factories with
     allocationFactory : ContractId V2.AllocationFactory
     settlementFactory : ContractId V2.SettlementFactory
@@ -129,7 +128,6 @@ requireRequested what admin settlement spec cid = do
   require' (what <> ".settlement", allocation.settlement) isEqualR ("requested settlement", settlement)
   require' (what, allocation.allocation) isEqualR ("requested", spec)
 
--- | Fetches an allocation, refusing one its registry's admin did not sign.
 fetchSigned : Text -> Party -> ContractId V2.Allocation -> Update V2.AllocationView
 fetchSigned what admin cid = do
   allocation <- fetch cid
@@ -164,7 +162,6 @@ allocateSides : Factories -> ExtraArgs -> V2.SettlementInfo -> Time -> Party -> 
 allocateSides factories extraArgs settlement requestedAt admin authorizer actors inputHoldingCids sides =
   fst <$> allocateSidesWithChange factories extraArgs settlement requestedAt admin authorizer actors inputHoldingCids sides
 
--- | Allocates the vault's side of a batch, returning the change of the instrument from the holdings it used.
 allocateSidesWithChange : Factories -> ExtraArgs -> V2.SettlementInfo -> Time -> Party -> V2.Account -> [Party] -> [ContractId V2.Holding] -> [V2.TransferLegSide] -> Update (ContractId V2.Allocation, [ContractId V2.Holding])
 allocateSidesWithChange factories extraArgs settlement requestedAt admin authorizer actors inputHoldingCids sides = do
   result <- exercise factories.allocationFactory V2.AllocationFactory_Allocate with
@@ -197,7 +194,6 @@ droppedBy requester executors actor
   | actor `elem` executors = CR_Rejected
   | otherwise = CR_Expired
 
--- | The contract ids listed under the key in a choice context.
 getContractIds : Text -> ChoiceContext -> Update [ContractId t]
 getContractIds key context = case TextMap.lookup key context.values of
   Some (AV_List cids) -> forA cids $ \v -> case v of

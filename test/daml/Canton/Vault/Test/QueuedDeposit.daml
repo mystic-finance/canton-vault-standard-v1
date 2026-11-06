@@ -218,13 +218,11 @@ fulfilCmd env requests prices = exerciseCmd env.vaultCid Q.ReferenceQueuedDeposi
   underlyingExtraArgs = tokenArgs env.usd
   shareExtraArgs = tokenArgs env.shares
 
--- | Every price the vault has struck.
 pricesOf : Env -> Script [ContractId Q.PeriodPrice]
 pricesOf env = do
   prices <- query @Q.PeriodPrice env.registrar
   pure [cid | (cid, p) <- prices, p.vaultId == env.vaultId]
 
--- | Rolls the vault into the next period.
 nextPeriod : Env -> Script Env
 nextPeriod env = do
   now <- current env
@@ -972,9 +970,6 @@ executorCannotSignARequestAsRegistrar = script do
     fulfilAs env env.venue [req with requestCid = forged; shareAllocation = venues]
   tokens env (sharesId env) env.venue >>= (=== 0.0)
 
--- Allocations the registries did not issue
---------------------------------------------
-
 -- Batches
 -----------
 
@@ -1346,7 +1341,6 @@ aQueuedRollBeyondTheLimitsNeedsTheCustodian = script do
   prices <- map snd <$> query @Q.PeriodPrice env.registrar
   map (\p -> (p.epoch, p.totalAssets)) prices === [(2, 10.0)]
 
--- | A fulfilment is reported to the requester and to the receiver they named.
 fulfilmentIsReportedToRequesterAndReceiver : Script ()
 fulfilmentIsReportedToRequesterAndReceiver = script do
   env <- setup
@@ -1412,7 +1406,6 @@ onlyTheRequestedAllocationsBind = script do
   Right _ <- bindAs env env.venue cid exact receiving
   pure ()
 
--- | An escrow paying another account of the custodian is refused.
 escrowToAnotherCustodianAccountIsRefused : Script ()
 escrowToAnotherCustodianAccountIsRefused = script do
   env <- setup
@@ -1442,7 +1435,6 @@ allocationsBindBeforeThePeriodEnds = script do
   setTime r1.fundBy
   failsWith "rate period is still open" =<< bindAs env env.venue c2 e2 a2
 
--- | Only the executors bind, and only allocations their registries signed.
 onlyExecutorsBindSignedAllocations : Script ()
 onlyExecutorsBindSignedAllocations = script do
   env <- setup
@@ -1517,7 +1509,6 @@ allocationsAreNotBoundAfterAnEarlyRoll = script do
   next <- nextPeriod env
   failsWith "allocations are bound in the request's own period" =<< bindAs next env.venue cid escrowed receiving
 
--- | The vault says on its view when it prices requests.
 viewSaysWhenRequestsArePriced : Script ()
 viewSaysWhenRequestsArePriced = script do
   env <- setup

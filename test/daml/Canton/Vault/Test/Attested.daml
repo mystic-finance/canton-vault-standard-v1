@@ -241,7 +241,6 @@ attestationFromTheFutureIsRefused = script do
   Right _ <- rollAttested f reopened =<< attest f oracle 1.0 now "nav-2"
   pure ()
 
--- | The evidence must match how the vault is priced.
 evidenceMustMatchThePricing : Script ()
 evidenceMustMatchThePricing = script do
   (f, oracle) <- setupOracleVault

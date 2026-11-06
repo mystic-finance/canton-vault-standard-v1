@@ -172,7 +172,6 @@ instantChoicesRefuseAnAccountWithNoOwner = script do
     failsWith "owner has an owner" =<< exit noOwner alice
     failsWith "receiver has an owner" =<< exit alice noOwner
 
--- | Both request choices refuse an account with no owner.
 requestsRefuseAnAccountWithNoOwner : Script ()
 requestsRefuseAnAccountWithNoOwner = script do
   env <- QD.setup

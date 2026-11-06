@@ -124,7 +124,6 @@ mintAndWithdrawSpendWhatTheyMove = script do
   auth <- authOf f.alice
   allowances f.alice auth >>= (=== (Some 80.0, Some 45.0))
 
--- | A delegate given no redeem allowance cannot redeem.
 aDelegateWithoutARedeemAllowanceCannotRedeem : Script ()
 aDelegateWithoutARedeemAllowanceCannotRedeem = script do
   f <- setupVault
@@ -134,7 +133,6 @@ aDelegateWithoutARedeemAllowanceCannotRedeem = script do
   auth <- authOf f.alice
   failsWith "the delegate may not redeem" =<< redeemAs f bob auth 10.0 bob
 
--- | An authorization stops working at its expiry.
 anExpiredAuthorizationIsRefused : Script ()
 anExpiredAuthorizationIsRefused = script do
   f <- setupVault
@@ -143,7 +141,6 @@ anExpiredAuthorizationIsRefused = script do
   passTime (minutes 1)
   failsWith "the authorization has expired" =<< depositAs f bob auth 10.0
 
--- | An authorization names one vault and works in no other.
 anAuthorizationIsForOneVault : Script ()
 anAuthorizationIsForOneVault = script do
   f <- setupVault
@@ -290,7 +287,6 @@ aDelegateQueuesARedemptionForTheOwner = script do
   failsWith "the redeem allowance is exceeded" =<< requestAs auth "r2" 30.0
   allowances env.alice auth >>= (=== (None, Some 20.0))
 
--- | A delegate pays in only from the owner's own accounts.
 aDelegatePaysInOnlyFromTheOwnersAccounts : Script ()
 aDelegatePaysInOnlyFromTheOwnersAccounts = script do
   f <- setupVault

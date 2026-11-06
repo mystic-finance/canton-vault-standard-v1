@@ -256,13 +256,11 @@ requestFor env party receiver label shares minAssetsOut = do
 queueRequest : Env -> Party -> Text -> Decimal -> Script (RequestId, Req)
 queueRequest env party label shares = requestFor env party party label shares None
 
--- | Every price the vault has struck.
 pricesOf : Env -> Script [ContractId R.PeriodPrice]
 pricesOf env = do
   prices <- query @R.PeriodPrice env.registrar
   pure [cid | (cid, p) <- prices, p.vaultId == env.vaultId]
 
--- | Rolls the vault into the next period.
 nextPeriod : Env -> Script Env
 nextPeriod env = do
   now <- current env
@@ -1014,9 +1012,6 @@ executorCannotSignARequestAsRegistrar = script do
   unlocked env (usdId env) env.venue >>= (=== 0.0)
   supply env >>= (=== 100.0)
 
--- Allocations the registries did not issue
---------------------------------------------
-
 -- Batches
 -----------
 
@@ -1459,7 +1454,6 @@ allocationsAreNotBoundAfterAnEarlyRoll = script do
   next <- nextPeriod env
   failsWith "allocations are bound in the request's own period" =<< bindAs next env.venue cid escrowed receiving
 
--- | The vault says on its view when it prices requests.
 viewSaysWhenRequestsArePriced : Script ()
 viewSaysWhenRequestsArePriced = script do
   env <- setup
