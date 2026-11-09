@@ -99,11 +99,9 @@ the roll nor the ledger grows with activity.
   outside vault actions, such as yield or a loss, shows only at the next roll:
   roll promptly after one, and use accrual for steady yield. On Canton Coin a
   period is at most 90 days, the longest a transfer may live.
-- A redemption names the pool holdings it pays from, and two redemptions naming
-  the same holding collide: one fails. Clients pick holdings at random and retry.
-  Keeping the pool in several holdings lets redemptions run side by side; merging
-  them now and then keeps a roll's read small (a Canton Coin transfer takes at
-  most 100 inputs).
+- Each redemption specifies the pool holdings it will draw from. If two redemptions target the same holding, they conflict, and one will fail.
+  To avoid this, clients randomly select holdings and retry failed transactions. Keeping the pool distributed across multiple holdings allows redemptions to execute in
+  parallel. Periodically consolidating those holdings keeps the number of inputs required for a roll manageable, since a Canton Coin transfer supports a maximum of 100 inputs.
 
 ## Packages
 
