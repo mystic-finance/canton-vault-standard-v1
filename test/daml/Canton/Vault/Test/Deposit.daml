@@ -190,7 +190,6 @@ slippageLimitIsEnforced = script do
       actors = [f.alice]
       extraArgs = depositArgs f [holdingCid]
 
--- | Shares redeem back into the underlying.
 redeemReturnsUnderlying : Script ()
 redeemReturnsUnderlying = script do
   f <- setupVault

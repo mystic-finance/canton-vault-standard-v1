@@ -99,7 +99,6 @@ template RateAttestation
     pricePerShare : Decimal
       -- ^ The price of one share in units of the underlying.
     effectiveAt : Time
-      -- ^ The time the price was taken.
     attestationId : Text
   where
     signatory oracle
@@ -423,7 +422,6 @@ template ReferenceVault
       do create this with priceLimits = limits
 
     choice ReferenceVault_SetPaused : ContractId ReferenceVault
-      -- ^ Pause or resume deposits and mints.
       with
         pause : Bool
       controller vaultRegistrar
@@ -443,9 +441,6 @@ template ReferenceVault
         caller : Party
       controller caller
       do pure this
-
--- Helpers
------------
 
 recordEvent : ReferenceVault -> V2.Account -> [Party] -> V2.Account -> VaultEvent -> Update ()
 recordEvent vault owner actors receiver event = report vault.vaultRegistrar vault.vaultId [Report with owner; receiver; actors; event; meta = emptyMetadata]
@@ -587,7 +582,6 @@ delegation actors account extraArgs
 orDelegated : Update (Optional a) -> (a -> Update b) -> Update b -> Update b
 orDelegated found delegated own = found >>= optional own delegated
 
--- | Whether the actors include all of the account's parties.
 includesParties : [Party] -> V2.Account -> Bool
 includesParties actors account = all (`elem` actors) (regularAccountParties account)
 
@@ -614,7 +608,6 @@ requirePayOut owner receiver actors = do
   requireRegular "receiver" receiver
   requireActing "owner" owner actors
 
--- | Refuses to transact against a rate period that has ended.
 requirePeriodOpen : ReferenceVault -> Update ()
 requirePeriodOpen vault = do
   open <- isLedgerTimeLT vault.rateValidUntil

@@ -146,7 +146,6 @@ actionsFailAfterThePeriodEnds = script do
 -- Amounts and caps
 --------------------
 
--- | A deposit over the vault's cap is refused.
 depositOverTheCapIsRejected : Script ()
 depositOverTheCapIsRejected = script do
   f <- setupCappedVault 50.0
@@ -271,7 +270,6 @@ redeemBeyondTheNamedHoldingsIsRejected = script do
       -- Names no share holdings at all.
       extraArgs = redeemArgs f (map (toInterfaceContractId . fst) pool) []
 
--- | A locked share holding cannot be burned.
 lockedSharesCannotBeRedeemed : Script ()
 lockedSharesCannotBeRedeemed = script do
   f <- setupVault
@@ -306,7 +304,6 @@ lockedSharesCannotBeRedeemed = script do
       actors = [f.alice]
       extraArgs = redeemArgs f (map (toInterfaceContractId . fst) pool) [lockedCid]
 
--- | Minting over the cap is refused, as depositing over it is.
 mintOverTheCapIsRejected : Script ()
 mintOverTheCapIsRejected = script do
   f <- setupCappedVault 50.0
@@ -321,7 +318,6 @@ mintOverTheCapIsRejected = script do
       actors = [f.alice]
       extraArgs = depositArgs f [funds]
 
--- | A locked pool holding cannot be counted at a roll.
 rollRejectsLockedPoolHoldings : Script ()
 rollRejectsLockedPoolHoldings = script do
   f <- setupVault
@@ -436,7 +432,6 @@ maxRedeemRejectsDuplicateShareHoldings = script do
       party = f.alice
       extraArgs = redeemArgs f [] (aliceShares <> aliceShares))
 
--- | Another party's holdings are not the caller's to redeem.
 maxRedeemRejectsAnotherPartysHoldings : Script ()
 maxRedeemRejectsAnotherPartysHoldings = script do
   f <- setupVault
@@ -469,7 +464,6 @@ maxRedeemRejectsTheWrongInstrument = script do
       party = f.alice
       extraArgs = redeemArgs f [] [otherCid])
 
--- | Locked shares are not available to redeem.
 maxRedeemRejectsALockedShareHolding : Script ()
 maxRedeemRejectsALockedShareHolding = script do
   f <- setupVault

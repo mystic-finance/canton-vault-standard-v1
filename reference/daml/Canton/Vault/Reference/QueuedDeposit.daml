@@ -107,7 +107,6 @@ template ReferenceQueuedDepositVault
         settlementDeadlineWindow
         meta = requestPolicies
 
-      -- A request's id is the period it was made in.
       pendingDepositRequest requestId account extraArgs = do
         requestCids : [ContractId QueuedDepositRequest] <- dedup <$> getContractIds depositRequestsKey extraArgs.context
         amounts <- forA requestCids $ \cid -> do
@@ -341,7 +340,6 @@ template ReferenceQueuedDepositVault
       do create this with priceLimits = limits
 
     choice ReferenceQueuedDepositVault_SetPaused : ContractId ReferenceQueuedDepositVault
-      -- ^ Pause or resume requests and fulfilments.
       with
         pause : Bool
       controller vaultRegistrar
@@ -414,9 +412,7 @@ template QueuedDepositRequest
     requester : Party
     receiver : Party
     sender : V2.Account
-      -- ^ The account the escrow is funded from.
     receiverAccount : V2.Account
-      -- ^ The account the shares are issued to.
     label : Text
     assets : Decimal
     anchor : ContractId RequestAnchor

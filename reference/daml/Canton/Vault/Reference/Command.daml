@@ -39,12 +39,10 @@ template VaultCommand
     actors : [Party]
       -- ^ The parties who signed the command and act in the vault action.
     executor : Party
-      -- ^ The party who runs the command.
     vaultId : Text
     vaultRegistrar : Party
     action : CommandAction
     expiresAt : Time
-      -- ^ The time after which the command can no longer run.
   where
     signatory actors
     observer executor
