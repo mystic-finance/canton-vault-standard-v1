@@ -239,9 +239,9 @@ requestPricingKey = "canton-vault/request-pricing"
 -- Whether an owner without it may still withdraw or redeem is the vault's own,
 -- and its max methods say so.
 --
--- Choices a vault adds for its own roles, such as filling requests or
--- publishing a price, MUST take their controllers from the vault contract
--- rather than from an argument.
+-- Choices a vault adds for its own roles, such as filling requests or publishing
+-- a price, MUST NOT let a caller give itself a role: their controllers come from
+-- the vault contract or from an authorization the vault's signatories created.
 --
 -- A delegate acts through the vault: it exercises the vault's choice as the
 -- actor, naming a `VaultDelegateAuth` (package `canton-vault-delegation-v1`)
