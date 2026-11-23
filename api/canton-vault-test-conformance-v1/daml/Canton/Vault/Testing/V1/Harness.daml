@@ -92,3 +92,8 @@ data Queue = Queue with
       -- ^ The executors end the requester's request under the label unfilled.
     pending : Account -> Script Prepared
       -- ^ The context naming the account's requests, for the pending methods.
+    shortfall : Optional (Decimal -> Script [TransactionTree])
+      -- ^ Opens the next period able to pay only that much of what is queued,
+      -- in the units requests are made in, and fills what it can, shared as
+      -- the vault's fill order says; `None` if the implementation can't make
+      -- its vault run short.

@@ -29,11 +29,12 @@ APIs and `daml-script`. It knows nothing about any particular implementation.
 | `publicReadsServeTheView` | `Vault_PublicFetch` returns the view; `Vault_PublicConvertToAssets` agrees with `convertToAssets`. |
 | `instantActionsAreReported` | Each instant action is reported once, with what moved, to both accounts' parties and the actors. |
 | `queuedDirectionsHaveNoInstantPath` | A queued direction's previews fail, its maxes are zero and its instant actions fail. |
-| `requestsPublishTheirTerms` | A request publishes allocation requests under the vault's executors, committed no later than the period's end plus the window; the async view says when requests are priced. |
+| `requestsPublishTheirTerms` | A request publishes allocation requests under the vault's executors, committed no later than the period's end plus the window; the async view says when requests are priced, when their fee is fixed and how they share a shortfall. |
 | `requestsAreEndedByTheirParties` | The requester and the receiver can decline and the executors can withdraw, each reported with its close reason. |
 | `requestsAreFilled` | A funded request is pending until filled, and the receiver is paid. |
 | `minimumsAreHonoured` | A request whose minimum no fill can meet stays queued and pays nothing. |
 | `requestIdsKeepTheirPromise` | A direction's requests take the id `0` all or none, and two sharing another id are filled together, at one rate. |
+| `shortfallsFollowTheFillOrder` | A vault declaring `oldest-first` or `pro-rata`, run short by half of two equal requests of different ids, fills the older whole and the newer not at all, or each by half. |
 | `pendingRebuildsFromEvents` | What a request has queued, rebuilt from the events alone, equals the pending methods at every step. |
 | `delegatesActWithinTheirAllowance` | `VaultDelegateAuth` works against the vault, and its allowance is spent. |
 
@@ -56,8 +57,10 @@ of driving a vault that the standard leaves to you:
   outside, as yield or a loss would.
 - For a vault with a queued direction, `queue` makes allocations as a wallet
   would, accepts a request's funding, fills, rejects, and names a party's
-  requests for the pending methods. Each returns the transaction trees it
-  submitted, so the suite can read your events.
+  requests for the pending methods. If you can, its `shortfall` opens a
+  period able to pay only part of what is queued and fills as your fill order
+  says. Each returns the transaction trees it submitted, so the suite can read
+  your events.
 - `issue` is for test environments where a deposit can't complete through the
   vault, for example a registry that needs the custodian's consent. It gives a
   party shares that your books count, and the properties that need a deposit to
@@ -87,6 +90,6 @@ The slippage failure waits on a decision about the standard: the suite
 matches the `vaultSlippageExceeded` text, and if the standard moves to a
 structured error, the check moves with it.
 
-Partial fills aren't checked, so neither is the rule that requests sharing an
-id fill in the same proportion: how and when a vault fills in part is its own,
-and the harness has no way to ask for one.
+Partial fills are checked only through `shortfall`, for a vault declaring
+`oldest-first` or `pro-rata`, so the rule that requests sharing an id fill in
+the same proportion isn't: how and when a vault fills in part is its own.

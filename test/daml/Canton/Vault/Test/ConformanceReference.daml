@@ -4,7 +4,7 @@ module Canton.Vault.Test.ConformanceReference where
 
 import DA.Action (void)
 import DA.Foldable (forA_)
-import DA.List (head, (!!))
+import DA.List (dedup, head, sort, (!!))
 import DA.Optional (fromSome)
 import DA.TextMap qualified as TextMap
 import Daml.Script
@@ -22,7 +22,9 @@ import Canton.Vault.Test.MockToken
 import Canton.Vault.Test.Periods (disclosuresFor, poolDisclosures, rollPeriod)
 import Canton.Vault.Test.QueuedDeposit qualified as QD
 import Canton.Vault.Test.QueuedRedeem qualified as QR
+import Canton.Vault.Test.AttestedRedeem qualified as AR
 import Canton.Vault.Testing.V1.Harness
+import Canton.Vault.Testing.V1.Queued (shortfallsFollowTheFillOrder)
 import Canton.Vault.Testing.V1.Suite qualified as Suite
 
 import Splice.Api.Token.MetadataV1
@@ -211,6 +213,7 @@ queuedDepositDeployment env = Deployment with
       pure Prepared with
         extraArgs = QD.requestArgs [cid | (cid, r) <- live, r.vaultId == env.vaultId, r.sender == account]
         disclosures = []
+    shortfall = None
   issue = None
 
 referenceQueuedRedeem : Harness
@@ -262,6 +265,7 @@ queuedRedeemDeployment env = Deployment with
       pure Prepared with
         extraArgs = QR.requestArgs [cid | (cid, r) <- live, r.vaultId == env.vaultId, r.sender == account]
         disclosures = []
+    shortfall = None
   -- The test token needs the custodian's consent to receive, so the operator issues shares and books the flow.
   issue = Some $ \party assets -> do
     now <- QR.current env
@@ -273,6 +277,40 @@ queuedRedeemDeployment env = Deployment with
         assetsDelta = assets; sharesDelta = shares
     _ <- QR.holdingOf env.custodian env.usd.admin (QR.usdId env) assets
     void (QR.holdingOf party env.registrar (QR.sharesId env) shares)
+
+-- | The reference queued-redemption vault priced by its oracle, declaring the fill order given and sharing a
+-- shortfall by it through the allotments it opens each period with.
+referenceOracleRedeem : Text -> Harness
+referenceOracleRedeem order = Harness with
+  name = "the reference oracle-priced queued-redemption vault, " <> order
+  deploy = \config -> if config /= plainConfig then pure None else do
+    (env, oracle) <- AR.setupOracleOrdered order
+    let base = queuedRedeemDeployment env
+        roll allotments = do
+          now <- QR.current env
+          either (\e -> abort ("the roll failed: " <> show e)) pure =<< AR.rollAt now oracle 1.0 allotments
+        runShort budget = do
+          live <- query @R.QueuedRedeemRequest env.registrar
+          let mine = [(cid, r) | (cid, r) <- live, r.vaultId == env.vaultId]
+              totals = [(e, sum [r.shares | (_, r) <- mine, r.epoch == e]) | e <- sort (dedup [r.epoch | (_, r) <- mine])]
+              allotments = shareShortfall order budget totals
+          rolled <- roll allotments
+          let requests = [ QR.Req with requestCid = cid; shareAllocation = r.shareAllocation; underlyingAllocation = r.underlyingAllocation
+                         | (cid, r) <- mine, r.epoch `elem` map fst allotments ]
+          either (\e -> abort ("the fill failed: " <> show e)) (pure . pure) =<< AR.fillTree rolled requests
+    pure $ Some base with
+      nextPeriod = [] <$ roll []
+      queue = (\q -> q with shortfall = Some runShort) <$> base.queue
+
+-- | Each period's share of a shortfall: the oldest periods whole first, or every period the same share.
+shareShortfall : Text -> Decimal -> [(Int, Decimal)] -> [(Int, Decimal)]
+shareShortfall order budget totals
+  | order == "pro-rata" = let f = min 1.0 (budget / sum (map snd totals)) in [(e, f) | f > 0.0, (e, _) <- totals]
+  | otherwise = oldestFirst budget totals
+
+oldestFirst : Decimal -> [(Int, Decimal)] -> [(Int, Decimal)]
+oldestFirst left ((e, t) :: rest) | left > 0.0 = (e, min 1.0 (left / t)) :: oldestFirst (left - t) rest
+oldestFirst _ _ = []
 
 noContext : ExtraArgs
 noContext = ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata
@@ -293,3 +331,7 @@ vaultProperties, queueProperties : [(Text, Harness -> Script ())]
 
 queuedRedeemVaultConforms : Script ()
 queuedRedeemVaultConforms = Suite.conformance referenceQueuedRedeem
+
+oracleRedeemSharesAShortfallOldestFirst, oracleRedeemSharesAShortfallProRata : Script ()
+oracleRedeemSharesAShortfallOldestFirst = shortfallsFollowTheFillOrder (referenceOracleRedeem "oldest-first")
+oracleRedeemSharesAShortfallProRata = shortfallsFollowTheFillOrder (referenceOracleRedeem "pro-rata")

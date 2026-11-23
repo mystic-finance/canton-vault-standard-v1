@@ -73,7 +73,7 @@ queuedDirectionsHaveNoInstantPath h = eachQueuedDirection h $ \d _ deposits -> d
     refused "an instant redemption" =<< perform d [alice] (Redeem 1.0 me me None)
 
 -- | A request publishes allocation requests under the vault's executors, committed until the end of its period
--- plus the window, and the vault says when requests are priced.
+-- plus the window, and the vault says when requests are priced, when their fee is fixed and how they share a shortfall.
 requestsPublishTheirTerms : Harness -> Script ()
 requestsPublishTheirTerms h = eachQueuedDirection h $ \d _ deposits -> do
   alice <- allocateParty "alice"
@@ -81,6 +81,8 @@ requestsPublishTheirTerms h = eachQueuedDirection h $ \d _ deposits -> do
   v <- viewOf d
   async <- asyncViewOf d deposits
   assertMsg "the async view says when requests are priced" (TextMap.member requestPricingKey async.meta.values)
+  assertMsg "the async view says when a request's fee is fixed" (TextMap.member requestFeeKey async.meta.values)
+  assertMsg "the async view says how requests share a shortfall" (TextMap.member fillOrderKey async.meta.values)
   r <- succeeded "a request" =<< requestIn d deposits alice alice "terms" 50.0 None
   assertMsg "the request publishes an allocation request" (r.allocationRequests /= [])
   let deadline = addRelTime v.rateValidUntil async.settlementDeadlineWindow
@@ -164,6 +166,29 @@ requestIdsKeepTheirPromise h = eachQueuedDirection h $ \d q deposits -> do
   if a.requestId /= b.requestId || a.requestId == 0 then skip "the two requests share no id" else do
     assertMsg "requests sharing an id are filled together" (paidA > 0.0 && paidB > 0.0)
     assertMsg ("requests sharing an id are filled at one rate, not " <> show (paidA, paidB)) (abs (paidA - 4.0 * paidB) <= 10.0 * ulp)
+
+-- | A vault declaring `oldest-first` or `pro-rata` shares a shortfall that way between requests of different ids:
+-- with half of two equal requests payable, the older is filled whole and the newer not at all, or each by half.
+shortfallsFollowTheFillOrder : Harness -> Script ()
+shortfallsFollowTheFillOrder h = eachQueuedDirection h $ \d q deposits -> do
+  async <- asyncViewOf d deposits
+  case (TextMap.lookup fillOrderKey async.meta.values, q.shortfall) of
+    (Some order, Some runShort) | order == "oldest-first" || order == "pro-rata" -> do
+      alice <- allocateParty "alice"
+      bob <- allocateParty "bob"
+      provide d deposits alice 10.0
+      provide d deposits bob 10.0
+      older <- succeeded "a request" =<< requestIn d deposits alice alice "older" 10.0 None
+      _ <- fundRequest q older
+      _ <- d.nextPeriod
+      newer <- succeeded "a request" =<< requestIn d deposits bob bob "newer" 10.0 None
+      _ <- fundRequest q newer
+      if older.requestId == newer.requestId && older.requestId /= 0 then skip "the two requests share an id" else do
+        _ <- runShort 10.0
+        left <- (,) <$> pendingOf d q deposits older.requestId (basic alice) <*> pendingOf d q deposits newer.requestId (basic bob)
+        let expected = if order == "oldest-first" then (0.0, 10.0) else (5.0, 5.0)
+        assertMsg (order <> " leaves " <> show expected <> " queued, not " <> show left) (left == expected)
+    _ -> skip (h.name <> " declares no fill order to check, or can't run short")
 
 -- What a request still has queued at `now`, from the vault's events alone.
 rebuilt : Time -> RequestRef -> [VaultEvent] -> Decimal

@@ -101,15 +101,16 @@ data VaultView = VaultView with
       -- ^ The share price, fixed for the period below. A rate with an accrual
       -- still moves within the period, but its parameters do not.
     depositFeeBps : Int
-      -- ^ The fee on `Vault_Deposit`, in basis points of the assets paid in.
+      -- ^ The fee on `Vault_Deposit` and on deposit requests, in basis points
+      -- of the assets paid in.
     mintFeeBps : Int
       -- ^ The fee on `Vault_Mint`, in basis points of the assets paid in.
     withdrawFeeBps : Int
       -- ^ The fee on `Vault_Withdraw`, in basis points of what the shares are
       -- worth.
     redeemFeeBps : Int
-      -- ^ The fee on `Vault_Redeem`, in basis points of what the shares are
-      -- worth.
+      -- ^ The fee on `Vault_Redeem` and on redemption requests, in basis
+      -- points of what the shares are worth.
     rateValidFrom : Time
       -- ^ The start of the period this rate applies to.
     rateValidUntil : Time
@@ -189,7 +190,8 @@ data AsyncView = AsyncView with
       -- only the executors can settle or cancel it; after it, the requester can
       -- withdraw it.
     meta : Metadata
-      -- ^ The vault's request pricing, under `requestPricingKey`, and any
+      -- ^ The vault's request pricing, request fee and fill order, under
+      -- `requestPricingKey`, `requestFeeKey` and `fillOrderKey`, and any
       -- extensions specific to the vault.
   deriving (Show, Eq, Serializable)
 
@@ -198,6 +200,22 @@ data AsyncView = AsyncView with
 -- MUST set it, and MUST NOT strike a request's rate when the request is made.
 requestPricingKey : Text
 requestPricingKey = "canton-vault/request-pricing"
+
+-- | The `AsyncView` metadata key saying when a request's fee is fixed. Free
+-- text; recommended values are `"request"`, the fee the view showed when the
+-- request was made, and `"fill"`, the fee when it is filled. A vault MUST set
+-- it.
+requestFeeKey : Text
+requestFeeKey = "canton-vault/request-fee"
+
+-- | The `AsyncView` metadata key saying how a vault shares what it can fill
+-- among requests that do not share an id, when it cannot fill them all. Free
+-- text; recommended values are `"oldest-first"`, in the order the vault
+-- accepted their funding, `"pro-rata"`, every request in the same proportion,
+-- and `"discretionary"`, as the executors choose. A vault MUST set it, and one
+-- that sets `"oldest-first"` or `"pro-rata"` MUST fill that way.
+fillOrderKey : Text
+fillOrderKey = "canton-vault/fill-order"
 
 --
 -- Vault

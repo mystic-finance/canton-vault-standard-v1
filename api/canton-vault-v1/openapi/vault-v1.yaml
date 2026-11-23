@@ -184,6 +184,29 @@ components:
           default: false
         pauseInfo:
           $ref: "#/components/schemas/PauseInfo"
+        performanceFeeBps:
+          description: |
+            The share of the vault's gains it takes as a fee, in basis points.
+            It is taken through the published totals, so it is already in the
+            share price. Absent if the vault charges none.
+          type: integer
+          minimum: 0
+        managementFeeBps:
+          description: |
+            The yearly fee on the vault's assets, in basis points. It is taken
+            through the published totals, so it is already in the share price.
+            Absent if the vault charges none.
+          type: integer
+          minimum: 0
+        pendingChanges:
+          description: |
+            The changes the vault has scheduled. The vault MUST NOT apply a
+            listed change before its `effectiveAt`, and MUST remove it once it
+            takes effect or is withdrawn. A change it hasn't listed carries no
+            such promise.
+          type: array
+          items:
+            $ref: "#/components/schemas/PendingChange"
       required:
         - vaultId
         - view
@@ -203,6 +226,31 @@ components:
             Timestamp (exclusive) until which the vault is paused, if known.
           type: string
           format: date-time
+
+    PendingChange:
+      description: |
+        A change the vault has scheduled.
+      type: object
+      properties:
+        field:
+          description: |
+            What the change applies to: a path in this response, such as
+            `view.depositFeeBps`, `asyncRedeemView.executors` or
+            `managementFeeBps`, or a name of the vault's own, such as
+            `deposit-cap`.
+          type: string
+        value:
+          description: |
+            The new value, encoded as the field is in this response.
+        effectiveAt:
+          description: |
+            Timestamp from which the change applies.
+          type: string
+          format: date-time
+      required:
+        - field
+        - value
+        - effectiveAt
 
     GetChoiceContextRequest:
       description: |
