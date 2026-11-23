@@ -8,7 +8,7 @@ import DA.List (dedup)
 import DA.Numeric qualified as N
 import DA.Optional (isNone, isSome, optionalToList)
 import DA.TextMap qualified as TextMap
-import DA.Time (isLedgerTimeLT)
+import DA.Time (addRelTime, convertRelTimeToMicroseconds, isLedgerTimeLT, subTime)
 
 import Splice.Api.Token.MetadataV1
 import Splice.Api.Token.HoldingV2
@@ -56,10 +56,11 @@ template MinimalVault
     totalAssets : Decimal
     validFrom : Time
     validUntil : Time
+    growthPerSecond : Decimal
   where
     signatory registrar, optionalToList custodian.owner
     ensure isSome custodian.owner && shares == InstrumentId with admin = registrar; id = vaultId
-      && totalShares >= 0.0 && totalAssets >= 0.0 && validUntil > validFrom
+      && totalShares >= 0.0 && totalAssets >= 0.0 && validUntil > validFrom && growthPerSecond >= 0.0
 
     interface instance Vault for MinimalVault where
       view = VaultView with
@@ -126,6 +127,20 @@ template MinimalVault
       do
         now <- getTime
         create this with validFrom = now; validUntil = until
+
+    choice MinimalVault_Advance : ContractId MinimalVault
+      -- ^ Opens the next period for any caller once this one ends; assets grow over this period's length.
+      with
+        caller : Party
+      controller caller
+      do
+        open <- isLedgerTimeLT validUntil
+        when open (fail "the period has not ended")
+        let length = subTime validUntil validFrom
+            seconds = intToDecimal (convertRelTimeToMicroseconds length) / 1000000.0
+        create this with
+          validFrom = validUntil; validUntil = addRelTime validUntil length
+          totalAssets = totalAssets * (1.0 + growthPerSecond * seconds)
 
     choice MinimalVault_Revalue : ContractId MinimalVault
       -- ^ Books a change in the pool's value from outside vault actions.

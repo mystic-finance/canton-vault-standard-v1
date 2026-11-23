@@ -1,0 +1,79 @@
+-- | Anyone may open the minimal vault's next period, and what opens, its growth included, depends only on the vault.
+module Canton.Vault.Testing.Minimal.Advance where
+
+import DA.Optional (fromSome)
+import DA.Time (addRelTime, hours, microseconds, minutes)
+import Daml.Script
+
+import Splice.Api.Token.HoldingV2
+import Splice.Testing.Tokens.TestTokenV2 (TokenRules(..))
+
+import Canton.Vault.Testing.V1.Read (refusedFor)
+import Canton.Vault.Testing.Minimal.Vault
+
+data Setup = Setup with
+  registrar : Party
+  stranger : Party
+  vaultCid : ContractId MinimalVault
+  vault : MinimalVault
+  disclosed : Disclosure
+
+-- | A vault with totals and an hour-long period, and a party with no stake in it.
+setup : Script Setup
+setup = do
+  usd <- allocateParty "usdAdmin"
+  registrar <- allocateParty "minimalRegistrar"
+  custodian <- allocateParty "minimalCustodian"
+  stranger <- allocateParty "stranger"
+  rules <- submit usd (createCmd TokenRules with admin = usd)
+  now <- getTime
+  let vault = MinimalVault with
+        registrar; vaultId = "minimal-1"
+        custodian = Account with owner = Some custodian; provider = None; id = "pool"
+        underlying = InstrumentId with admin = usd; id = "USD"
+        shares = InstrumentId with admin = registrar; id = "minimal-1"
+        transferFactory = toInterfaceContractId rules; totalShares = 10.0; totalAssets = 12.0
+        validFrom = now; validUntil = addRelTime now (hours 1); growthPerSecond = 0.000001
+  vaultCid <- submit (actAs [registrar, custodian]) (createCmd vault)
+  disclosed <- fromSome <$> queryDisclosure registrar vaultCid
+  pure Setup with ..
+
+advanceBy : Setup -> Party -> Script (Either SubmitError (ContractId MinimalVault))
+advanceBy s party = trySubmit (actAs party <> disclose s.disclosed) do
+  exerciseCmd s.vaultCid MinimalVault_Advance with caller = party
+
+-- | The period after the vault's: an hour from where it ended, with an hour's growth of 0.0001% a second.
+nextOf : MinimalVault -> MinimalVault
+nextOf v = v with validFrom = v.validUntil; validUntil = addRelTime v.validUntil (hours 1); totalAssets = 12.0432
+
+openedBy : Setup -> Party -> Script MinimalVault
+openedBy s party = do
+  cid <- either (abort . show) pure =<< advanceBy s party
+  fromSome <$> queryContractId s.registrar cid
+
+aStrangerAdvancesTheVault : Script ()
+aStrangerAdvancesTheVault = do
+  s <- setup
+  setTime s.vault.validUntil
+  next <- openedBy s s.stranger
+  assertMsg ("opened " <> show next) (next == nextOf s.vault)
+
+aLateAdvanceOpensTheSamePeriod : Script ()
+aLateAdvanceOpensTheSamePeriod = do
+  s <- setup
+  setTime (addRelTime s.vault.validUntil (minutes 90))
+  next <- openedBy s s.stranger
+  assertMsg ("opened " <> show next) (next == nextOf s.vault)
+
+anAdvanceBeforeTheEndIsRefused : Script ()
+anAdvanceBeforeTheEndIsRefused = do
+  s <- setup
+  setTime (addRelTime s.vault.validUntil (microseconds (-1)))
+  refusedFor "an advance before the period ends" "the period has not ended" =<< advanceBy s s.stranger
+
+aSecondAdvanceIsRefused : Script ()
+aSecondAdvanceIsRefused = do
+  s <- setup
+  setTime s.vault.validUntil
+  _ <- openedBy s s.stranger
+  refusedFor "a second advance of the same vault" "NotActive" =<< advanceBy s s.registrar
