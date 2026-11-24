@@ -1509,8 +1509,11 @@ allocationsAreNotBoundAfterAnEarlyRoll = script do
   next <- nextPeriod env
   failsWith "allocations are bound in the request's own period" =<< bindAs next env.venue cid escrowed receiving
 
-viewSaysWhenRequestsArePriced : Script ()
-viewSaysWhenRequestsArePriced = script do
+viewStatesItsRequestPolicies : Script ()
+viewStatesItsRequestPolicies = script do
   env <- setup
   Some vault <- queryContractId env.registrar env.vaultCid
-  TextMap.lookup requestPricingKey (view (toInterface @VaultAsyncDeposit vault)).meta.values === Some "period-close"
+  let policies = (view (toInterface @VaultAsyncDeposit vault)).meta.values
+  TextMap.lookup requestPricingKey policies === Some "period-close"
+  TextMap.lookup requestFeeKey policies === Some "fill"
+  TextMap.lookup fillOrderKey policies === Some "discretionary"

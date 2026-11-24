@@ -105,7 +105,7 @@ template ReferenceQueuedDepositVault
       view = AsyncView with
         executors
         settlementDeadlineWindow
-        meta = requestPolicies
+        meta = requestPolicies "discretionary"
 
       pendingDepositRequest requestId account extraArgs = do
         requestCids : [ContractId QueuedDepositRequest] <- dedup <$> getContractIds depositRequestsKey extraArgs.context

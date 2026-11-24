@@ -35,6 +35,7 @@ properties =
   , ("requestsAreFilled", requestsAreFilled)
   , ("minimumsAreHonoured", minimumsAreHonoured)
   , ("requestIdsKeepTheirPromise", requestIdsKeepTheirPromise)
+  , ("shortfallsFollowTheFillOrder", shortfallsFollowTheFillOrder)
   , ("pendingRebuildsFromEvents", pendingRebuildsFromEvents)
   , ("delegatesActWithinTheirAllowance", delegatesActWithinTheirAllowance) ]
 

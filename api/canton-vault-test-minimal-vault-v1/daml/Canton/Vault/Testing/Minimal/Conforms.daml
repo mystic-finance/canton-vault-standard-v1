@@ -56,7 +56,7 @@ deployMinimal = do
     createCmd MinimalVault with
       registrar; custodian = pool; vaultId; underlying; shares = shareInstrument
       transferFactory = toInterfaceContractId rules; totalShares = 0.0; totalAssets = 0.0
-      validFrom = now; validUntil = addRelTime now (hours 1)
+      validFrom = now; validUntil = addRelTime now (hours 1); growthPerSecond = 0.0
   let vaultDisclosed = do
         cid <- current
         fromSome <$> queryDisclosure registrar cid
@@ -127,4 +127,4 @@ aCustodianAccountWithNoOwnerIsRefused = do
       underlying = InstrumentId with admin = usd; id = "USD"
       shares = InstrumentId with admin = registrar; id = "minimal-1"
       transferFactory = toInterfaceContractId rules; totalShares = 0.0; totalAssets = 0.0
-      validFrom = now; validUntil = addRelTime now (hours 1)
+      validFrom = now; validUntil = addRelTime now (hours 1); growthPerSecond = 0.0

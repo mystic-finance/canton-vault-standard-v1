@@ -7,7 +7,7 @@ import DA.Optional (isSome)
 import DA.TextMap qualified as TextMap
 import DA.Time (isLedgerTimeGE)
 
-import Canton.Vault.V1 (requestPricingKey)
+import Canton.Vault.V1 (fillOrderKey, requestFeeKey, requestPricingKey)
 import Canton.Vault.EventLog.V1
 import Canton.Vault.Reference.Log
 
@@ -31,9 +31,11 @@ requestLegId requester label leg =
 redemptionAccount : Party -> V2.Account
 redemptionAccount registrar = V2.Account with owner = Some registrar; provider = None; id = "redemptions"
 
--- | When the queued vaults strike a request's rate: once its period has closed.
-requestPolicies : Metadata
-requestPolicies = Metadata with values = TextMap.fromList [(requestPricingKey, "period-close")]
+-- | How the queued vaults treat requests: priced once their period has closed, charged the fee at the fill, and
+-- sharing a shortfall in the fill order given.
+requestPolicies : Text -> Metadata
+requestPolicies fillOrder = Metadata with
+  values = TextMap.fromList [(requestPricingKey, "period-close"), (requestFeeKey, "fill"), (fillOrderKey, fillOrder)]
 
 data Factories = Factories with
     allocationFactory : ContractId V2.AllocationFactory

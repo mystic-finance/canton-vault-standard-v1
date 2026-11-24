@@ -64,6 +64,8 @@ template ReferenceQueuedRedeemVault
       -- ^ How far a roll may move the price on the registrar's word alone.
     allotments : [(Int, Decimal)]
       -- ^ The share of each earlier period's unfilled requests this period fills, for a vault priced by its oracle.
+    fillOrder : Text
+      -- ^ How the allotments share a shortfall among periods, as the async view states it.
   where
     signatory vaultRegistrar, custodianOwner custodian
     observer executors
@@ -110,7 +112,7 @@ template ReferenceQueuedRedeemVault
       view = AsyncView with
         executors
         settlementDeadlineWindow
-        meta = requestPolicies
+        meta = requestPolicies fillOrder
 
       pendingRedeemRequest requestId account extraArgs = do
         requestCids : [ContractId QueuedRedeemRequest] <- dedup <$> getContractIds redeemRequestsKey extraArgs.context

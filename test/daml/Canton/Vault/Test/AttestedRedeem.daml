@@ -23,12 +23,18 @@ import Splice.Testing.Tokens.TestTokenV2.Holding (Token(..))
 
 -- | The queued-redemption vault, re-created to be priced by a new oracle party.
 setupOracle : Script (Env, Party)
-setupOracle = do
+setupOracle = setupOracleOrdered "discretionary"
+
+-- | The oracle-priced vault, declaring the fill order given.
+setupOracleOrdered : Text -> Script (Env, Party)
+setupOracleOrdered fillOrder = do
   env <- setup
   oracle <- allocateParty "oracle"
   Some vault <- queryContractId env.registrar env.vaultCid
   vaultCid <- submit (actAs [env.registrar, env.custodian]) $
-    archiveCmd env.vaultCid *> createCmd vault with pricing = OraclePricing with oracle; latest = None; maxAge = days 1
+    archiveCmd env.vaultCid *> createCmd vault with
+      pricing = OraclePricing with oracle; latest = None; maxAge = days 1
+      fillOrder
   let env' = env with vaultCid
   pure (env', oracle)
 
